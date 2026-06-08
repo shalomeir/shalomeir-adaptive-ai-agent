@@ -20,7 +20,7 @@ from .tools.builtins import (
     build_aggregate_csv,
     build_ask_user,
     build_file_tools,
-    build_monster_hp_query,
+    build_query_json_numeric,
     build_normalize_csv,
     build_run_python,
     build_search_docs,
@@ -64,7 +64,7 @@ def _assemble_runner(
     for tool in build_file_tools(cfg.workspace_dir):
         registry.register(tool)
     registry.register(build_aggregate_csv(cfg.workspace_dir))
-    registry.register(build_monster_hp_query(cfg.workspace_dir))
+    registry.register(build_query_json_numeric(cfg.workspace_dir))
     registry.register(build_normalize_csv(cfg.workspace_dir))
     registry.register(build_run_python(sandbox))
     registry.register(build_search_docs(docs_dir))

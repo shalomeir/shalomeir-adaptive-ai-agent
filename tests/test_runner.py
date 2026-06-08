@@ -1,4 +1,4 @@
-from adaptive_agent.runner import AgentRunner, RunnerDeps
+from adaptive_agent.runner import AgentRunner, RunnerDeps, _SYSTEM
 from adaptive_agent.llm import FakeLLMClient
 from adaptive_agent.tools.registry import ToolRegistry
 from adaptive_agent.tools.base import Tool, ToolResult
@@ -241,3 +241,16 @@ def test_consecutive_failures_stop(tmp_path):
     )
     result = runner.run_turn("go")
     assert result.stopped_reason == "consecutive_failures"
+
+
+def test_system_prompt_is_not_demo_case_specific():
+    forbidden = (
+        "events.csv",
+        "monsters.json",
+        "query" + "Monster" + "Hp",
+        "aggregateCsv",
+        "normalizeCsv",
+    )
+
+    for term in forbidden:
+        assert term not in _SYSTEM

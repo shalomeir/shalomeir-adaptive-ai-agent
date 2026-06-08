@@ -32,10 +32,8 @@ _SYSTEM = (
     '- {"action":"update_tool","name":"<tool>","code":"def run(input):\\n    return ..."} — fix a failed tool\n'
     '- {"action":"finish","summary":"..."} — stop when the task is done\n'
     'To use a tool you MUST use call_tool — never put a tool name in the "action" field. '
-    "Example: to read the workspace file monsters.json, reply "
-    '{"action":"call_tool","name":"readFile","input":{"path":"monsters.json"}}. '
-    'Workspace file paths are RELATIVE (just the file name, e.g. "monsters.json"); do not use '
-    'absolute paths or "..".\n'
+    'Workspace file paths are RELATIVE (for example, "data.json" or "report.csv"); do not use '
+    'absolute paths or "..". Use readFile only to inspect a small file before deciding what to do.\n'
     'There are TWO ways to run Python. Both are invoked with call_tool — "runPython" and any tool '
     'you create are tool NAMES, never values of the "action" field:\n'
     "(a) The built-in runPython tool. Invoke it as "
@@ -45,19 +43,13 @@ _SYSTEM = (
     "(b) A tool you create_tool, then call_tool by its name. Its code defines run(input) where "
     '`input` is the call_tool "input" dict, and you RETURN the result.\n'
     "To process a workspace file, OPEN IT DIRECTLY inside your code by its relative name — your code "
-    "runs with the workspace as the working directory. For example, a single call_tool to runPython "
-    'with code "import json\\ndata = json.load(open(\\"monsters.json\\"))\\nresult = ...\\n'
-    'print(json.dumps(result))" answers a one-off data question in one step. You do NOT need to '
-    "readFile first or pass file contents through input; use readFile only to peek at a small file.\n"
+    "runs with the workspace as the working directory. You do NOT need to readFile first or pass "
+    "file contents through input for normal file processing.\n"
     "For file output, prefer returning the computed text/data from runPython or a created tool, then "
     "call writeFile with the final relative path and content. This lets the runtime apply its file "
     "write policy.\n"
-    "For CSV dedupe/sort/save requests, prefer the built-in normalizeCsv tool with "
-    '{"src":"events.csv","dst":"events-clean.csv","sortBy":"date"} instead of ad hoc code.\n'
-    "For CSV read-only group/sum requests, prefer the built-in aggregateCsv tool with "
-    '{"src":"events.csv","groupBy":"type","sumColumn":"amount","dedupe":true}; do NOT write a file.\n'
-    "For monsters.json hp threshold name/average requests, prefer the built-in queryMonsterHp "
-    'tool with {"src":"monsters.json","threshold":100} instead of ad hoc code.\n'
+    "Prefer deterministic built-in data tools when their descriptions match the task instead of "
+    "creating ad hoc code. Read-only analysis must not call writeFile.\n"
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
     "installed and will fail to import. NEVER ask the user to install packages; for CSV work use "
     "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "
@@ -241,12 +233,10 @@ class AgentRunner:
         dst = csv_paths[1] if len(csv_paths) >= 2 else f"{Path(src).stem}-clean.csv"
         return {"src": src, "dst": dst, "sortBy": "date"}
 
-    def _parse_direct_monster_hp_query(self, request: str) -> dict[str, Any] | None:
+    def _parse_direct_json_numeric_query(self, request: str) -> dict[str, Any] | None:
         lowered = request.lower()
         if not (
             ".json" in lowered
-            and "hp" in lowered
-            and ("몬스터" in request or "monster" in lowered)
             and ("이름" in request or "name" in lowered)
             and ("평균" in request or "average" in lowered or "avg" in lowered)
         ):
@@ -254,29 +244,59 @@ class AgentRunner:
         json_paths = re.findall(r"[\w.-]+\.json", request)
         if not json_paths:
             return None
+        field_match = re.search(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:>=|=>|[가이]?\s*\d+(?:\.\d+)?\s*이상)",
+            request,
+        )
+        numeric_field = field_match.group(1) if field_match is not None else "hp"
         threshold = 100.0
-        comparison = re.search(r"hp\s*(?:>=|=>)\s*(\d+(?:\.\d+)?)", request, re.IGNORECASE)
+        comparison = re.search(
+            rf"{re.escape(numeric_field)}\s*(?:>=|=>)\s*(\d+(?:\.\d+)?)",
+            request,
+            re.IGNORECASE,
+        )
         korean_min = re.search(r"(\d+(?:\.\d+)?)\s*이상", request)
         if comparison is not None:
             threshold = float(comparison.group(1))
         elif korean_min is not None:
             threshold = float(korean_min.group(1))
-        return {"src": json_paths[0], "threshold": threshold}
+        payload: dict[str, Any] = {
+            "src": json_paths[0],
+            "numericField": numeric_field,
+            "labelField": "name",
+            "threshold": threshold,
+        }
+        if "몬스터" in request or "monster" in lowered:
+            payload["rootKey"] = "monsters"
+        return payload
 
     def _parse_direct_csv_aggregate(self, request: str) -> dict[str, Any] | None:
         lowered = request.lower()
         if not (
             ".csv" in lowered
             and any(term in request for term in ("중복", "duplicate"))
-            and ("amount" in lowered)
-            and ("type" in lowered)
             and any(term in request for term in ("합계", "sum"))
         ):
             return None
         csv_paths = re.findall(r"[\w.-]+\.csv", request)
         if not csv_paths:
             return None
-        return {"src": csv_paths[0], "groupBy": "type", "sumColumn": "amount", "dedupe": True}
+        sum_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:의\s*)?(?:합계|sum)", request)
+        if sum_match is None:
+            sum_match = re.search(r"\bsum\s+([A-Za-z_][A-Za-z0-9_]*)", request, re.IGNORECASE)
+        group_match = re.search(
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:별|by\b)",
+            request,
+            re.IGNORECASE,
+        )
+        if group_match is None:
+            group_match = re.search(r"\bby\s+([A-Za-z_][A-Za-z0-9_]*)", request, re.IGNORECASE)
+        return {
+            "src": csv_paths[0],
+            "groupBy": group_match.group(1) if group_match is not None else "type",
+            "sumColumn": sum_match.group(1) if sum_match is not None else "amount",
+            "dedupe": True,
+        }
 
     def _request_allows_file_write(self, request: str) -> bool:
         lowered = request.lower()
@@ -343,11 +363,11 @@ class AgentRunner:
             return TurnResult(summary=direct_response)
 
         self.conv.add_user(request)
-        direct_monster_payload = self._parse_direct_monster_hp_query(request)
-        if direct_monster_payload is not None and any(
-            digest.name == "queryMonsterHp" for digest in self.deps.registry.digests()
+        direct_json_payload = self._parse_direct_json_numeric_query(request)
+        if direct_json_payload is not None and any(
+            digest.name == "queryJsonNumeric" for digest in self.deps.registry.digests()
         ):
-            return self._run_direct_monster_hp_query(direct_monster_payload)
+            return self._run_direct_json_numeric_query(direct_json_payload)
 
         direct_aggregate_payload = self._parse_direct_csv_aggregate(request)
         if direct_aggregate_payload is not None and any(
@@ -548,27 +568,28 @@ class AgentRunner:
             )
             return result
 
-    def _run_direct_monster_hp_query(self, payload: dict[str, Any]) -> TurnResult:
+    def _run_direct_json_numeric_query(self, payload: dict[str, Any]) -> TurnResult:
         result = TurnResult()
         with self.tracer.trace():
-            res = self.deps.registry.call("queryMonsterHp", payload)
-            self.tracer.log(kind="tool_call", toolName="queryMonsterHp")
+            res = self.deps.registry.call("queryJsonNumeric", payload)
+            self.tracer.log(kind="tool_call", toolName="queryJsonNumeric")
             if not res.ok:
-                obs = f"도구 queryMonsterHp 실패: {res.error}"
+                obs = f"도구 queryJsonNumeric 실패: {res.error}"
                 self.conv.add_observation(obs)
                 result.observations.append(obs)
                 result.summary = obs
                 result.stopped_reason = "direct_tool_failure"
                 self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
                 return result
-            obs = f"도구 queryMonsterHp 결과: {res.output}"
+            obs = f"도구 queryJsonNumeric 결과: {res.output}"
             self.conv.add_observation(obs)
             result.observations.append(obs)
             output = res.output or {}
-            names = ", ".join(output.get("names", [])) or "없음"
+            labels = ", ".join(output.get("labels", [])) or "없음"
+            numeric_field = str(output.get("numericField", payload.get("numericField", "value")))
             result.summary = (
-                f"hp가 {output.get('threshold', payload['threshold']):g} 이상인 몬스터는 "
-                f"{names}입니다. 평균 hp는 {output.get('averageHp')}입니다."
+                f"{numeric_field}가 {output.get('threshold', payload['threshold']):g} 이상인 항목은 "
+                f"{labels}입니다. 평균 {numeric_field}는 {output.get('averageValue')}입니다."
             )
             return result
 

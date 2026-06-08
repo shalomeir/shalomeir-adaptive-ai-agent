@@ -11,7 +11,7 @@ from adaptive_agent.skills import SkillStore
 from adaptive_agent.tools.builtins import (
     build_aggregate_csv,
     build_file_tools,
-    build_monster_hp_query,
+    build_query_json_numeric,
     build_normalize_csv,
     build_search_docs,
 )
@@ -39,7 +39,7 @@ def _runner(
     for tool in build_file_tools(ws):
         reg.register(tool)
     reg.register(build_aggregate_csv(ws))
-    reg.register(build_monster_hp_query(ws))
+    reg.register(build_query_json_numeric(ws))
     reg.register(build_normalize_csv(ws))
     if docs_dir is not None:
         reg.register(build_search_docs(docs_dir))
@@ -406,7 +406,7 @@ def test_d3_live_prompt_uses_direct_csv_aggregate_without_write_prompt(tmp_path:
     for tool in build_file_tools(ws):
         reg.register(tool)
     reg.register(build_aggregate_csv(ws))
-    reg.register(build_monster_hp_query(ws))
+    reg.register(build_query_json_numeric(ws))
     reg.register(build_normalize_csv(ws))
     sandbox = ExecutionSandbox(ws, timeout_sec=10, max_output_bytes=16384)
     llm = FakeLLMClient(replies=[])

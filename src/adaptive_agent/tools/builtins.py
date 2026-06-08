@@ -148,19 +148,19 @@ def build_normalize_csv(workspace: Path | str) -> Tool:
     )
 
 
-def build_monster_hp_query(workspace: Path | str) -> Tool:
+def build_query_json_numeric(workspace: Path | str) -> Tool:
     ws = Path(workspace)
     ws.mkdir(parents=True, exist_ok=True)
 
-    def monster_hp_query(inp: dict[str, Any]) -> ToolResult:
+    def query_json_numeric(inp: dict[str, Any]) -> ToolResult:
         try:
             src = _resolve(ws, inp["src"])
         except ValueError as e:
             return ToolResult(ok=False, error=str(e))
         threshold = float(inp.get("threshold", 100))
-        root_key = str(inp.get("rootKey", "monsters"))
-        hp_field = str(inp.get("hpField", "hp"))
-        name_field = str(inp.get("nameField", "name"))
+        root_key = inp.get("rootKey")
+        numeric_field = str(inp.get("numericField", "value"))
+        label_field = str(inp.get("labelField", "name"))
 
         try:
             payload = json.loads(src.read_text("utf-8"))
@@ -169,40 +169,50 @@ def build_monster_hp_query(workspace: Path | str) -> Tool:
         except json.JSONDecodeError as e:
             return ToolResult(ok=False, error=f"JSON 파싱 실패: {e.msg}")
 
-        records = payload.get(root_key) if isinstance(payload, dict) else payload
+        records: Any
+        if root_key is not None and isinstance(payload, dict):
+            records = payload.get(str(root_key))
+        elif isinstance(payload, dict):
+            array_values = [value for value in payload.values() if isinstance(value, list)]
+            records = array_values[0] if len(array_values) == 1 else payload
+        else:
+            records = payload
         if not isinstance(records, list):
-            return ToolResult(ok=False, error=f"JSON 배열을 찾을 수 없습니다: {root_key}")
+            return ToolResult(ok=False, error="JSON 배열을 찾을 수 없습니다")
 
         selected: list[dict[str, Any]] = []
         for item in records:
             if not isinstance(item, dict):
                 continue
-            hp = item.get(hp_field)
-            if isinstance(hp, bool) or not isinstance(hp, int | float):
+            value = item.get(numeric_field)
+            if isinstance(value, bool) or not isinstance(value, int | float):
                 continue
-            if hp >= threshold:
+            if value >= threshold:
                 selected.append(item)
 
-        names = [str(item.get(name_field, "")) for item in selected if item.get(name_field)]
-        total_hp = sum(float(item[hp_field]) for item in selected)
-        average_hp = round(total_hp / len(selected), 2) if selected else 0.0
+        labels = [str(item.get(label_field, "")) for item in selected if item.get(label_field)]
+        total_value = sum(float(item[numeric_field]) for item in selected)
+        average_value = round(total_value / len(selected), 2) if selected else 0.0
         return ToolResult(
             ok=True,
             output={
                 "src": inp["src"],
                 "threshold": threshold,
-                "names": names,
+                "rootKey": root_key,
+                "numericField": numeric_field,
+                "labelField": label_field,
+                "labels": labels,
                 "count": len(selected),
-                "averageHp": average_hp,
+                "averageValue": average_value,
             },
         )
 
     return Tool(
-        "queryMonsterHp",
-        "monsters JSON에서 hp 임계값 이상인 항목 이름과 평균 hp를 계산한다",
+        "queryJsonNumeric",
+        "JSON 배열에서 숫자 필드 임계값 이상인 항목의 라벨과 평균을 계산한다",
         "builtin",
         {"type": "object", "required": ["src"]},
-        monster_hp_query,
+        query_json_numeric,
     )
 
 
