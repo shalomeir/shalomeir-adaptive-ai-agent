@@ -35,9 +35,12 @@ OpenAI API 키를 쓰는 호스팅 모델 방식과, 키 없이 로컬 [Ollama](
 ```bash
 # 방법 A: OpenAI 호스팅 모델 사용
 cp .env.example .env
-# .env 아래쪽의 OpenAI 예시 블록을 주석 해제하고 AGENT_API_KEY만 본인 키로 바꾼다.
+# 아래쪽의 OpenAI 예시 네 줄을 주석 해제한 뒤 AGENT_API_KEY만 본인 키로 바꾼다.
+# 같은 .env 안에서는 아래쪽 OpenAI 값이 위쪽 Ollama 기본값보다 우선된다.
+# AGENT_PROVIDER=openai
 # AGENT_BASE_URL=https://api.openai.com/v1
 # AGENT_MODEL=gpt-4o-mini
+# AGENT_API_KEY=sk-...
 
 # 방법 B: Ollama 로컬 모델 사용
 ollama pull qwen2.5-coder:7b
@@ -45,7 +48,13 @@ ollama pull qwen2.5-coder:7b
 
 ### 2) 에이전트가 바라볼 엔드포인트 설정
 
-OpenAI를 쓸 때는 `.env.example`에서 복사한 `.env`의 OpenAI 설정을 그대로 쓰면 된다.
+OpenAI를 쓸 때는 `.env.example`에서 복사한 `.env`의 OpenAI 설정을 활성화하면 된다. 위쪽
+Ollama 줄을 주석 처리해도 되지만 필수는 아니다. 이미 터미널에 `AGENT_*` 환경 변수를 export해
+둔 경우 `.env`보다 그 값이 우선될 수 있으므로, 의도와 다르게 로컬 모델이 잡히면 먼저 해제한다.
+
+```bash
+unset AGENT_PROVIDER AGENT_BASE_URL AGENT_MODEL AGENT_API_KEY
+```
 
 ```bash
 # Ollama를 쓸 때만 아래처럼 로컬 OpenAI 호환 엔드포인트로 바꾼다
