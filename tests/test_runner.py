@@ -99,17 +99,21 @@ def test_llm_response_preview_is_bounded(tmp_path):
     assert first_llm_event["responseTruncated"] is True
 
 
-def test_bare_json_response_finishes_instead_of_looping(tmp_path):
+def test_bare_json_response_gets_protocol_feedback_and_retries(tmp_path):
     runner = build_runner(
         tmp_path,
-        ['{"path":"events-clean.csv","rows":5,"removed":2}'] * 10,
+        [
+            '{"path":"events-clean.csv","rows":5,"removed":2}',
+            '{"action":"respond","text":"events-clean.csv 저장 완료. rows=5, removed=2","final":true}',
+        ],
     )
 
     result = runner.run_turn("events.csv 정리 결과 알려줘")
 
     assert result.stopped_reason == "finish"
-    assert '"events-clean.csv"' in result.summary
-    assert runner.deps.llm.calls == 1
+    assert "events-clean.csv 저장 완료" in result.summary
+    assert runner.deps.llm.calls == 2
+    assert any("action 필드가 없습니다" in observation for observation in result.observations)
 
 
 def test_max_iterations_guard(tmp_path):

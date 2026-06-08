@@ -10,6 +10,12 @@ from .schemas import AgentAction, parse_agent_action
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _CANONICAL_ACTIONS = {"respond", "ask_user", "call_tool", "create_tool", "update_tool", "finish"}
 _DIRECT_TOOL_ACTIONS = {"readFile", "writeFile", "listFiles", "runPython", "searchDocs", "askUser"}
+_ACTION_CONTRACT = (
+    '반드시 action 필드를 포함하세요. 최종 답변은 '
+    '{"action":"respond","text":"...","final":true} 또는 '
+    '{"action":"finish","summary":"..."} 형식이어야 합니다. '
+    '도구 결과 JSON을 {"path":...}처럼 그대로 최상위 응답으로 반환하지 마세요.'
+)
 
 
 def _strip_fence(text: str) -> str:
@@ -79,11 +85,7 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
     """Normalize common model action aliases before strict schema validation."""
     action = value.get("action")
     if not isinstance(action, str):
-        return {
-            "action": "respond",
-            "text": json.dumps(value, ensure_ascii=False),
-            "final": True,
-        }
+        return value
 
     if action == "respond" and "text" not in value:
         text = value.get("output", value.get("message", value.get("summary")))
@@ -165,10 +167,16 @@ def parse_action_text(raw: str) -> ParseResult:
         return ParseResult(
             ok=False, error=f"출력이 유효한 JSON이 아닙니다: {e}. 하나의 JSON 객체만 반환하세요."
         )
+    if not isinstance(data.get("action"), str):
+        preview = json.dumps(data, ensure_ascii=False)
+        return ParseResult(
+            ok=False,
+            error=f"이전 응답은 JSON이지만 action 필드가 없습니다: {preview}. {_ACTION_CONTRACT}",
+        )
     try:
         return ParseResult(ok=True, action=parse_agent_action(data))
     except Exception as e:
         return ParseResult(
             ok=False,
-            error=f"action 형식을 어겼습니다: {e}. schemas의 action 형식으로 다시 답하세요.",
+            error=f"action 형식을 어겼습니다: {e}. {_ACTION_CONTRACT}",
         )

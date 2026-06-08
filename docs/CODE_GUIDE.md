@@ -104,9 +104,9 @@ AgentAction = Annotated[
 약한 모델은 코드펜스나 trailing 쉼표로 출력을 깨뜨린다. `parsing.py`가 펜스를 벗기고
 가장 바깥 `{...}`를 떼어내 trailing 쉼표를 지운 뒤 `json.loads`한다. 그래도 형식이 어긋나면
 사람이 읽을 수 있는 오류 문자열을 만들어 다시 묻는다.
-action 없이 결과 JSON만 나온 경우에는 약한 모델이 도구 결과를 그대로 최종 답변으로 낸 것으로
-보고 `respond(final=true)`로 정규화한다. 이렇게 하지 않으면 같은 bare JSON을 non-final
-`respond`로 해석해 반복하다가 no-progress로 중단될 수 있다.
+action 없이 결과 JSON만 나온 경우에는 프로토콜 위반으로 본다. 오류 observation에는 직전
+응답과 올바른 `respond(final=true)` / `finish` 예시를 넣어, 다음 LLM 호출이 같은 bare JSON을
+반복하지 않고 규약에 맞는 최종 응답으로 교정하게 한다.
 
 ```python
 def parse_action_text(raw: str) -> ParseResult:
