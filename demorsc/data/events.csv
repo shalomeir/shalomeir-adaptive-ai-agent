@@ -1,0 +1,8 @@
+id,date,type,amount
+3,2026-03-02,purchase,1200
+1,2026-01-15,signup,0
+2,2026-02-20,purchase,800
+2,2026-02-20,purchase,800
+4,2026-01-15,refund,-200
+1,2026-01-15,signup,0
+5,2026-04-10,purchase,500

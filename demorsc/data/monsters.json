@@ -1,0 +1,9 @@
+{
+  "monsters": [
+    { "name": "Goblin", "hp": 80, "atk": 12 },
+    { "name": "Orc", "hp": 150, "atk": 25 },
+    { "name": "Slime", "hp": 40, "atk": 5 },
+    { "name": "Dragon", "hp": 300, "atk": 70 },
+    { "name": "Wolf", "hp": 110, "atk": 18 }
+  ]
+}

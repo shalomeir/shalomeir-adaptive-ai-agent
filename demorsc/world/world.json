@@ -1,0 +1,40 @@
+{
+  "root": {
+    "id": "scene",
+    "type": "Scene",
+    "name": "Scene",
+    "props": {},
+    "children": [
+      {
+        "id": "ground",
+        "type": "Container",
+        "name": "Ground",
+        "props": {},
+        "children": [
+          { "id": "tree1", "type": "Entity", "name": "OakTree", "props": { "health": 120, "solid": true }, "children": [] },
+          { "id": "rock1", "type": "Entity", "name": "Boulder", "props": { "health": 60, "solid": true }, "children": [] }
+        ]
+      },
+      {
+        "id": "lights",
+        "type": "Container",
+        "name": "Lights",
+        "props": {},
+        "children": [
+          { "id": "sun", "type": "Light", "name": "Sun", "props": { "intensity": 0.8 }, "children": [] }
+        ]
+      },
+      {
+        "id": "enemies",
+        "type": "Container",
+        "name": "Enemies",
+        "props": {},
+        "children": [
+          { "id": "e1", "type": "Entity", "name": "Goblin", "props": { "health": 80, "solid": true }, "children": [] },
+          { "id": "e2", "type": "Entity", "name": "Orc", "props": { "health": 150, "solid": true }, "children": [] },
+          { "id": "e3", "type": "Entity", "name": "Dragon", "props": { "health": 300, "solid": true }, "children": [] }
+        ]
+      }
+    ]
+  }
+}
