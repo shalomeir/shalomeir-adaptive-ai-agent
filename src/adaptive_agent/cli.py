@@ -47,6 +47,7 @@ def _assemble_runner(
     free_ask: Callable[..., str],
     confirm_ask: Callable[[str], str],
     max_iterations: int | None = None,
+    non_interactive: bool = False,
 ) -> AgentRunner:
     """Wire up tools, deps, and the runner.
 
@@ -71,6 +72,7 @@ def _assemble_runner(
         max_iterations=max_iterations or cfg.max_iterations,
         max_fix_retries=cfg.max_fix_retries,
         exporter=get_exporter(cfg.monitoring),
+        non_interactive=non_interactive,
     )
     return AgentRunner(
         deps,
@@ -110,8 +112,8 @@ def run(
     """작업 한 건을 비대화형으로 실행하고 결과를 출력한다.
 
     스크립트·CI·반복 테스트에 쓴다. ``--yes``는 파일 쓰기·도구 저장 같은 y/n 확인을
-    모두 승인한다. 자유 형식 ask_user 질문은 비대화형이라 답할 수 없어, 같은 응답으로
-    처리되며(승인 시 "y") 진행이 막히면 그대로 보고된다.
+    모두 승인한다. 자유 형식 ask_user 질문은 비대화형이라 답할 수 없으므로 질문을 출력하고
+    HITL 필요 상태로 종료한다.
     """
     load_dotenv()
     cfg = AgentConfig.load()
@@ -124,6 +126,7 @@ def run(
         free_ask=lambda q, _c=None: NON_INTERACTIVE_ASK,
         confirm_ask=lambda q: answer,
         max_iterations=max_iterations,
+        non_interactive=True,
     )
     result = runner.run_turn(task)
     console.print(result.summary or "작업을 마쳤습니다.")

@@ -91,6 +91,7 @@ class RunnerDeps:
     max_iterations: int = 20
     max_fix_retries: int = 3
     exporter: Exporter | None = None
+    non_interactive: bool = False
 
 
 @dataclass
@@ -286,14 +287,8 @@ class AgentRunner:
             )
         return None
 
-    def _non_interactive_ask_observation(self, question: str, request: str) -> str:
-        structure_hint = self._workspace_structure_hint(f"{request}\n{question}")
-        return (
-            "비대화형 실행에서는 사용자에게 추가 질문을 할 수 없습니다. "
-            "요청과 작업 영역 파일만으로 해결 가능한지 먼저 확인하고, 필요한 파일 구조는 "
-            "readFile 또는 runPython으로 직접 확인해 계속 진행하세요."
-            + (f"\n{structure_hint}" if structure_hint else "")
-        )
+    def _hitl_required_summary(self, question: str) -> str:
+        return f"HITL 처리가 필요합니다: {question}"
 
     def _mentioned_workspace_paths(self, text: str) -> list[str]:
         """Extract likely workspace-relative data paths from a user/model message."""
@@ -586,6 +581,10 @@ class AgentRunner:
                     self.conv.add_observation("계속 진행하세요.")
                     continue
                 if isinstance(action, AskUser):
+                    if self.deps.non_interactive:
+                        result.summary = self._hitl_required_summary(action.question)
+                        result.stopped_reason = "hitl_required"
+                        break
                     blocked_ask = self._blocked_ask_user_observation(action.question, request)
                     if blocked_ask is not None:
                         self.conv.add_observation(blocked_ask)
@@ -593,10 +592,9 @@ class AgentRunner:
                         continue
                     answer = self.deps.ask(action.question, action.choices)
                     if answer == NON_INTERACTIVE_ASK:
-                        obs = self._non_interactive_ask_observation(action.question, request)
-                        self.conv.add_observation(obs)
-                        result.observations.append(obs)
-                        continue
+                        result.summary = self._hitl_required_summary(action.question)
+                        result.stopped_reason = "hitl_required"
+                        break
                     obs = f"사용자 답변: {answer}"
                     self.conv.add_observation(obs)
                     result.observations.append(obs)
