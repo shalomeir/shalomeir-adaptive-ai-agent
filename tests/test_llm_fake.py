@@ -1,6 +1,6 @@
 from adaptive_agent import llm
 from adaptive_agent.llm import FakeLLMClient, HttpLLMClient
-from adaptive_agent.schemas import Message
+from adaptive_agent.schemas import Message, ToolDigest
 
 
 def test_fake_returns_scripted_replies():
@@ -47,6 +47,38 @@ def test_http_client_requests_json_object_response(monkeypatch):
 
     assert result == '{"action":"finish","summary":"ok"}'
     assert payloads[0]["response_format"] == {"type": "json_object"}
+
+
+def test_http_client_merges_protocol_and_tools_into_one_system_message(monkeypatch):
+    payloads = []
+
+    def fake_post(url, json, headers, timeout):
+        payloads.append(json)
+        return _FakeResponse(
+            200,
+            {"choices": [{"message": {"content": '{"action":"finish","summary":"ok"}'}}]},
+        )
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    client = HttpLLMClient("http://localhost:11434/v1", "model")
+
+    client.chat(
+        [
+            Message(role="system", content="STRICT OUTPUT CONTRACT"),
+            Message(role="user", content="task"),
+            Message(role="tool", content="도구 결과"),
+        ],
+        digests=[ToolDigest(name="runPython", origin="builtin", description="Run Python")],
+    )
+
+    messages = payloads[0]["messages"]
+    system_messages = [message for message in messages if message["role"] == "system"]
+    assert len(system_messages) == 1
+    assert system_messages[0]["content"].startswith("STRICT OUTPUT CONTRACT")
+    assert "사용 가능한 도구" in system_messages[0]["content"]
+    assert "runPython" in system_messages[0]["content"]
+    assert messages[1] == {"role": "user", "content": "task"}
+    assert messages[2] == {"role": "user", "content": "도구 결과"}
 
 
 def test_http_client_falls_back_when_json_response_mode_is_unsupported(monkeypatch):

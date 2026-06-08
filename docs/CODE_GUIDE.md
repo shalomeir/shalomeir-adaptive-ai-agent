@@ -231,6 +231,10 @@ if self.skills is not None and self.generated is not None:
 `ConversationStore`는 시스템 프롬프트를 본문과 분리해 보관한다. 시스템 접두가 매 턴 그대로라
 프롬프트 앞부분이 안정적이고, 변화는 끝에만 덧붙는다. `ContextManager`는 추정 토큰이 임계를
 넘으면 오래된 구간을 요약으로 접되, 코드가 강제로 보존하는 핵심 사실을 함께 남긴다.
+`HttpLLMClient`는 provider payload를 만들 때 프로토콜 system prompt와 도구 목록을 하나의
+system 메시지로 합친다. 로컬 모델이 여러 system 메시지 중 도구 목록이나 최근 observation에
+끌려 action 규약을 잊는 것을 줄이기 위해, strict output contract를 항상 첫 system 메시지의
+앞부분에 둔다.
 
 ```python
 old, recent = body[: -self.keep_recent], body[-self.keep_recent:]

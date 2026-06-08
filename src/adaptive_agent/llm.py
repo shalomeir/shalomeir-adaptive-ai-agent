@@ -14,10 +14,37 @@ class LLMClient(Protocol):
     def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str: ...
 
 
-def _render_system(digests: list[ToolDigest]) -> str:
+def _render_tool_inventory(digests: list[ToolDigest]) -> str:
     # Build a compact tool inventory so the model knows what is available.
     lines = [f"- {d.name} ({d.origin}): {d.description}" for d in digests]
     return "사용 가능한 도구:\n" + "\n".join(lines)
+
+
+def _to_provider_message(message: Message) -> dict[str, str]:
+    # "tool" is not a standard OpenAI role; surface it as "user".
+    return {
+        "role": message.role if message.role != "tool" else "user",
+        "content": message.content,
+    }
+
+
+def _build_payload_messages(
+    messages: list[Message], digests: list[ToolDigest]
+) -> list[dict[str, str]]:
+    """Merge protocol and tool inventory into one system message.
+
+    Local models are more likely to drift when they receive multiple system
+    messages. Keep the runner's protocol prompt first and append the tool list
+    inside the same system message so the output contract stays dominant.
+    """
+    inventory = _render_tool_inventory(digests)
+    if messages and messages[0].role == "system":
+        system = {
+            "role": "system",
+            "content": f"{messages[0].content}\n\n{inventory}",
+        }
+        return [system, *[_to_provider_message(message) for message in messages[1:]]]
+    return [{"role": "system", "content": inventory}, *[_to_provider_message(m) for m in messages]]
 
 
 class HttpLLMClient:
@@ -36,14 +63,7 @@ class HttpLLMClient:
         self.timeout = timeout
 
     def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str:
-        payload_messages: list[dict[str, str]] = [
-            {"role": "system", "content": _render_system(digests)}
-        ]
-        payload_messages += [
-            # "tool" is not a standard OpenAI role; surface it as "user".
-            {"role": m.role if m.role != "tool" else "user", "content": m.content}
-            for m in messages
-        ]
+        payload_messages = _build_payload_messages(messages, digests)
         headers: dict[str, str] = (
             {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         )
