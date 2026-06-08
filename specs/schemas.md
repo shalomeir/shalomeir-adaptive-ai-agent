@@ -7,9 +7,7 @@
 | 버전 | 날짜 | 변경 내용 |
 | --- | --- | --- |
 | 0.1 | 2026-06-01 | 최초 작성. action 프로토콜, 내장 도구 입출력, ToolSpec, manifest, 로그 이벤트, 설정 스키마 정의 |
-| 0.2 | 2026-06-08 | CSV 중복 제거·정렬 내장 도구 `normalizeCsv` 계약 추가 |
-| 0.3 | 2026-06-08 | JSON 숫자 필드 질의 내장 도구 `queryJsonNumeric` 계약 추가 |
-| 0.4 | 2026-06-08 | CSV 읽기 전용 그룹 합계 내장 도구 `aggregateCsv` 계약 추가 |
+| 0.2 | 2026-06-08 | 전용 데이터 데모 내장 도구 계약 제거. 일반 `runPython`/생성 도구 경로 유지 |
 
 ## 0. 규약
 
@@ -247,56 +245,7 @@ def run(input: dict) -> dict:
       "truncated": { "type": "boolean" } } } }
 ```
 
-### 3.5 normalizeCsv
-
-```json
-{ "input": { "type": "object", "required": ["src", "dst"],
-    "properties": { "src": { "type": "string" }, "dst": { "type": "string" },
-      "sortBy": { "type": "string", "default": "date" } },
-    "additionalProperties": false },
-  "output": { "type": "object", "required": ["src", "dst", "rows", "removedDuplicates", "sortBy"],
-    "properties": { "src": { "type": "string" }, "dst": { "type": "string" },
-      "rows": { "type": "integer" }, "removedDuplicates": { "type": "integer" },
-      "sortBy": { "type": "string" } } } }
-```
-
-### 3.6 aggregateCsv
-
-```json
-{ "input": { "type": "object", "required": ["src"],
-    "properties": { "src": { "type": "string" },
-      "groupBy": { "type": "string", "default": "type" },
-      "sumColumn": { "type": "string", "default": "amount" },
-      "dedupe": { "type": "boolean", "default": true } },
-    "additionalProperties": false },
-  "output": { "type": "object",
-    "required": ["src", "groupBy", "sumColumn", "dedupe", "rows", "removedDuplicates", "sums"],
-    "properties": { "src": { "type": "string" }, "groupBy": { "type": "string" },
-      "sumColumn": { "type": "string" }, "dedupe": { "type": "boolean" },
-      "rows": { "type": "integer" }, "removedDuplicates": { "type": "integer" },
-      "sums": { "type": "object", "additionalProperties": { "type": "number" } } } } }
-```
-
-### 3.7 queryJsonNumeric
-
-```json
-{ "input": { "type": "object", "required": ["src"],
-    "properties": { "src": { "type": "string" },
-      "threshold": { "type": "number", "default": 100 },
-      "rootKey": { "type": ["string", "null"] },
-      "numericField": { "type": "string", "default": "value" },
-      "labelField": { "type": "string", "default": "name" } },
-    "additionalProperties": false },
-  "output": { "type": "object",
-    "required": ["src", "threshold", "rootKey", "numericField", "labelField", "labels", "count", "averageValue"],
-    "properties": { "src": { "type": "string" }, "threshold": { "type": "number" },
-      "rootKey": { "type": ["string", "null"] }, "numericField": { "type": "string" },
-      "labelField": { "type": "string" },
-      "labels": { "type": "array", "items": { "type": "string" } },
-      "count": { "type": "integer" }, "averageValue": { "type": "number" } } } }
-```
-
-### 3.8 createTool
+### 3.5 createTool
 
 입력은 2절 ToolSpec과 같다.
 
@@ -308,7 +257,7 @@ def run(input: dict) -> dict:
       "trustedStatus": { "type": "string", "enum": ["untrusted", "session", "persisted"] } } } }
 ```
 
-### 3.9 updateTool
+### 3.6 updateTool
 
 ```json
 { "input": { "type": "object", "required": ["name", "code"],
@@ -320,7 +269,7 @@ def run(input: dict) -> dict:
       "updated": { "type": "boolean" } } } }
 ```
 
-### 3.10 searchDocs
+### 3.7 searchDocs
 
 ```json
 { "input": { "type": "object", "required": ["query"],
@@ -335,7 +284,7 @@ def run(input: dict) -> dict:
         "snippet": { "type": "string" }, "score": { "type": "number" } } } } } } }
 ```
 
-### 3.11 askUser
+### 3.8 askUser
 
 ```json
 { "input": { "type": "object", "required": ["question"],

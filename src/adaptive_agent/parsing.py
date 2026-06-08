@@ -8,6 +8,8 @@ from typing import Any
 from .schemas import AgentAction, parse_agent_action
 
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+_CANONICAL_ACTIONS = {"respond", "ask_user", "call_tool", "create_tool", "update_tool", "finish"}
+_DIRECT_TOOL_ACTIONS = {"readFile", "writeFile", "listFiles", "runPython", "searchDocs", "askUser"}
 
 
 def _strip_fence(text: str) -> str:
@@ -16,15 +18,35 @@ def _strip_fence(text: str) -> str:
     return m.group(1) if m else text
 
 
-# 한계: rfind로 마지막 '}'를 쓰므로 trailing 텍스트에 '}'가 있으면 outermost 보장이 깨질 수
-# 있고, 그 경우 json.loads가 실패해 상위에서 ok=False로 처리된다.
 def _extract_object(text: str) -> str:
-    """Slice out the outermost JSON object from arbitrary surrounding text."""
+    """Slice out the first balanced JSON object from arbitrary surrounding text."""
     start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    if start == -1:
         raise ValueError("no JSON object found")
-    return text[start : end + 1]
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text[start:], start=start):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+
+    raise ValueError("JSON object was not closed")
 
 
 def _remove_trailing_commas(text: str) -> str:
@@ -32,10 +54,96 @@ def _remove_trailing_commas(text: str) -> str:
     return re.sub(r",(\s*[}\]])", r"\1", text)
 
 
+def _quote_triple_quoted_fields(text: str) -> str:
+    """Convert Python-style triple-quoted code/content fields into JSON strings."""
+
+    def replace(match: re.Match[str]) -> str:
+        prefix = match.group(1)
+        body = match.group(3)
+        return f"{prefix}{json.dumps(body, ensure_ascii=False)}"
+
+    pattern = r'("(?:code|content)"\s*:\s*)("""|\'\'\')(.*?)(\2)'
+    return re.sub(pattern, replace, text, flags=re.DOTALL)
+
+
 def json_repair(raw: str) -> dict[str, Any]:
     """Best-effort JSON extraction: strip fences, extract object, fix trailing commas."""
-    candidate = _remove_trailing_commas(_extract_object(_strip_fence(raw)))
-    return json.loads(candidate)
+    candidate = _remove_trailing_commas(_quote_triple_quoted_fields(_extract_object(_strip_fence(raw))))
+    value = json.loads(candidate)
+    if not isinstance(value, dict):
+        raise ValueError("top-level JSON value must be an object")
+    return _normalize_action_payload(value)
+
+
+def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common model action aliases before strict schema validation."""
+    action = value.get("action")
+    if not isinstance(action, str):
+        return {"action": "respond", "text": json.dumps(value, ensure_ascii=False)}
+
+    if action == "respond" and "text" not in value:
+        text = value.get("output", value.get("message", value.get("summary")))
+        if text is not None:
+            return {
+                **value,
+                "text": text if isinstance(text, str) else json.dumps(text, ensure_ascii=False),
+            }
+
+    if action == "ask_user" and "question" not in value:
+        input_data = value.get("input", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        question = value.get("message", input_data.get("message", input_data.get("question")))
+        if question is not None:
+            return {
+                **value,
+                "question": str(question),
+                "choices": value.get("choices", input_data.get("choices")),
+            }
+
+    if action in _CANONICAL_ACTIONS:
+        return value
+
+    if action in _DIRECT_TOOL_ACTIONS:
+        return {
+            "action": "call_tool",
+            "name": action,
+            "input": value.get("input", {}),
+        }
+
+    if action == "callTool":
+        return {
+            "action": "call_tool",
+            "name": value.get("name"),
+            "input": value.get("input", {}),
+        }
+
+    if action == "askUser":
+        input_data = value.get("input", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        return {
+            "action": "ask_user",
+            "question": value.get("question", input_data.get("question")),
+            "choices": value.get("choices", input_data.get("choices")),
+            "reason": value.get("reason", input_data.get("reason")),
+        }
+
+    if action == "createTool":
+        return {"action": "create_tool", "spec": value.get("spec", value.get("input"))}
+
+    if action == "updateTool":
+        input_data = value.get("input", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        return {
+            "action": "update_tool",
+            "name": value.get("name", input_data.get("name")),
+            "code": value.get("code", input_data.get("code")),
+            "reason": value.get("reason", input_data.get("reason")),
+        }
+
+    return value
 
 
 @dataclass

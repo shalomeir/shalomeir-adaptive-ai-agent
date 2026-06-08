@@ -134,19 +134,19 @@ def test_small_talk_answers_without_ask_user_boilerplate(tmp_path):
 
 def test_incomplete_loop_reports_last_result(tmp_path):
     # 모델이 도구는 돌렸지만 finish/respond(final)로 끝맺지 못하고 같은 호출만 반복하면,
-    # no-progress로 중단하되 빈 요약 대신 마지막 관찰(실제 결과)을 돌려줘야 한다.
+    # 캐시된 성공 결과로 중단하되 빈 요약 대신 마지막 결과를 돌려줘야 한다.
     runner = build_runner(
         tmp_path,
         ['{"action":"call_tool","name":"echo","input":{"answer":42}}'] * 50,
     )
     result = runner.run_turn("go")
-    assert result.stopped_reason == "no_progress"
+    assert result.stopped_reason == "cached_result"
     assert result.summary
     assert "42" in result.summary
 
 
-def test_incomplete_loop_logs_error_event(tmp_path):
-    # 비정상 종료는 종료 사유를 error 이벤트로 남겨 로그만으로 추적 가능해야 한다.
+def test_cached_result_loop_does_not_log_error_event(tmp_path):
+    # 이미 성공한 동일 tool call 반복은 실패가 아니라 캐시 종료이므로 error 이벤트로 남기지 않는다.
     import json
 
     runner = build_runner(
@@ -156,8 +156,7 @@ def test_incomplete_loop_logs_error_event(tmp_path):
     runner.run_turn("go")
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     errors = [e for e in events if e["kind"] == "error"]
-    assert errors
-    assert errors[-1]["errorKind"] == "no_progress"
+    assert errors == []
 
 
 def test_deps_exporter_receives_events(tmp_path):
@@ -218,6 +217,46 @@ def test_package_install_ask_is_blocked_before_user_prompt(tmp_path):
     assert len([o for o in result.observations if "표준 라이브러리" in o]) == 2
 
 
+def test_file_structure_ask_is_blocked_before_user_prompt(tmp_path):
+    asks = []
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={"content": '{"items":[{"name":"a","value":1}]}', "truncated": False},
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"ask_user","question":"Could you provide more details about '
+                        'the structure of the data in data.json?"}'
+                    ),
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("analyze data.json")
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert any("파일을 직접 열어" in o for o in result.observations)
+    assert any("listFields={'items': 1}" in o for o in result.observations)
+
+
 def test_consecutive_failures_stop(tmp_path):
     reg = ToolRegistry()
     reg.register(
@@ -248,8 +287,8 @@ def test_system_prompt_is_not_demo_case_specific():
         "events.csv",
         "monsters.json",
         "query" + "Monster" + "Hp",
-        "aggregateCsv",
-        "normalizeCsv",
+        "aggregate" + "Csv",
+        "normalize" + "Csv",
     )
 
     for term in forbidden:

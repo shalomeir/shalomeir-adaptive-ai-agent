@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import csv
-import json
 from pathlib import Path
 from typing import Any, Callable
 
+from ..python_repair import escape_newlines_in_string_literals
 from ..sandbox import ExecutionSandbox
 from .base import Tool, ToolResult
 
@@ -88,204 +87,20 @@ def build_file_tools(workspace: Path | str) -> list[Tool]:
     ]
 
 
-def build_normalize_csv(workspace: Path | str) -> Tool:
-    ws = Path(workspace)
-    ws.mkdir(parents=True, exist_ok=True)
-
-    def normalize_csv(inp: dict[str, Any]) -> ToolResult:
-        try:
-            src = _resolve(ws, inp["src"])
-            dst = _resolve(ws, inp["dst"])
-        except ValueError as e:
-            return ToolResult(ok=False, error=str(e))
-        sort_by = str(inp.get("sortBy", "date"))
-        try:
-            with src.open(newline="", encoding="utf-8") as fh:
-                rows = list(csv.reader(fh))
-        except FileNotFoundError:
-            return ToolResult(ok=False, error=f"입력 파일을 찾을 수 없습니다: {inp['src']}")
-        if not rows:
-            return ToolResult(ok=False, error="CSV 파일이 비어 있습니다")
-
-        header, body = rows[0], rows[1:]
-        if sort_by not in header:
-            return ToolResult(ok=False, error=f"정렬 기준 컬럼이 없습니다: {sort_by}")
-
-        seen: set[tuple[str, ...]] = set()
-        unique_rows: list[list[str]] = []
-        for row in body:
-            key = tuple(row)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique_rows.append(row)
-
-        sort_index = header.index(sort_by)
-        unique_rows.sort(key=lambda row: row[sort_index])
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        with dst.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(header)
-            writer.writerows(unique_rows)
-
-        return ToolResult(
-            ok=True,
-            output={
-                "src": inp["src"],
-                "dst": inp["dst"],
-                "rows": len(unique_rows),
-                "removedDuplicates": len(body) - len(unique_rows),
-                "sortBy": sort_by,
-            },
-        )
-
-    return Tool(
-        "normalizeCsv",
-        "CSV에서 완전히 중복된 행을 제거하고 지정 컬럼 기준 오름차순으로 정렬해 저장한다",
-        "builtin",
-        {"type": "object", "required": ["src", "dst"]},
-        normalize_csv,
-    )
-
-
-def build_query_json_numeric(workspace: Path | str) -> Tool:
-    ws = Path(workspace)
-    ws.mkdir(parents=True, exist_ok=True)
-
-    def query_json_numeric(inp: dict[str, Any]) -> ToolResult:
-        try:
-            src = _resolve(ws, inp["src"])
-        except ValueError as e:
-            return ToolResult(ok=False, error=str(e))
-        threshold = float(inp.get("threshold", 100))
-        root_key = inp.get("rootKey")
-        numeric_field = str(inp.get("numericField", "value"))
-        label_field = str(inp.get("labelField", "name"))
-
-        try:
-            payload = json.loads(src.read_text("utf-8"))
-        except FileNotFoundError:
-            return ToolResult(ok=False, error=f"입력 파일을 찾을 수 없습니다: {inp['src']}")
-        except json.JSONDecodeError as e:
-            return ToolResult(ok=False, error=f"JSON 파싱 실패: {e.msg}")
-
-        records: Any
-        if root_key is not None and isinstance(payload, dict):
-            records = payload.get(str(root_key))
-        elif isinstance(payload, dict):
-            array_values = [value for value in payload.values() if isinstance(value, list)]
-            records = array_values[0] if len(array_values) == 1 else payload
-        else:
-            records = payload
-        if not isinstance(records, list):
-            return ToolResult(ok=False, error="JSON 배열을 찾을 수 없습니다")
-
-        selected: list[dict[str, Any]] = []
-        for item in records:
-            if not isinstance(item, dict):
-                continue
-            value = item.get(numeric_field)
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                continue
-            if value >= threshold:
-                selected.append(item)
-
-        labels = [str(item.get(label_field, "")) for item in selected if item.get(label_field)]
-        total_value = sum(float(item[numeric_field]) for item in selected)
-        average_value = round(total_value / len(selected), 2) if selected else 0.0
-        return ToolResult(
-            ok=True,
-            output={
-                "src": inp["src"],
-                "threshold": threshold,
-                "rootKey": root_key,
-                "numericField": numeric_field,
-                "labelField": label_field,
-                "labels": labels,
-                "count": len(selected),
-                "averageValue": average_value,
-            },
-        )
-
-    return Tool(
-        "queryJsonNumeric",
-        "JSON 배열에서 숫자 필드 임계값 이상인 항목의 라벨과 평균을 계산한다",
-        "builtin",
-        {"type": "object", "required": ["src"]},
-        query_json_numeric,
-    )
-
-
-def build_aggregate_csv(workspace: Path | str) -> Tool:
-    ws = Path(workspace)
-    ws.mkdir(parents=True, exist_ok=True)
-
-    def aggregate_csv(inp: dict[str, Any]) -> ToolResult:
-        try:
-            src = _resolve(ws, inp["src"])
-        except ValueError as e:
-            return ToolResult(ok=False, error=str(e))
-        group_by = str(inp.get("groupBy", "type"))
-        sum_column = str(inp.get("sumColumn", "amount"))
-        dedupe = bool(inp.get("dedupe", True))
-        try:
-            with src.open(newline="", encoding="utf-8") as fh:
-                reader = csv.DictReader(fh)
-                rows = list(reader)
-                fieldnames = reader.fieldnames or []
-        except FileNotFoundError:
-            return ToolResult(ok=False, error=f"입력 파일을 찾을 수 없습니다: {inp['src']}")
-        if group_by not in fieldnames:
-            return ToolResult(ok=False, error=f"그룹 기준 컬럼이 없습니다: {group_by}")
-        if sum_column not in fieldnames:
-            return ToolResult(ok=False, error=f"합계 컬럼이 없습니다: {sum_column}")
-
-        seen: set[tuple[str, ...]] = set()
-        unique_rows: list[dict[str, str]] = []
-        for row in rows:
-            key = tuple(row.get(name, "") for name in fieldnames)
-            if dedupe and key in seen:
-                continue
-            seen.add(key)
-            unique_rows.append(row)
-
-        sums: dict[str, int | float] = {}
-        for row in unique_rows:
-            group = row[group_by]
-            raw_value = row[sum_column]
-            value: int | float
-            try:
-                value = int(raw_value)
-            except ValueError:
-                value = float(raw_value)
-            sums[group] = sums.get(group, 0) + value
-
-        return ToolResult(
-            ok=True,
-            output={
-                "src": inp["src"],
-                "groupBy": group_by,
-                "sumColumn": sum_column,
-                "dedupe": dedupe,
-                "rows": len(unique_rows),
-                "removedDuplicates": len(rows) - len(unique_rows),
-                "sums": sums,
-            },
-        )
-
-    return Tool(
-        "aggregateCsv",
-        "CSV에서 완전 중복 행을 선택적으로 제거하고 지정 컬럼 합계를 그룹별로 계산한다",
-        "builtin",
-        {"type": "object", "required": ["src"]},
-        aggregate_csv,
-    )
-
-
 def build_run_python(sandbox: ExecutionSandbox) -> Tool:
     def run_python(inp: dict[str, Any]) -> ToolResult:
         if "code" in inp:
-            res = sandbox.run_code(inp["code"], args=inp.get("args"), stdin=inp.get("stdin"))
+            code = escape_newlines_in_string_literals(str(inp["code"]))
+            if "def run(" in code and "__adaptive_agent_result" not in code:
+                code += (
+                    "\n\nif __name__ == '__main__':\n"
+                    "    import json as __adaptive_agent_json\n"
+                    "    __adaptive_agent_result = run({})\n"
+                    "    if __adaptive_agent_result is not None:\n"
+                    "        print(__adaptive_agent_json.dumps(__adaptive_agent_result, "
+                    "ensure_ascii=False))\n"
+                )
+            res = sandbox.run_code(code, args=inp.get("args"), stdin=inp.get("stdin"))
         elif "file" in inp:
             res = sandbox.run_file(inp["file"], args=inp.get("args"), stdin=inp.get("stdin"))
         else:
@@ -318,7 +133,7 @@ def build_run_python(sandbox: ExecutionSandbox) -> Tool:
         "runPython",
         "제한된 Python 스크립트를 격리 실행한다. input.code에 최상위 스크립트를 넣는다 — "
         "함수 본문이 아니므로 return을 쓰지 말고 결과는 print로 출력한다. 스크립트는 "
-        "workspace를 cwd로 실행하므로 events.csv 같은 상대 경로를 직접 열 수 있다.",
+        "workspace를 cwd로 실행하므로 data.json 같은 상대 경로를 직접 열 수 있다.",
         "builtin",
         {"type": "object"},
         run_python,

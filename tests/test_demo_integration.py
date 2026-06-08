@@ -9,10 +9,8 @@ from adaptive_agent.runner import AgentRunner, RunnerDeps
 from adaptive_agent.sandbox import ExecutionSandbox
 from adaptive_agent.skills import SkillStore
 from adaptive_agent.tools.builtins import (
-    build_aggregate_csv,
     build_file_tools,
-    build_query_json_numeric,
-    build_normalize_csv,
+    build_run_python,
     build_search_docs,
 )
 from adaptive_agent.tools.generated import GeneratedToolManager
@@ -38,12 +36,10 @@ def _runner(
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
-    reg.register(build_aggregate_csv(ws))
-    reg.register(build_query_json_numeric(ws))
-    reg.register(build_normalize_csv(ws))
     if docs_dir is not None:
         reg.register(build_search_docs(docs_dir))
     sandbox = ExecutionSandbox(ws, timeout_sec=10, max_output_bytes=16384)
+    reg.register(build_run_python(sandbox))
     deps = RunnerDeps(
         llm=FakeLLMClient(replies=replies),
         registry=reg,
@@ -121,10 +117,26 @@ def test_d1_json_query(tmp_path: Path) -> None:
     assert "186.67" in blob
 
 
-def test_d1_live_prompt_uses_direct_monster_hp_query(tmp_path: Path) -> None:
+def test_d1_live_prompt_uses_general_python_tool_path(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path)
     shutil.copy(DEMORSC / "data" / "monsters.json", ws / "monsters.json")
-    runner = _runner(tmp_path, ws, replies=[], ask="n")
+    code = (
+        "import json\n"
+        "data = json.load(open('monsters.json'))\n"
+        "records = data['monsters'] if isinstance(data, dict) else data\n"
+        "selected = [m for m in records if m.get('hp', 0) >= 100]\n"
+        "avg = round(sum(m['hp'] for m in selected) / len(selected), 2)\n"
+        "print(json.dumps({'names': [m['name'] for m in selected], 'avg': avg}, ensure_ascii=False))\n"
+    )
+    runner = _runner(
+        tmp_path,
+        ws,
+        [
+            _call("runPython", {"code": code}),
+            _finish("Orc, Dragon, Wolf 평균 hp 186.67"),
+        ],
+        ask="n",
+    )
 
     result = runner.run_turn(
         "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
@@ -134,7 +146,7 @@ def test_d1_live_prompt_uses_direct_monster_hp_query(tmp_path: Path) -> None:
     assert "Dragon" in result.summary
     assert "Wolf" in result.summary
     assert "186.67" in result.summary
-    assert runner.deps.llm.calls == 0
+    assert runner.deps.llm.calls == 2
 
 
 # ---------- D2 + D5: dedup/sort, persist, reuse ----------
@@ -215,10 +227,40 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
     assert [r[0] for r in rows2] == ["a", "b", "c"]
 
 
-def test_d2_live_prompt_uses_direct_csv_normalize(tmp_path: Path) -> None:
+def test_d2_live_prompt_uses_general_python_then_write_file(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path)
     shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
-    runner = _runner(tmp_path, ws, replies=[], ask="y")
+    content = (
+        "id,date,type,amount\n"
+        "1,2026-01-15,signup,0\n"
+        "4,2026-01-15,refund,-200\n"
+        "2,2026-02-20,purchase,800\n"
+        "3,2026-03-02,purchase,1200\n"
+        "5,2026-04-10,purchase,500\n"
+    )
+    code = (
+        "import csv, io, json\n"
+        "rows = list(csv.reader(open('events.csv', newline='')))\n"
+        "header, body = rows[0], rows[1:]\n"
+        "seen = set(); unique = []\n"
+        "for row in body:\n"
+        "    key = tuple(row)\n"
+        "    if key not in seen:\n"
+        "        seen.add(key); unique.append(row)\n"
+        "unique.sort(key=lambda row: row[header.index('date')])\n"
+        "buf = io.StringIO(); writer = csv.writer(buf); writer.writerow(header); writer.writerows(unique)\n"
+        "print(json.dumps({'content': buf.getvalue(), 'rows': len(unique)}, ensure_ascii=False))\n"
+    )
+    runner = _runner(
+        tmp_path,
+        ws,
+        [
+            _call("runPython", {"code": code}),
+            _call("writeFile", {"path": "events-clean.csv", "content": content}),
+            _finish("events-clean.csv 저장 완료"),
+        ],
+        ask="y",
+    )
 
     result = runner.run_turn(
         "events.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 "
@@ -226,7 +268,7 @@ def test_d2_live_prompt_uses_direct_csv_normalize(tmp_path: Path) -> None:
     )
 
     assert "events-clean.csv" in result.summary
-    assert runner.deps.llm.calls == 0
+    assert runner.deps.llm.calls == 3
     rows = _data_rows(ws / "events-clean.csv")
     assert len(rows) == 5
     assert [row[1] for row in rows] == sorted(row[1] for row in rows)
@@ -397,29 +439,30 @@ def test_d3_failure_then_self_fix(tmp_path: Path) -> None:
     assert "tool_update" in _log_kinds(tmp_path)
 
 
-def test_d3_live_prompt_uses_direct_csv_aggregate_without_write_prompt(tmp_path: Path) -> None:
+def test_d3_live_prompt_uses_general_python_without_write_prompt(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path)
     shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
-    asks: list[tuple[object, ...]] = []
-
-    reg = ToolRegistry()
-    for tool in build_file_tools(ws):
-        reg.register(tool)
-    reg.register(build_aggregate_csv(ws))
-    reg.register(build_query_json_numeric(ws))
-    reg.register(build_normalize_csv(ws))
-    sandbox = ExecutionSandbox(ws, timeout_sec=10, max_output_bytes=16384)
-    llm = FakeLLMClient(replies=[])
-    runner = AgentRunner(
-        RunnerDeps(
-            llm=llm,
-            registry=reg,
-            ask=lambda *a: asks.append(a) or "n",
-            log_dir=tmp_path / "logs",
-        ),
-        generated=GeneratedToolManager(ws / ".session", sandbox),
-        skills=SkillStore(tmp_path / "skills"),
-        policy=PolicyManager(ask=lambda q: asks.append((q,)) or "n"),
+    code = (
+        "import csv, json\n"
+        "rows = list(csv.reader(open('events.csv', newline='')))[1:]\n"
+        "seen = set(); unique = []\n"
+        "for row in rows:\n"
+        "    key = tuple(row)\n"
+        "    if key not in seen:\n"
+        "        seen.add(key); unique.append(row)\n"
+        "sums = {}\n"
+        "for row in unique:\n"
+        "    sums[row[2]] = sums.get(row[2], 0) + int(row[3])\n"
+        "print(json.dumps(sums, ensure_ascii=False))\n"
+    )
+    runner = _runner(
+        tmp_path,
+        ws,
+        [
+            _call("runPython", {"code": code}),
+            _finish("purchase 2500, signup 0, refund -200"),
+        ],
+        ask="n",
     )
 
     result = runner.run_turn(
@@ -429,8 +472,7 @@ def test_d3_live_prompt_uses_direct_csv_aggregate_without_write_prompt(tmp_path:
     assert "purchase 2500" in result.summary
     assert "signup 0" in result.summary
     assert "refund -200" in result.summary
-    assert llm.calls == 0
-    assert asks == []
+    assert runner.deps.llm.calls == 2
 
 
 # ---------- D4: ambiguous request asks first, acts only after clarification ----------

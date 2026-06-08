@@ -93,19 +93,16 @@ adaptive-agent chat
 
 - **D1 · 데이터 질의**
   입력: `workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘.`
-  기대: Orc, Dragon, Wolf와 평균 186.67. 실제 CLI에서는 이 자주 쓰는 JSON hp 질의를
-  `queryJsonNumeric` 내장 도구가 안정적으로 처리한다. (읽기만 하므로 승인 없음)
+  기대: Orc, Dragon, Wolf와 평균 186.67. 읽기만 하므로 승인 없음.
 
 - **D2 · CSV 정리와 도구 저장**
   입력: `events.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 events-clean.csv로 저장해줘.`
-  기대: 고유 5행, 날짜순. 실제 CLI에서는 이 자주 쓰는 CSV 정리 요청을 `normalizeCsv` 내장
-  도구가 안정적으로 처리하며, 파일 쓰기에서 `(y/n)` 확인을 묻는다.
+  기대: 고유 5행, 날짜순. 파일 쓰기에서 `(y/n)` 확인을 묻는다.
 
 - **D3 · 실패와 자가수정**
   입력: `events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘.`
-  기대: 최종 합계는 purchase 2500, signup 0, refund -200. 실제 CLI에서는 이 읽기 전용 CSV
-  집계를 `aggregateCsv` 내장 도구가 처리하므로 파일 쓰기 확인을 묻지 않는다. 생성 도구가
-  처음에 틀린 뒤 고치는 경로는 통합 테스트로 별도 검증한다.
+  기대: 최종 합계는 purchase 2500, signup 0, refund -200. 읽기 전용 집계라 파일 쓰기
+  확인을 묻지 않는다.
 
 - **D4 · 모호한 요청**
   입력: `데이터 좀 정리해줘.`

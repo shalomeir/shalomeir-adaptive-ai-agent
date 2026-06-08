@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..python_repair import escape_newlines_in_string_literals
 from ..sandbox import ExecutionSandbox
 from ..schemas import ToolSpec
 from .base import Tool, ToolResult
@@ -52,7 +53,7 @@ class GeneratedToolManager:
     def _write(self, spec: ToolSpec) -> None:
         """Write tool.py and _runner.py to the tool's directory."""
         d = self._dir(spec.name)
-        (d / "tool.py").write_text(spec.code, encoding="utf-8")
+        (d / "tool.py").write_text(escape_newlines_in_string_literals(spec.code), encoding="utf-8")
         (d / "_runner.py").write_text(_RUNNER.format(entrypoint=spec.entrypoint), encoding="utf-8")
 
     def _invoke(self, spec: ToolSpec, payload: dict[str, Any]) -> ToolResult:

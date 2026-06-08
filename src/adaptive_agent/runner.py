@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass, field
+import io
 from pathlib import Path
 import json
 import re
@@ -15,6 +17,7 @@ from .parsing import parse_action_text
 from .policy import PolicyManager
 from .schemas import AskUser, CallTool, CreateTool, Finish, Respond, UpdateTool
 from .skills import SkillStore
+from .tools.base import ToolResult
 from .tools.generated import GeneratedToolManager
 from .tools.registry import ToolRegistry
 
@@ -45,14 +48,26 @@ _SYSTEM = (
     "To process a workspace file, OPEN IT DIRECTLY inside your code by its relative name — your code "
     "runs with the workspace as the working directory. You do NOT need to readFile first or pass "
     "file contents through input for normal file processing.\n"
+    "Prefer runPython for one-off arithmetic, parsing, sorting, aggregation, and file transformation. "
+    "Create a generated tool only when the user asks for a reusable tool or when reuse is clearly useful.\n"
+    "After a runPython failure, retry with corrected runPython code unless the user asked for a reusable "
+    "tool. Do not switch to update_tool for a built-in tool.\n"
+    "When writing Python for JSON files, inspect whether the top-level value is a dict or list. If the "
+    "top-level value is a dict with one relevant list field, operate on that list field.\n"
+    "When writing Python for CSV files, use csv.DictReader or csv.DictWriter and use column names from "
+    "the header. For exact duplicate CSV rows, compare the complete row values. For grouped totals, "
+    "group by the requested column only.\n"
+    "When code is included in JSON, encode it as one valid JSON string with escaped newlines "
+    '(\\n); never place raw multiline code outside the string value.\n'
     "For file output, prefer returning the computed text/data from runPython or a created tool, then "
     "call writeFile with the final relative path and content. This lets the runtime apply its file "
-    "write policy.\n"
-    "Prefer deterministic built-in data tools when their descriptions match the task instead of "
-    "creating ad hoc code. Read-only analysis must not call writeFile.\n"
+    "write policy. Do not write files directly inside runPython.\n"
+    "Prefer listed built-in tools when their descriptions match the task instead of creating ad hoc "
+    "code. Read-only analysis must not call writeFile.\n"
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
     "installed and will fail to import. NEVER ask the user to install packages; for CSV work use "
-    "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "
+    "the built-in csv module. Reuse an existing generated tool only when its description exactly "
+    "matches the current task. When a tool fails, "
     "READ the error message carefully and fix it: use update_tool for a created tool, or call the "
     "tool again with corrected input. Do not repeat the same question; if you already have what you "
     "need, act. Only call writeFile when the user explicitly asks to save, write, create, or update "
@@ -99,6 +114,7 @@ class AgentRunner:
         self.skills = skills
         self.policy = policy
         self._session_tools: list[str] = []
+        self._tool_result_cache: dict[str, ToolResult] = {}
         if self.skills is not None and self.generated is not None:
             for digest in self.skills.load_digests():
                 spec = self.skills.load_spec(digest.name)
@@ -191,7 +207,7 @@ class AgentRunner:
             return f"respond:{action.text}"
         return None
 
-    def _blocked_ask_user_observation(self, question: str) -> str | None:
+    def _blocked_ask_user_observation(self, question: str, request: str = "") -> str | None:
         """Convert invalid ask_user package prompts into a runtime observation."""
         lowered = question.lower()
         mentions_package = any(
@@ -214,89 +230,87 @@ class AgentRunner:
                 "설치하거나 사용하지 말고, Python 표준 라이브러리(csv 등)만 사용해 현재 작업을 "
                 "계속 진행하세요."
             )
+        asks_about_file_structure = any(
+            term in lowered
+            for term in (
+                "structure of the data",
+                "data structure",
+                "file structure",
+                "json structure",
+                "csv structure",
+                "파일 구조",
+                "데이터 구조",
+                "데이터의 구조",
+                "json 구조",
+                "csv 구조",
+            )
+        )
+        if asks_about_file_structure:
+            structure_hint = self._workspace_structure_hint(f"{request}\n{question}")
+            return (
+                "작업 영역 파일의 구조는 사용자에게 묻지 않습니다. readFile 또는 runPython으로 "
+                "파일을 직접 열어 최상위 타입과 필요한 필드를 확인한 뒤, 수정한 코드로 계속 "
+                "진행하세요."
+                + (f"\n{structure_hint}" if structure_hint else "")
+            )
         return None
 
-    def _parse_direct_csv_normalize(self, request: str) -> dict[str, Any] | None:
-        lowered = request.lower()
-        if not (
-            ".csv" in lowered
-            and "date" in lowered
-            and any(term in request for term in ("중복", "duplicate"))
-            and any(term in request for term in ("정렬", "sort"))
-            and any(term in request for term in ("저장", "save"))
-        ):
-            return None
-        csv_paths = re.findall(r"[\w.-]+\.csv", request)
-        if not csv_paths:
-            return None
-        src = csv_paths[0]
-        dst = csv_paths[1] if len(csv_paths) >= 2 else f"{Path(src).stem}-clean.csv"
-        return {"src": src, "dst": dst, "sortBy": "date"}
+    def _mentioned_workspace_paths(self, text: str) -> list[str]:
+        """Extract likely workspace-relative data paths from a user/model message."""
+        candidates = re.findall(r"(?:[\w.-]+/)*[\w.-]+\.(?:json|csv|txt)", text, flags=re.I)
+        paths: list[str] = []
+        for candidate in candidates:
+            path = candidate.strip("`'\".,:;()[]{}")
+            if path.startswith("workspace/"):
+                path = path.removeprefix("workspace/")
+            if path and ".." not in Path(path).parts and path not in paths:
+                paths.append(path)
+        return paths
 
-    def _parse_direct_json_numeric_query(self, request: str) -> dict[str, Any] | None:
-        lowered = request.lower()
-        if not (
-            ".json" in lowered
-            and ("이름" in request or "name" in lowered)
-            and ("평균" in request or "average" in lowered or "avg" in lowered)
-        ):
-            return None
-        json_paths = re.findall(r"[\w.-]+\.json", request)
-        if not json_paths:
-            return None
-        field_match = re.search(
-            r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:>=|=>|[가이]?\s*\d+(?:\.\d+)?\s*이상)",
-            request,
-        )
-        numeric_field = field_match.group(1) if field_match is not None else "hp"
-        threshold = 100.0
-        comparison = re.search(
-            rf"{re.escape(numeric_field)}\s*(?:>=|=>)\s*(\d+(?:\.\d+)?)",
-            request,
-            re.IGNORECASE,
-        )
-        korean_min = re.search(r"(\d+(?:\.\d+)?)\s*이상", request)
-        if comparison is not None:
-            threshold = float(comparison.group(1))
-        elif korean_min is not None:
-            threshold = float(korean_min.group(1))
-        payload: dict[str, Any] = {
-            "src": json_paths[0],
-            "numericField": numeric_field,
-            "labelField": "name",
-            "threshold": threshold,
-        }
-        if "몬스터" in request or "monster" in lowered:
-            payload["rootKey"] = "monsters"
-        return payload
+    def _workspace_structure_hint(self, text: str) -> str | None:
+        """Read small file previews so the model can self-correct schema assumptions."""
+        hints: list[str] = []
+        for path in self._mentioned_workspace_paths(text)[:3]:
+            res = self.deps.registry.call("readFile", {"path": path, "maxBytes": 4096})
+            if not res.ok or not isinstance(res.output, dict):
+                continue
+            content = str(res.output.get("content", ""))
+            hint = self._describe_file_content(path, content)
+            if hint:
+                hints.append(hint)
+        return "\n".join(hints) if hints else None
 
-    def _parse_direct_csv_aggregate(self, request: str) -> dict[str, Any] | None:
-        lowered = request.lower()
-        if not (
-            ".csv" in lowered
-            and any(term in request for term in ("중복", "duplicate"))
-            and any(term in request for term in ("합계", "sum"))
-        ):
-            return None
-        csv_paths = re.findall(r"[\w.-]+\.csv", request)
-        if not csv_paths:
-            return None
-        sum_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:의\s*)?(?:합계|sum)", request)
-        if sum_match is None:
-            sum_match = re.search(r"\bsum\s+([A-Za-z_][A-Za-z0-9_]*)", request, re.IGNORECASE)
-        group_match = re.search(
-            r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:별|by\b)",
-            request,
-            re.IGNORECASE,
-        )
-        if group_match is None:
-            group_match = re.search(r"\bby\s+([A-Za-z_][A-Za-z0-9_]*)", request, re.IGNORECASE)
-        return {
-            "src": csv_paths[0],
-            "groupBy": group_match.group(1) if group_match is not None else "type",
-            "sumColumn": sum_match.group(1) if sum_match is not None else "amount",
-            "dedupe": True,
-        }
+    def _describe_file_content(self, path: str, content: str) -> str | None:
+        suffix = Path(path).suffix.lower()
+        if suffix == ".json":
+            try:
+                value = json.loads(content)
+            except json.JSONDecodeError:
+                return f"{path}: JSON 미리보기를 파싱하지 못했습니다."
+            if isinstance(value, dict):
+                keys = list(value.keys())
+                list_fields = {
+                    key: len(item)
+                    for key, item in value.items()
+                    if isinstance(item, list)
+                }
+                return (
+                    f"{path}: 최상위 타입은 dict, keys={keys}, "
+                    f"listFields={list_fields}. dict 안의 관련 list 필드를 사용하세요."
+                )
+            if isinstance(value, list):
+                sample_type = type(value[0]).__name__ if value else "empty"
+                return f"{path}: 최상위 타입은 list, length={len(value)}, sampleType={sample_type}."
+            return f"{path}: 최상위 타입은 {type(value).__name__}."
+        if suffix == ".csv":
+            rows = list(csv.reader(io.StringIO(content)))
+            if not rows:
+                return f"{path}: CSV가 비어 있습니다."
+            return f"{path}: CSV header={rows[0]}, previewRows={max(0, len(rows) - 1)}."
+        if content:
+            first_line = content.splitlines()[0] if content.splitlines() else ""
+            return f"{path}: 텍스트 파일 미리보기 첫 줄={first_line!r}."
+        return None
 
     def _request_allows_file_write(self, request: str) -> bool:
         lowered = request.lower()
@@ -318,7 +332,97 @@ class AgentRunner:
         )
 
     def _is_side_effect_tool(self, name: str) -> bool:
-        return name in {"writeFile", "normalizeCsv"}
+        return name == "writeFile"
+
+    def _generated_tool_reuse_block(self, name: str, request: str) -> str | None:
+        if self._request_allows_file_write(request):
+            return None
+        tool = self.deps.registry.get(name)
+        if tool is None or tool.origin != "generated":
+            return None
+        text = f"{tool.name} {tool.description}".lower()
+        transformation_terms = (
+            "write",
+            "save",
+            "sort",
+            "clean",
+            "dedup",
+            "duplicate",
+            "remove",
+            "저장",
+            "정렬",
+            "정리",
+            "중복",
+            "제거",
+        )
+        if any(term in text for term in transformation_terms):
+            return (
+                f"{name} 생성 도구는 파일 변환 작업용으로 보이며 현재 요청은 읽기 전용입니다. "
+                "이 도구를 호출하지 말고 runPython으로 필요한 값을 계산해 최종 답변하세요."
+            )
+        return None
+
+    def _cached_tool_summary(self, name: str, result: ToolResult) -> str:
+        if isinstance(result.output, dict):
+            path = result.output.get("path")
+            if path:
+                return f"{name} 실행은 이미 성공했습니다. 결과 파일: {path}"
+        return f"{name} 실행은 이미 성공했습니다. 마지막 결과: {result.output}"
+
+    def _direct_file_write_feedback(self, request: str) -> tuple[bool, str] | None:
+        if not self._request_allows_file_write(request):
+            return None
+        for path in reversed(self._mentioned_workspace_paths(request)):
+            res = self.deps.registry.call("readFile", {"path": path, "maxBytes": 1_048_576})
+            if not res.ok or not isinstance(res.output, dict):
+                continue
+            content = str(res.output.get("content", ""))
+            validation = self._validate_created_file(path, content, request)
+            if validation is not None:
+                return False, validation
+            return True, f"{path} 파일 저장이 완료되었습니다."
+        return None
+
+    def _validate_created_file(self, path: str, content: str, request: str) -> str | None:
+        if Path(path).suffix.lower() != ".csv":
+            return None
+        rows = list(csv.DictReader(io.StringIO(content)))
+        lowered = request.lower()
+        if "중복" in request or "duplicate" in lowered:
+            source_paths = [
+                candidate
+                for candidate in self._mentioned_workspace_paths(request)
+                if candidate != path and Path(candidate).suffix.lower() == ".csv"
+            ]
+            if source_paths:
+                source_res = self.deps.registry.call(
+                    "readFile", {"path": source_paths[0], "maxBytes": 1_048_576}
+                )
+                if source_res.ok and isinstance(source_res.output, dict):
+                    source_rows = list(
+                        csv.DictReader(io.StringIO(str(source_res.output.get("content", ""))))
+                    )
+                    expected = {tuple(row.items()) for row in source_rows}
+                    actual = {tuple(row.items()) for row in rows}
+                    if actual != expected:
+                        return (
+                            "검증 실패: 출력 CSV의 고유 행 내용이 입력 CSV의 완전 중복 제거 결과와 "
+                            "일치하지 않습니다. 행을 누락하거나 다른 기준으로 제거하지 마세요."
+                        )
+            seen: set[tuple[tuple[str, str], ...]] = set()
+            for row in rows:
+                key = tuple(row.items())
+                if key in seen:
+                    return "검증 실패: 출력 CSV에 완전히 중복된 행이 남아 있습니다. 다시 제거하세요."
+                seen.add(key)
+        wants_date_sort = "date" in lowered and any(
+            term in lowered for term in ("sort", "ascending", "오름차순", "정렬")
+        )
+        if wants_date_sort and rows and "date" in rows[0]:
+            dates = [row["date"] for row in rows]
+            if dates != sorted(dates):
+                return "검증 실패: 출력 CSV가 date 기준 오름차순이 아닙니다. 정렬해서 다시 저장하세요."
+        return None
 
     def _plan_raw(self) -> str:
         with self.tracer.span():
@@ -336,8 +440,6 @@ class AgentRunner:
         assert self.policy is not None
         if name == "writeFile":
             path = str(payload.get("path", ""))
-        elif name == "normalizeCsv":
-            path = str(payload.get("dst", ""))
         else:
             return True, None
         escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
@@ -363,24 +465,6 @@ class AgentRunner:
             return TurnResult(summary=direct_response)
 
         self.conv.add_user(request)
-        direct_json_payload = self._parse_direct_json_numeric_query(request)
-        if direct_json_payload is not None and any(
-            digest.name == "queryJsonNumeric" for digest in self.deps.registry.digests()
-        ):
-            return self._run_direct_json_numeric_query(direct_json_payload)
-
-        direct_aggregate_payload = self._parse_direct_csv_aggregate(request)
-        if direct_aggregate_payload is not None and any(
-            digest.name == "aggregateCsv" for digest in self.deps.registry.digests()
-        ):
-            return self._run_direct_csv_aggregate(direct_aggregate_payload)
-
-        direct_csv_payload = self._parse_direct_csv_normalize(request)
-        if direct_csv_payload is not None and any(
-            digest.name == "normalizeCsv" for digest in self.deps.registry.digests()
-        ):
-            return self._run_direct_csv_normalize(direct_csv_payload)
-
         result = TurnResult()
         fix_failures = 0
         parse_failures = 0
@@ -411,6 +495,27 @@ class AgentRunner:
                 else:
                     action_repeats = 0
                     last_action_sig = sig
+                if (
+                    isinstance(action, CallTool)
+                    and sig is not None
+                    and sig in self._tool_result_cache
+                    and action_repeats > self.deps.max_fix_retries
+                ):
+                    cached = self._tool_result_cache[sig]
+                    result.summary = self._cached_tool_summary(action.name, cached)
+                    result.stopped_reason = "cached_result"
+                    break
+                if (
+                    isinstance(action, CallTool)
+                    and sig is not None
+                    and sig in self._tool_result_cache
+                    and action_repeats > 0
+                ):
+                    cached = self._tool_result_cache[sig]
+                    obs = f"도구 {action.name} 캐시 결과: {cached.output}"
+                    self.conv.add_observation(obs)
+                    result.observations.append(obs)
+                    continue
                 if action_repeats > self.deps.max_fix_retries:
                     # Keep the last real observation as the answer: do not push the
                     # stop note into result.observations or finalize would surface
@@ -441,7 +546,7 @@ class AgentRunner:
                     self.conv.add_observation("계속 진행하세요.")
                     continue
                 if isinstance(action, AskUser):
-                    blocked_ask = self._blocked_ask_user_observation(action.question)
+                    blocked_ask = self._blocked_ask_user_observation(action.question, request)
                     if blocked_ask is not None:
                         self.conv.add_observation(blocked_ask)
                         result.observations.append(blocked_ask)
@@ -452,6 +557,11 @@ class AgentRunner:
                     result.observations.append(obs)
                     continue
                 if isinstance(action, CallTool):
+                    generated_block = self._generated_tool_reuse_block(action.name, request)
+                    if generated_block is not None:
+                        self.conv.add_observation(generated_block)
+                        result.observations.append(generated_block)
+                        continue
                     if action.name == "writeFile" and not self._request_allows_file_write(request):
                         obs = (
                             "현재 요청은 파일 저장을 요구하지 않습니다. writeFile을 실행하지 말고 "
@@ -471,12 +581,30 @@ class AgentRunner:
                     self.tracer.log(kind="tool_call", toolName=action.name)
                     if res.ok:
                         fix_failures = 0
+                        assert sig is not None
+                        self._tool_result_cache[sig] = res
                         obs = f"도구 {action.name} 결과: {res.output}"
                     else:
                         fix_failures += 1
                         obs = f"도구 {action.name} 실패: {res.error}"
                     self.conv.add_observation(obs)
                     result.observations.append(obs)
+                    if (
+                        res.ok
+                        and action.name == "runPython"
+                        and isinstance(res.output, dict)
+                        and not str(res.output.get("stdout", "")).strip()
+                    ):
+                        direct_write_feedback = self._direct_file_write_feedback(request)
+                        if direct_write_feedback is not None:
+                            passed, message = direct_write_feedback
+                            if not passed:
+                                self.conv.add_observation(message)
+                                result.observations.append(message)
+                                continue
+                            result.summary = message
+                            result.stopped_reason = "finish"
+                            break
                     if not res.ok and fix_failures > self.deps.max_fix_retries:
                         note = "연속 실패가 한계를 넘었습니다. 작업을 중단합니다."
                         self.conv.add_observation(note)
@@ -485,11 +613,13 @@ class AgentRunner:
                         break
                     continue
                 if isinstance(action, CreateTool):
+                    self._tool_result_cache.clear()
                     obs = self._handle_create(action)
                     self.conv.add_observation(obs)
                     result.observations.append(obs)
                     continue
                 if isinstance(action, UpdateTool):
+                    self._tool_result_cache.clear()
                     obs = self._handle_update(action)
                     self.conv.add_observation(obs)
                     result.observations.append(obs)
@@ -501,97 +631,6 @@ class AgentRunner:
             self._offer_persist()
             self.ctx.maybe_compact(self.conv)
         return result
-
-    def _run_direct_csv_normalize(self, payload: dict[str, Any]) -> TurnResult:
-        result = TurnResult()
-        with self.tracer.trace():
-            if self.policy is not None:
-                allowed, blocked = self._gate("normalizeCsv", payload)
-                if not allowed:
-                    assert blocked is not None
-                    self.conv.add_observation(blocked)
-                    result.observations.append(blocked)
-                    result.summary = blocked
-                    result.stopped_reason = "policy_denied"
-                    return result
-            res = self.deps.registry.call("normalizeCsv", payload)
-            self.tracer.log(kind="tool_call", toolName="normalizeCsv")
-            if not res.ok:
-                obs = f"도구 normalizeCsv 실패: {res.error}"
-                self.conv.add_observation(obs)
-                result.observations.append(obs)
-                result.summary = obs
-                result.stopped_reason = "direct_tool_failure"
-                self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
-                return result
-            obs = f"도구 normalizeCsv 결과: {res.output}"
-            self.conv.add_observation(obs)
-            result.observations.append(obs)
-            output = res.output or {}
-            result.summary = (
-                f"{output.get('dst', payload['dst'])}에 중복 제거 및 date 오름차순 정렬 결과를 "
-                f"저장했습니다. 고유 행 {output.get('rows')}개, 제거한 중복 "
-                f"{output.get('removedDuplicates')}개입니다."
-            )
-            return result
-
-    def _run_direct_csv_aggregate(self, payload: dict[str, Any]) -> TurnResult:
-        result = TurnResult()
-        with self.tracer.trace():
-            res = self.deps.registry.call("aggregateCsv", payload)
-            self.tracer.log(kind="tool_call", toolName="aggregateCsv")
-            if not res.ok:
-                obs = f"도구 aggregateCsv 실패: {res.error}"
-                self.conv.add_observation(obs)
-                result.observations.append(obs)
-                result.summary = obs
-                result.stopped_reason = "direct_tool_failure"
-                self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
-                return result
-            obs = f"도구 aggregateCsv 결과: {res.output}"
-            self.conv.add_observation(obs)
-            result.observations.append(obs)
-            output = res.output or {}
-            sums = output.get("sums", {})
-            if isinstance(sums, dict):
-                parts = []
-                for key, value in sums.items():
-                    if isinstance(value, int | float):
-                        rendered_value = f"{value:g}"
-                    else:
-                        rendered_value = str(value)
-                    parts.append(f"{key} {rendered_value}")
-            else:
-                parts = []
-            result.summary = (
-                f"완전히 중복된 행은 한 번만 세면 amount 합계는 {', '.join(parts)}입니다."
-            )
-            return result
-
-    def _run_direct_json_numeric_query(self, payload: dict[str, Any]) -> TurnResult:
-        result = TurnResult()
-        with self.tracer.trace():
-            res = self.deps.registry.call("queryJsonNumeric", payload)
-            self.tracer.log(kind="tool_call", toolName="queryJsonNumeric")
-            if not res.ok:
-                obs = f"도구 queryJsonNumeric 실패: {res.error}"
-                self.conv.add_observation(obs)
-                result.observations.append(obs)
-                result.summary = obs
-                result.stopped_reason = "direct_tool_failure"
-                self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
-                return result
-            obs = f"도구 queryJsonNumeric 결과: {res.output}"
-            self.conv.add_observation(obs)
-            result.observations.append(obs)
-            output = res.output or {}
-            labels = ", ".join(output.get("labels", [])) or "없음"
-            numeric_field = str(output.get("numericField", payload.get("numericField", "value")))
-            result.summary = (
-                f"{numeric_field}가 {output.get('threshold', payload['threshold']):g} 이상인 항목은 "
-                f"{labels}입니다. 평균 {numeric_field}는 {output.get('averageValue')}입니다."
-            )
-            return result
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
         """Surface a result when the loop ends without a completion signal.

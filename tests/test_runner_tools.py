@@ -2,11 +2,12 @@ from adaptive_agent.runner import AgentRunner, RunnerDeps
 from adaptive_agent.llm import FakeLLMClient
 from adaptive_agent.tools.registry import ToolRegistry
 from adaptive_agent.tools.generated import GeneratedToolManager
-from adaptive_agent.tools.builtins import build_file_tools, build_normalize_csv
+from adaptive_agent.tools.builtins import build_file_tools, build_run_python
 from adaptive_agent.skills import SkillStore
 from adaptive_agent.sandbox import ExecutionSandbox
 from adaptive_agent.policy import PolicyManager
 from adaptive_agent.schemas import ToolSpec
+from adaptive_agent.tools.base import Tool, ToolResult
 
 
 def build(tmp_path, replies, ask="y"):
@@ -96,7 +97,6 @@ def _write_runner(tmp_path, path, ask):
     reg = ToolRegistry()
     for t in build_file_tools(ws):
         reg.register(t)
-    reg.register(build_normalize_csv(ws))
     deps = RunnerDeps(
         llm=FakeLLMClient(
             replies=[
@@ -160,7 +160,7 @@ def test_repeated_ask_user_stops_with_no_progress(tmp_path):
     assert result.stopped_reason == "no_progress"
 
 
-def test_repeated_identical_tool_call_stops_with_no_progress(tmp_path):
+def test_repeated_identical_tool_call_reuses_cached_result(tmp_path):
     # Re-calling the same tool with identical input never advances state. Each call
     # may succeed (so fix_failures resets), but the run is going nowhere.
     create = (
@@ -171,7 +171,7 @@ def test_repeated_identical_tool_call_stops_with_no_progress(tmp_path):
     call = '{"action":"call_tool","name":"noop","input":{"x":1}}'
     runner = build(tmp_path, [create] + [call] * 6)
     result = runner.run_turn("noop forever")
-    assert result.stopped_reason == "no_progress"
+    assert result.stopped_reason == "cached_result"
 
 
 def test_repeated_identical_write_file_prompts_only_once(tmp_path):
@@ -196,9 +196,131 @@ def test_repeated_identical_write_file_prompts_only_once(tmp_path):
 
     result = runner.run_turn("write once")
 
-    assert result.stopped_reason == "no_progress"
+    assert result.stopped_reason == "cached_result"
     assert asks == ["'write_file' 작업을 진행할까요? (y/n)"]
     assert (ws / "out.txt").read_text() == "hello"
+
+
+def test_run_python_direct_file_write_can_finish_from_created_file(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    reg = ToolRegistry()
+    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    reg.register(build_run_python(sandbox))
+    deps = RunnerDeps(
+        llm=FakeLLMClient(
+            replies=[
+                (
+                    '{"action":"call_tool","name":"runPython","input":'
+                    '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"a,b\\\\n\\")"}}'
+                )
+            ]
+        ),
+        registry=reg,
+        ask=lambda *a: "y",
+        log_dir=tmp_path,
+    )
+    runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: "y"))
+
+    result = runner.run_turn("save result to out.csv")
+
+    assert result.stopped_reason == "finish"
+    assert result.summary == "out.csv 파일 저장이 완료되었습니다."
+    assert (ws / "out.csv").read_text() == "a,b\n"
+
+
+def test_run_python_direct_file_write_validates_requested_csv_sort(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    reg = ToolRegistry()
+    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    reg.register(build_run_python(sandbox))
+    deps = RunnerDeps(
+        llm=FakeLLMClient(
+            replies=[
+                (
+                    '{"action":"call_tool","name":"runPython","input":'
+                    '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"date\\\\n2026-02-01\\\\n2026-01-01\\\\n\\")"}}'
+                ),
+                '{"action":"finish","summary":"fixed"}',
+            ]
+        ),
+        registry=reg,
+        ask=lambda *a: "y",
+        log_dir=tmp_path,
+    )
+    runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: "y"))
+
+    result = runner.run_turn("sort by date ascending and save to out.csv")
+
+    assert result.summary == "fixed"
+    assert any("date 기준 오름차순이 아닙니다" in o for o in result.observations)
+
+
+def test_run_python_direct_file_write_validates_dedupe_preserves_unique_rows(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "input.csv").write_text("id,date\n1,2026-01-01\n2,2026-01-02\n1,2026-01-01\n")
+    reg = ToolRegistry()
+    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    reg.register(build_run_python(sandbox))
+    deps = RunnerDeps(
+        llm=FakeLLMClient(
+            replies=[
+                (
+                    '{"action":"call_tool","name":"runPython","input":'
+                    '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"id,date\\\\n1,2026-01-01\\\\n\\")"}}'
+                ),
+                '{"action":"finish","summary":"fixed"}',
+            ]
+        ),
+        registry=reg,
+        ask=lambda *a: "y",
+        log_dir=tmp_path,
+    )
+    runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: "y"))
+
+    result = runner.run_turn("input.csv duplicate rows remove and save to out.csv")
+
+    assert result.summary == "fixed"
+    assert any("고유 행 내용" in o for o in result.observations)
+
+
+def test_read_only_request_blocks_file_transform_generated_tool(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "sort-csv",
+            "Remove duplicate rows and sort CSV by date.",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=True, output={"path": "out.csv"}),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"sort-csv","input":{}}',
+                    '{"action":"finish","summary":"used runPython instead"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "y",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("amount 합계를 type별로 알려줘")
+
+    assert result.summary == "used runPython instead"
+    assert any("읽기 전용" in o for o in result.observations)
 
 
 def test_update_unknown_tool_is_graceful(tmp_path):

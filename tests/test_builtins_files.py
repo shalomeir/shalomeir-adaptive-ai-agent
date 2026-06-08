@@ -1,6 +1,5 @@
-import csv
-
-from adaptive_agent.tools.builtins import build_file_tools, build_normalize_csv
+from adaptive_agent.sandbox import ExecutionSandbox
+from adaptive_agent.tools.builtins import build_file_tools, build_run_python
 
 
 def test_write_then_read(tmp_path):
@@ -38,22 +37,21 @@ def test_list_files_with_symlinked_workspace(tmp_path):
     assert "x.txt" in [e["path"] for e in res.output["entries"]]
 
 
-def test_normalize_csv_dedupes_and_sorts(tmp_path):
-    (tmp_path / "events.csv").write_text(
-        "id,date,type,amount\n"
-        "3,2026-03-02,purchase,1200\n"
-        "1,2026-01-15,signup,0\n"
-        "2,2026-02-20,purchase,800\n"
-        "2,2026-02-20,purchase,800\n"
-        "4,2026-01-15,refund,-200\n",
-        encoding="utf-8",
-    )
-    tool = build_normalize_csv(tmp_path)
+def test_run_python_repairs_raw_newline_inside_string_literal(tmp_path):
+    sandbox = ExecutionSandbox(tmp_path, timeout_sec=2, max_output_bytes=10_000)
+    tool = build_run_python(sandbox)
 
-    res = tool.handler({"src": "events.csv", "dst": "events-clean.csv", "sortBy": "date"})
+    res = tool.handler({"code": "print(f'a\nb')"})
 
     assert res.ok
-    with (tmp_path / "events-clean.csv").open(newline="", encoding="utf-8") as fh:
-        rows = list(csv.reader(fh))[1:]
-    assert len(rows) == 4
-    assert [row[1] for row in rows] == sorted(row[1] for row in rows)
+    assert res.output["stdout"] == "a\nb\n"
+
+
+def test_run_python_invokes_accidental_run_function(tmp_path):
+    sandbox = ExecutionSandbox(tmp_path, timeout_sec=2, max_output_bytes=10_000)
+    tool = build_run_python(sandbox)
+
+    res = tool.handler({"code": "def run(input):\n    return {'total': 3}"})
+
+    assert res.ok
+    assert res.output["stdout"] == '{"total": 3}\n'
