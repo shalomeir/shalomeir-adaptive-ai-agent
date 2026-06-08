@@ -23,6 +23,7 @@ from .tools.generated import GeneratedToolManager
 from .tools.registry import ToolRegistry
 
 NON_INTERACTIVE_ASK = "__adaptive_agent_non_interactive_ask_unavailable__"
+LLM_RESPONSE_LOG_CHARS = 4000
 
 _SYSTEM = (
     "You are a task-solving agent that creates and runs small Python tools. You are not a "
@@ -113,6 +114,13 @@ def _is_numeric(rows: list[dict[str, str]], field: str) -> bool:
     except (KeyError, TypeError, ValueError):
         return False
     return True
+
+
+def _preview_text(text: str, limit: int = LLM_RESPONSE_LOG_CHARS) -> tuple[str, bool]:
+    """Return a bounded preview for local diagnostics logs."""
+    if len(text) <= limit:
+        return text, False
+    return text[:limit], True
 
 
 class AgentRunner:
@@ -936,7 +944,14 @@ class AgentRunner:
                 if digest.name not in self._suppressed_tool_names
             ]
             raw = self.deps.llm.chat(self.conv.messages(), digests)
-            self.tracer.log(kind="llm_call", model=getattr(self.deps.llm, "model", None))
+            preview, truncated = _preview_text(raw)
+            self.tracer.log(
+                kind="llm_call",
+                model=getattr(self.deps.llm, "model", None),
+                responsePreview=preview,
+                responseChars=len(raw),
+                responseTruncated=truncated,
+            )
             return raw
 
     def _gate(self, name: str, payload: dict[str, Any]) -> tuple[bool, str | None]:

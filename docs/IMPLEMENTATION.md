@@ -20,7 +20,7 @@
 | `config.py` | 환경 변수 기반 `AgentConfig` 로딩 |
 | `schemas.py` | action 유니온, ToolSpec, ToolManifest, Message 등 pydantic 모델 |
 | `parsing.py` | LLM 출력의 JSON 복구와 action 파싱, 실패 시 오류 피드백 |
-| `observability.py` | JSONL trace/span 로그, Rich 출력, 이벤트를 익스포터로 전달 |
+| `observability.py` | JSONL trace/span 로그, Rich 출력, bounded LLM 응답 preview, 이벤트를 익스포터로 전달 |
 | `monitoring.py` | 외부 모니터링 익스포터 인터페이스와 no-op 기본 구현 |
 | `sandbox.py` | subprocess 격리 실행(타임아웃, 작업 디렉터리 제한, 네트워크 정책, 출력 제한) |
 | `policy.py` | ALLOW / DENY / ASK_USER 권한 게이트 |

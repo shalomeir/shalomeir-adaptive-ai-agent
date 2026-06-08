@@ -6,13 +6,24 @@ from adaptive_agent.observability import Tracer
 def test_jsonl_event_written(tmp_path):
     tracer = Tracer(log_dir=tmp_path)
     with tracer.trace() as trace_id:
-        tracer.log(kind="llm_call", model="m", inputTokens=10, parseOk=True)
+        tracer.log(
+            kind="llm_call",
+            model="m",
+            inputTokens=10,
+            parseOk=True,
+            responsePreview='{"action":"finish"}',
+            responseChars=19,
+            responseTruncated=False,
+        )
     lines = (tmp_path / "events.jsonl").read_text().splitlines()
     assert len(lines) == 1
     evt = json.loads(lines[0])
     assert evt["kind"] == "llm_call"
     assert evt["traceId"] == trace_id
     assert evt["model"] == "m"
+    assert evt["responsePreview"] == '{"action":"finish"}'
+    assert evt["responseChars"] == 19
+    assert evt["responseTruncated"] is False
 
 
 def test_parent_span_id_propagated(tmp_path):

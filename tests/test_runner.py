@@ -63,6 +63,40 @@ def test_bad_json_then_recovers(tmp_path):
     assert "recovered" in result.summary
 
 
+def test_llm_response_preview_is_logged(tmp_path):
+    import json
+
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"finish","summary":"logged"}',
+        ],
+    )
+
+    runner.run_turn("go")
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    llm_events = [event for event in events if event["kind"] == "llm_call"]
+    assert llm_events[0]["responsePreview"] == '{"action":"finish","summary":"logged"}'
+    assert llm_events[0]["responseChars"] == len('{"action":"finish","summary":"logged"}')
+    assert llm_events[0]["responseTruncated"] is False
+
+
+def test_llm_response_preview_is_bounded(tmp_path):
+    import json
+
+    raw = '{"action":"respond","text":"' + ("x" * 5000) + '"}'
+    runner = build_runner(tmp_path, [raw])
+
+    runner.run_turn("go")
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    first_llm_event = next(event for event in events if event["kind"] == "llm_call")
+    assert len(first_llm_event["responsePreview"]) == 4000
+    assert first_llm_event["responseChars"] == len(raw)
+    assert first_llm_event["responseTruncated"] is True
+
+
 def test_max_iterations_guard(tmp_path):
     # Distinct actions each turn keep advancing (no-progress guard does not fire),
     # so the run is bounded only by max_iterations.

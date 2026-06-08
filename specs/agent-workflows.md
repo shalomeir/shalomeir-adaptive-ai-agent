@@ -74,7 +74,7 @@ async def run_turn(request, context):
 async def plan(context) -> AgentAction:
     for attempt in range(config.maxFixRetries + 1):
         raw = await llm.chat(context.messages(), tools=registry.digests())
-        log(kind="llm_call", model=..., inputTokens=..., cacheHit=...)
+        log(kind="llm_call", model=..., responsePreview=..., responseChars=..., responseTruncated=...)
         try:
             data = json_repair(raw)             # 흔한 깨짐 복구
             action = AgentAction.validate(data)  # pydantic 검증

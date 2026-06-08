@@ -32,6 +32,9 @@ _ALLOWED = {
     "fixIteration",
     "errorKind",
     "message",
+    "responsePreview",
+    "responseChars",
+    "responseTruncated",
 }
 
 
