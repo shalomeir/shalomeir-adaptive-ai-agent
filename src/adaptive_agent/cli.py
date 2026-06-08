@@ -13,7 +13,7 @@ from .config import AgentConfig
 from .llm import HttpLLMClient
 from .monitoring import get_exporter
 from .policy import PolicyManager
-from .runner import AgentRunner, RunnerDeps
+from .runner import NON_INTERACTIVE_ASK, AgentRunner, RunnerDeps
 from .sandbox import ExecutionSandbox
 from .skills import SkillStore
 from .tools.builtins import (
@@ -115,13 +115,13 @@ def run(
     """
     load_dotenv()
     cfg = AgentConfig.load()
-    # Non-interactive: there is no stdin to prompt, so every gate gets a fixed
-    # answer — "y" approves when --yes is set, "n" safely declines otherwise.
+    # Non-interactive: policy gates get a fixed y/n, but free-form ask_user
+    # questions must not be answered with "n" because that corrupts the task.
     answer = "y" if yes else "n"
     runner = _assemble_runner(
         cfg,
         docs_dir,
-        free_ask=lambda q, _c=None: answer,
+        free_ask=lambda q, _c=None: NON_INTERACTIVE_ASK,
         confirm_ask=lambda q: answer,
         max_iterations=max_iterations,
     )

@@ -1,4 +1,4 @@
-from adaptive_agent.runner import AgentRunner, RunnerDeps, _SYSTEM
+from adaptive_agent.runner import NON_INTERACTIVE_ASK, AgentRunner, RunnerDeps, _SYSTEM
 from adaptive_agent.llm import FakeLLMClient
 from adaptive_agent.tools.registry import ToolRegistry
 from adaptive_agent.tools.base import Tool, ToolResult
@@ -224,6 +224,28 @@ def test_ask_user_flow(tmp_path):
     )
     result = runner.run_turn("vague")
     assert any("events.csv" in o for o in result.observations)
+
+
+def test_non_interactive_ask_does_not_inject_no_answer(tmp_path):
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"몬스터 데이터 구조를 확인해 주세요."}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=ToolRegistry(),
+            ask=lambda *a: NON_INTERACTIVE_ASK,
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("monsters.json 분석")
+
+    assert result.summary == "continued"
+    assert not any("사용자 답변: n" in o for o in result.observations)
+    assert any("비대화형 실행" in o or "파일을 직접 열어" in o for o in result.observations)
 
 
 def test_package_install_ask_is_blocked_before_user_prompt(tmp_path):

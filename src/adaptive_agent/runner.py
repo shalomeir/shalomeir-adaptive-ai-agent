@@ -22,6 +22,8 @@ from .tools.base import ToolResult
 from .tools.generated import GeneratedToolManager
 from .tools.registry import ToolRegistry
 
+NON_INTERACTIVE_ASK = "__adaptive_agent_non_interactive_ask_unavailable__"
+
 _SYSTEM = (
     "You are a task-solving agent that creates and runs small Python tools. You are not a "
     "general chatbot, and you are not any vendor's assistant — if asked who you are, say you are "
@@ -283,6 +285,15 @@ class AgentRunner:
                 + (f"\n{structure_hint}" if structure_hint else "")
             )
         return None
+
+    def _non_interactive_ask_observation(self, question: str, request: str) -> str:
+        structure_hint = self._workspace_structure_hint(f"{request}\n{question}")
+        return (
+            "비대화형 실행에서는 사용자에게 추가 질문을 할 수 없습니다. "
+            "요청과 작업 영역 파일만으로 해결 가능한지 먼저 확인하고, 필요한 파일 구조는 "
+            "readFile 또는 runPython으로 직접 확인해 계속 진행하세요."
+            + (f"\n{structure_hint}" if structure_hint else "")
+        )
 
     def _mentioned_workspace_paths(self, text: str) -> list[str]:
         """Extract likely workspace-relative data paths from a user/model message."""
@@ -581,6 +592,11 @@ class AgentRunner:
                         result.observations.append(blocked_ask)
                         continue
                     answer = self.deps.ask(action.question, action.choices)
+                    if answer == NON_INTERACTIVE_ASK:
+                        obs = self._non_interactive_ask_observation(action.question, request)
+                        self.conv.add_observation(obs)
+                        result.observations.append(obs)
+                        continue
                     obs = f"사용자 답변: {answer}"
                     self.conv.add_observation(obs)
                     result.observations.append(obs)
