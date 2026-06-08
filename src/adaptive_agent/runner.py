@@ -121,6 +121,7 @@ class AgentRunner:
         self.policy = policy
         self._session_tools: list[str] = []
         self._tool_result_cache: dict[str, ToolResult] = {}
+        self._suppressed_tool_names: set[str] = set()
         if self.skills is not None and self.generated is not None:
             for digest in self.skills.load_digests():
                 spec = self.skills.load_spec(digest.name)
@@ -391,9 +392,10 @@ class AgentRunner:
             "제거",
         )
         if any(term in text for term in transformation_terms):
+            self._suppressed_tool_names.add(tool.name)
             return (
                 f"{name} 생성 도구는 파일 변환 작업용으로 보이며 현재 요청은 읽기 전용입니다. "
-                "이 도구를 호출하지 말고 runPython으로 필요한 값을 계산해 최종 답변하세요."
+                "이번 턴 도구 목록에서 제외했습니다. runPython으로 필요한 값을 계산해 최종 답변하세요."
             )
         return None
 
@@ -461,7 +463,12 @@ class AgentRunner:
 
     def _plan_raw(self) -> str:
         with self.tracer.span():
-            raw = self.deps.llm.chat(self.conv.messages(), self.deps.registry.digests())
+            digests = [
+                digest
+                for digest in self.deps.registry.digests()
+                if digest.name not in self._suppressed_tool_names
+            ]
+            raw = self.deps.llm.chat(self.conv.messages(), digests)
             self.tracer.log(kind="llm_call", model=getattr(self.deps.llm, "model", None))
             return raw
 
@@ -501,6 +508,7 @@ class AgentRunner:
 
         self.conv.add_user(request)
         result = TurnResult()
+        self._suppressed_tool_names.clear()
         fix_failures = 0
         parse_failures = 0
         last_action_sig: str | None = None

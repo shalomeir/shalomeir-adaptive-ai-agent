@@ -323,6 +323,50 @@ def test_read_only_request_blocks_file_transform_generated_tool(tmp_path):
     assert any("읽기 전용" in o for o in result.observations)
 
 
+def test_blocked_generated_tool_is_hidden_for_rest_of_turn(tmp_path):
+    seen_digests = []
+
+    class RecordingLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, digests):
+            seen_digests.append([digest.name for digest in digests])
+            self.calls += 1
+            if self.calls == 1:
+                return '{"action":"call_tool","name":"sum-amount-by-type","input":{}}'
+            if self.calls == 2:
+                return '{"action":"call_tool","name":"runPython","input":{"code":"print(\\"purchase: 2500\\")"}}'
+            return '{"action":"finish","summary":"purchase: 2500"}'
+
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "sum-amount-by-type",
+            "Sums the amount for each type and writes the result to a CSV file.",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=True, output={"path": "events-clean.csv"}),
+        )
+    )
+    sandbox = ExecutionSandbox(tmp_path / "ws", timeout_sec=5, max_output_bytes=4096)
+    reg.register(build_run_python(sandbox))
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=RecordingLLM(),
+            registry=reg,
+            ask=lambda *a: "y",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("events.csv amount 합계를 type별로 알려줘")
+
+    assert result.summary == "purchase: 2500"
+    assert "sum-amount-by-type" in seen_digests[0]
+    assert "sum-amount-by-type" not in seen_digests[1]
+
+
 def test_update_unknown_tool_is_graceful(tmp_path):
     # The model may try to update a built-in or nonexistent tool; the runner
     # must not crash, just observe and move on.
