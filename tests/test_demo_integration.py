@@ -43,7 +43,7 @@ def _runner(
     )
     return AgentRunner(
         deps,
-        generated=GeneratedToolManager(tmp_path / "session", sandbox),
+        generated=GeneratedToolManager(ws / ".session", sandbox),
         skills=SkillStore(skills_dir or (tmp_path / "skills")),
         policy=PolicyManager(ask=lambda q: ask),
     )
@@ -271,13 +271,7 @@ def test_d8_multiturn_gated_write(tmp_path: Path) -> None:
         "    sel = [m for m in data if m['hp'] >= 100]\n"
         "    return {'names': [m['name'] for m in sel]}\n"
     )
-    table = (
-        "| name | hp |\n"
-        "| --- | --- |\n"
-        "| Dragon | 300 |\n"
-        "| Orc | 150 |\n"
-        "| Wolf | 110 |\n"
-    )
+    table = "| name | hp |\n| --- | --- |\n| Dragon | 300 |\n| Orc | 150 |\n| Wolf | 110 |\n"
     runner = _runner(
         tmp_path,
         ws,

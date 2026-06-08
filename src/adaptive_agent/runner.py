@@ -29,18 +29,30 @@ _SYSTEM = (
     '"code":"def run(input):\\n    return ...","inputSchema":{"type":"object"}}} — make a tool\n'
     '- {"action":"update_tool","name":"<tool>","code":"def run(input):\\n    return ..."} — fix a failed tool\n'
     '- {"action":"finish","summary":"..."} — stop when the task is done\n'
-    "To use a tool you MUST use call_tool — never put a tool name in the \"action\" field. "
-    'Example: to read the workspace file monsters.json, reply '
+    'To use a tool you MUST use call_tool — never put a tool name in the "action" field. '
+    "Example: to read the workspace file monsters.json, reply "
     '{"action":"call_tool","name":"readFile","input":{"path":"monsters.json"}}. '
-    "Workspace file paths are RELATIVE (just the file name, e.g. \"monsters.json\"); do not use "
-    "absolute paths or \"..\". "
-    "Tool code must define run(input): it takes one dict and returns a JSON-serializable value "
-    "(the return value is the result; stdout is only logged). Use ONLY the Python standard library "
-    "(json, csv, re, math, etc.) — third-party packages such as pandas or numpy are NOT installed "
-    "in the sandbox and will fail to import. To process a workspace file, read it first with "
-    "readFile and pass its content into your tool's input. Reuse an existing tool instead of "
-    "recreating it. When a tool fails, read the error and use update_tool. Do not repeat the same "
-    "question; if you already have what you need, act. Keep tool names in kebab-case."
+    'Workspace file paths are RELATIVE (just the file name, e.g. "monsters.json"); do not use '
+    'absolute paths or "..".\n'
+    'There are TWO ways to run Python. Both are invoked with call_tool — "runPython" and any tool '
+    'you create are tool NAMES, never values of the "action" field:\n'
+    "(a) The built-in runPython tool. Invoke it as "
+    '{"action":"call_tool","name":"runPython","input":{"code":"<script>"}}. The code is a TOP-LEVEL '
+    "script: there is NO input variable, do NOT write return — PRINT the result, e.g. "
+    "print(json.dumps(result)).\n"
+    "(b) A tool you create_tool, then call_tool by its name. Its code defines run(input) where "
+    '`input` is the call_tool "input" dict, and you RETURN the result.\n'
+    "To process a workspace file, OPEN IT DIRECTLY inside your code by its relative name — your code "
+    "runs with the workspace as the working directory. For example, a single call_tool to runPython "
+    'with code "import json\\ndata = json.load(open(\\"monsters.json\\"))\\nresult = ...\\n'
+    'print(json.dumps(result))" answers a one-off data question in one step. You do NOT need to '
+    "readFile first or pass file contents through input; use readFile only to peek at a small file.\n"
+    "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
+    "installed and will fail to import. Reuse an existing tool instead of recreating it. When a tool "
+    "fails, READ the error message carefully and fix it: use update_tool for a created tool, or call "
+    "the tool again with corrected input. Do not repeat the same question; if you already have what "
+    "you need, act. Keep tool names in kebab-case. When you have the answer, reply with respond "
+    "(final:true) or finish — do not keep calling tools."
 )
 
 
@@ -63,10 +75,13 @@ class TurnResult:
 
 
 class AgentRunner:
-    def __init__(self, deps: RunnerDeps,
-                 generated: GeneratedToolManager | None = None,
-                 skills: SkillStore | None = None,
-                 policy: PolicyManager | None = None) -> None:
+    def __init__(
+        self,
+        deps: RunnerDeps,
+        generated: GeneratedToolManager | None = None,
+        skills: SkillStore | None = None,
+        policy: PolicyManager | None = None,
+    ) -> None:
         self.deps = deps
         self.tracer = Tracer(deps.log_dir, exporter=deps.exporter)
         self.conv = ConversationStore(system=_SYSTEM)
@@ -82,6 +97,75 @@ class AgentRunner:
             for digest in self.skills.load_digests():
                 spec = self.skills.load_spec(digest.name)
                 self.deps.registry.register(self.generated.create(spec))
+
+    def _direct_conversation_response(self, request: str) -> str | None:
+        """Handle lightweight chat that should not enter the tool-planning loop."""
+        text = request.strip()
+        lowered = text.lower()
+        compact = lowered.replace(" ", "")
+        if not text:
+            return "입력이 비어 있습니다. 짧게라도 말을 걸거나 실행할 작업을 적어 주세요."
+
+        if self._is_runtime_model_question(lowered, compact):
+            model = getattr(self.deps.llm, "model", "설정된 LLM")
+            base_url = getattr(self.deps.llm, "base_url", "설정된 엔드포인트")
+            return (
+                f"현재 이 adaptive-agent CLI는 `{model}` 모델을 쓰고 있습니다. "
+                f"엔드포인트는 `{base_url}`입니다."
+            )
+
+        if compact in {"안녕", "안녕.", "하이", "ㅎㅇ", "hello", "hi"}:
+            model = getattr(self.deps.llm, "model", "설정된 LLM")
+            return (
+                "안녕. 지금은 데모용 adaptive-agent CLI 세션이고, "
+                f"로컬 설정상 `{model}`로 응답하고 있어."
+            )
+
+        if compact in {"그냥대화", "그냥대화.", "대화", "대화.", "잡담", "잡담."}:
+            return "좋아. 도구 실행 말고 그냥 얘기해도 돼. 방금처럼 데모가 딱딱하면 바로 말해줘."
+
+        if compact in {"뭐야", "뭐야.", "머야", "머야."}:
+            model = getattr(self.deps.llm, "model", "설정된 LLM")
+            return (
+                "방금 답이 너무 일반적으로 나간 거야. "
+                f"정확히는 `{model}` 기반의 adaptive-agent CLI 런타임이야."
+            )
+
+        return None
+
+    def _is_runtime_model_question(self, lowered: str, compact: str) -> bool:
+        direct_forms = {
+            "너무슨모델?",
+            "너무슨모델",
+            "무슨모델?",
+            "무슨모델",
+            "모델명?",
+            "모델명",
+            "whatmodel?",
+            "whichmodel?",
+            "whatmodelareyou?",
+            "whichmodelareyou?",
+        }
+        if compact in direct_forms:
+            return True
+        has_model_term = any(term in lowered for term in ("모델", "model", "llm"))
+        asks_runtime = any(
+            term in lowered
+            for term in (
+                "너",
+                "현재",
+                "무슨",
+                "뭐",
+                "어떤",
+                "사용",
+                "쓰",
+                "which",
+                "what",
+                "using",
+                "are you",
+            )
+        )
+        return has_model_term and asks_runtime
 
     def _plan_raw(self) -> str:
         with self.tracer.span():
@@ -103,8 +187,12 @@ class AgentRunner:
         escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
         action_id = "out_of_workspace" if escapes else "write_file"
         decision = self.policy.evaluate(action_id)
-        self.tracer.log(kind="policy_decision", policy=decision.decision,
-                        policyReason=decision.reason, toolName=name)
+        self.tracer.log(
+            kind="policy_decision",
+            policy=decision.decision,
+            policyReason=decision.reason,
+            toolName=name,
+        )
         if decision.decision == "DENY":
             return False, f"정책상 거부됨: {action_id}"
         if decision.decision == "ASK_USER" and not self.policy.confirm(action_id):
@@ -112,19 +200,33 @@ class AgentRunner:
         return True, None
 
     def run_turn(self, request: str) -> TurnResult:
+        direct_response = self._direct_conversation_response(request)
+        if direct_response is not None:
+            self.conv.add_user(request)
+            self.conv.add_assistant(direct_response)
+            return TurnResult(summary=direct_response)
+
         self.conv.add_user(request)
         result = TurnResult()
         fix_failures = 0
+        parse_failures = 0
         with self.tracer.trace():
             for _ in range(self.deps.max_iterations):
                 raw = self._plan_raw()
                 parsed = parse_action_text(raw)
                 if not parsed.ok or parsed.action is None:
+                    parse_failures += 1
                     error = parsed.error or "알 수 없는 파싱 오류"
                     self.tracer.log(kind="llm_call", parseOk=False)
                     self.conv.add_observation(error)
                     result.observations.append(error)
+                    # A model that keeps emitting invalid JSON will not recover by
+                    # looping to max_iterations — stop early instead of spinning.
+                    if parse_failures > self.deps.max_fix_retries:
+                        result.stopped_reason = "parse_failures"
+                        break
                     continue
+                parse_failures = 0
                 action = parsed.action
                 self.tracer.log(kind="llm_call", actionType=action.action, parseOk=True)
                 if isinstance(action, Finish):
@@ -182,9 +284,26 @@ class AgentRunner:
                     continue
             else:
                 result.stopped_reason = "max_iterations"
+            if not result.summary and result.stopped_reason != "finish":
+                self._finalize_incomplete(result)
             self._offer_persist()
             self.ctx.maybe_compact(self.conv)
         return result
+
+    def _finalize_incomplete(self, result: TurnResult) -> None:
+        """Surface a result when the loop ends without a completion signal.
+
+        A weak model sometimes runs the tools that produce the answer but never
+        emits respond(final)/finish, so it burns through the iteration budget. In
+        that case an empty summary hides the work entirely; instead we report the
+        last observation (which usually holds the answer) and record the stop
+        reason as an error event so the run is traceable from the log alone.
+        """
+        last = result.observations[-1] if result.observations else ""
+        result.summary = f"작업을 완결하지 못하고 {result.stopped_reason}(으)로 중단했습니다." + (
+            f" 마지막 결과: {last}" if last else ""
+        )
+        self.tracer.log(kind="error", errorKind=result.stopped_reason, message=result.summary)
 
     def _handle_create(self, action: CreateTool) -> str:
         if self.generated is None:
@@ -199,8 +318,10 @@ class AgentRunner:
         if self.generated is None:
             return "도구 생성기가 구성되지 않았습니다."
         if action.name not in self.generated.specs():
-            return (f"'{action.name}'은(는) 수정할 수 있는 생성 도구가 아닙니다. "
-                    "내장 도구는 call_tool로 호출하고, 새 도구는 create_tool로 만드세요.")
+            return (
+                f"'{action.name}'은(는) 수정할 수 있는 생성 도구가 아닙니다. "
+                "내장 도구는 call_tool로 호출하고, 새 도구는 create_tool로 만드세요."
+            )
         tool = self.generated.update(action.name, action.code)
         self.deps.registry.register(tool)
         if action.name not in self._session_tools:
@@ -215,8 +336,12 @@ class AgentRunner:
             return
         for name in self._session_tools:
             decision = self.policy.evaluate("persist_tool")
-            self.tracer.log(kind="policy_decision", policy=decision.decision,
-                            policyReason=decision.reason, toolName=name)
+            self.tracer.log(
+                kind="policy_decision",
+                policy=decision.decision,
+                policyReason=decision.reason,
+                toolName=name,
+            )
             if decision.decision == "DENY":
                 continue
             if decision.decision == "ASK_USER" and not self.policy.confirm(f"persist:{name}"):

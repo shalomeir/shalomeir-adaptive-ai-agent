@@ -3,8 +3,7 @@ from adaptive_agent.schemas import Message
 
 
 def test_fake_returns_scripted_replies():
-    client = FakeLLMClient(replies=['{"action":"respond","text":"hi"}',
-                                    '{"action":"finish"}'])
+    client = FakeLLMClient(replies=['{"action":"respond","text":"hi"}', '{"action":"finish"}'])
     out1 = client.chat([Message(role="user", content="x")], digests=[])
     out2 = client.chat([Message(role="user", content="y")], digests=[])
     assert "respond" in out1

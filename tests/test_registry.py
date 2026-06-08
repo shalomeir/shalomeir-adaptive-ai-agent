@@ -4,7 +4,9 @@ from adaptive_agent.tools.registry import ToolRegistry
 
 def make_echo() -> Tool:
     return Tool(
-        name="echo", description="echo input", origin="builtin",
+        name="echo",
+        description="echo input",
+        origin="builtin",
         input_schema={"type": "object"},
         handler=lambda inp: ToolResult(ok=True, output={"echo": inp}),
     )
@@ -31,3 +33,19 @@ def test_missing_tool_returns_error():
     res = reg.call("nope", {})
     assert not res.ok
     assert "nope" in res.error
+
+
+def test_call_is_tool_name_format_insensitive():
+    # 모델이 등록명과 다른 형식(camelCase)으로 불러도 정규화 비교로 도구를 찾는다.
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="filter-monsters",
+            description="d",
+            origin="generated",
+            input_schema={"type": "object"},
+            handler=lambda i: ToolResult(ok=True, output="hit"),
+        )
+    )
+    res = reg.call("filterMonsters", {})
+    assert res.ok and res.output == "hit"

@@ -27,8 +27,9 @@ class HttpLLMClient:
     the client provider-agnostic (works with Ollama, vLLM, LiteLLM, etc.).
     """
 
-    def __init__(self, base_url: str, model: str, api_key: str | None = None,
-                 timeout: float = 180) -> None:
+    def __init__(
+        self, base_url: str, model: str, api_key: str | None = None, timeout: float = 180
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key

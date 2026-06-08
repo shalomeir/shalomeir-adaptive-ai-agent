@@ -32,6 +32,9 @@
 
 ```python
 def run_turn(self, request: str) -> TurnResult:
+    direct_response = self._direct_conversation_response(request)
+    if direct_response is not None:
+        return TurnResult(summary=direct_response) # 0) 짧은 대화는 루프 밖에서 처리
     self.conv.add_user(request)
     result = TurnResult()
     fix_failures = 0
@@ -49,13 +52,26 @@ def run_turn(self, request: str) -> TurnResult:
             ...
         else:
             result.stopped_reason = "max_iterations"   # 반복 소진 시 종료
+        if not result.summary and result.stopped_reason != "finish":
+            self._finalize_incomplete(result)      # 3.5) 미완결 종료 폴백
         self._offer_persist()                      # 4) 생성 도구 저장 제안
         self.ctx.maybe_compact(self.conv)          # 5) 길어지면 요약
     return result
 ```
 
-종료는 네 갈래다: `finish` action, `final`이 참인 `respond`, 최대 반복 도달,
-그리고 도구 호출이 연속으로 실패해 상한을 넘는 경우.
+`_direct_conversation_response`는 인사, 모델명 질문, "그냥 대화" 같은 입력을 도구 계획으로
+오인하지 않게 하는 앞단이다. 이 경로는 LLM 호출도, 로그 이벤트도 만들지 않는다. 실제 작업
+요청만 아래 ReAct 루프에 들어간다.
+
+종료는 다섯 갈래다: `finish` action, `final`이 참인 `respond`, 최대 반복 도달,
+도구 호출이 연속으로 실패해 상한을 넘는 경우, 그리고 LLM이 유효한 JSON action을
+연속으로 못 내 파싱 실패 상한을 넘는 경우(`parse_failures`). 마지막 갈래는 약한 모델이
+형식을 잃고 헛도는 것을 `max_iterations`까지 가기 전에 끊는다.
+
+뒤의 두 갈래(최대 반복·연속 실패)는 완료 신호 없이 끝나므로 `summary`가 비어 있다.
+약한 모델이 답을 내는 도구는 다 돌려놓고 `respond(final)`/`finish`로 끝맺지 못해 반복을
+소진하는 경우가 그렇다. `_finalize_incomplete`가 이때 마지막 observation(대개 실제 결과)을
+요약으로 노출하고, 종료 사유를 `error` 이벤트로 남겨 로그만으로도 추적되게 한다.
 
 ```python
 if not res.ok and fix_failures > self.deps.max_fix_retries:
@@ -128,7 +144,9 @@ class Tool:
 ```python
 _RUNNER = """\
 import json, sys, importlib.util
-spec = importlib.util.spec_from_file_location("tool", "tool.py")
+from pathlib import Path
+tool_path = Path(__file__).with_name("tool.py")
+spec = importlib.util.spec_from_file_location("tool", tool_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 payload = json.loads(sys.stdin.read() or "{{}}")
@@ -137,15 +155,20 @@ print("__RESULT__" + json.dumps(result))
 """
 ```
 
-이 스크립트를 `ExecutionSandbox`가 subprocess로 돌린다. 같은 프로세스의 `exec`를 쓰지 않고
-타임아웃·작업 디렉터리 제한·출력 제한을 건다.
+이 스크립트를 `ExecutionSandbox`가 workspace를 cwd로 두고 subprocess로 돌린다. 그래서 생성
+도구의 `open("events.csv")` 같은 상대 경로는 사용자가 보는 작업 영역 파일을 가리킨다. 같은
+프로세스의 `exec`를 쓰지 않고 타임아웃·작업 디렉터리 제한·출력 제한을 건다.
 
 ```python
-cmd = [sys.executable, "-I", rel_path, *(args or [])]   # -I: 격리 모드
+cmd = [sys.executable, "-I", script_path, *(args or [])]   # -I: 격리 모드
 proc = subprocess.run(cmd, cwd=self.workspace, env=env,
                       input=stdin, capture_output=True, text=True,
                       timeout=self.timeout_sec)
 ```
+
+세션 중 생성된 도구는 `workspace/.session/<tool-name>/` 아래에 기록된다. runner는 그
+하위 경로의 `_runner.py`만 실행하도록 workspace 밖 스크립트 경로를 거부한다. macOS에서
+`sandbox-exec`가 있고 네트워크 정책이 `deny`이면 subprocess 네트워크 접근도 차단한다.
 
 결과는 `__RESULT__` 접두가 붙은 줄에서 읽는데, 마지막 일치 줄을 쓴다. 신뢰할 수 없는 코드가
 가짜 `__RESULT__` 줄을 먼저 출력해 반환값을 위조하지 못하게 하기 위해서다.
@@ -216,7 +239,8 @@ conv.replace_body([carry, *recent])
 ## 9. 관측
 
 `Tracer`는 한 요청을 trace로, 그 안의 LLM 호출과 도구 실행을 span으로 묶어 JSONL 한 줄씩
-남긴다. 남기는 필드는 허용 목록으로 제한해 민감 정보가 새지 않게 한다. 같은 이벤트를 교체
+남긴다. span은 스택으로 관리해 각 이벤트가 부모 span(`parentSpanId`)을 기록하므로 중첩
+관계가 로그에 드러난다. 남기는 필드는 허용 목록으로 제한해 민감 정보가 새지 않게 한다. 같은 이벤트를 교체
 가능한 익스포터로도 전달하므로, 외부 모니터링은 호출부를 바꾸지 않고 붙일 수 있다. 전달 실패는
 핵심 경로를 막지 않도록 무시한다.
 

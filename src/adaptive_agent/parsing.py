@@ -50,10 +50,13 @@ def parse_action_text(raw: str) -> ParseResult:
     try:
         data = json_repair(raw)
     except (ValueError, json.JSONDecodeError) as e:
-        return ParseResult(ok=False, error=f"출력이 유효한 JSON이 아닙니다: {e}. "
-                                            "하나의 JSON 객체만 반환하세요.")
+        return ParseResult(
+            ok=False, error=f"출력이 유효한 JSON이 아닙니다: {e}. 하나의 JSON 객체만 반환하세요."
+        )
     try:
         return ParseResult(ok=True, action=parse_agent_action(data))
     except Exception as e:
-        return ParseResult(ok=False, error=f"action 형식을 어겼습니다: {e}. "
-                                            "schemas의 action 형식으로 다시 답하세요.")
+        return ParseResult(
+            ok=False,
+            error=f"action 형식을 어겼습니다: {e}. schemas의 action 형식으로 다시 답하세요.",
+        )

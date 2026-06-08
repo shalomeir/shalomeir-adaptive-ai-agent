@@ -14,6 +14,6 @@ def test_parse_action_ok():
 
 
 def test_parse_action_fail_returns_error():
-    res = parse_action_text('not json at all')
+    res = parse_action_text("not json at all")
     assert not res.ok
     assert res.error

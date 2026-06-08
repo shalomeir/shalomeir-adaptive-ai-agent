@@ -1,8 +1,28 @@
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter
+
+
+def normalize_tool_name(value: str) -> str:
+    """Coerce a model-supplied tool name to kebab-case.
+
+    Weak models routinely emit camelCase/snake_case/spaced names that violate the
+    kebab-case contract. Rather than reject and force a retry the model often
+    can't satisfy, we recover by normalizing: split camelCase boundaries, lower
+    case, and collapse any non-alphanumeric run into a single hyphen.
+    """
+    if not isinstance(value, str):
+        return value
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "-", value)  # camelCase 경계
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s).lower()  # 그 외 구분자 → 하이픈
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "generated-tool"
+
+
+KebabName = Annotated[str, BeforeValidator(normalize_tool_name)]
 
 
 class _Wire(BaseModel):
@@ -10,7 +30,7 @@ class _Wire(BaseModel):
 
 
 class ToolSpec(_Wire):
-    name: str = Field(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")
+    name: KebabName = Field(pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")
     description: str = Field(min_length=1)
     code: str
     entrypoint: str = "run"
@@ -44,7 +64,7 @@ class CreateTool(BaseModel):
 
 class UpdateTool(BaseModel):
     action: Literal["update_tool"]
-    name: str
+    name: KebabName
     code: str
     reason: str | None = None
 

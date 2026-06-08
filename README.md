@@ -23,43 +23,29 @@ pip install -e ".[dev]"
 adaptive-agent version   # 0.1.0 이 찍히면 설치 성공
 ```
 
-시연 방법은 두 가지다. **LLM 없이 바로 확인하는 방법 A**와, **로컬 모델로 직접 대화하는
-방법 B**.
-
 ---
 
-## 방법 A — LLM 없이 데모 8종 바로 확인하기
+## LLM 없이 데모 8종 바로 확인하기
 
-가장 빠르고 확실한 방법이다. 통합 테스트가 가짜 LLM으로 에이전트 루프를 그대로 돌리고, 실제
-생성 도구를 sandbox에서 실행해 결과 상태까지 검증한다. 모델 설치 없이 즉시 돌아간다.
+가장 빠르고 확실한 검증 경로다. 통합 테스트가 가짜 LLM으로 에이전트 루프를 그대로 돌리고,
+실제 생성 도구를 sandbox에서 실행해 결과 상태까지 검증한다. 모델 설치 없이 즉시 돌아간다.
 
 ```bash
 pytest tests/test_demo_integration.py -v
 ```
 
-각 테스트가 데모 시나리오 하나에 대응한다.
-
-| 테스트 | 데모 | 확인하는 것 |
-| --- | --- | --- |
-| `test_d1_json_query` | D1 | JSON에서 조건 필터 + 평균 계산 도구 생성·실행 |
-| `test_d2_persist_then_d5_reuse` | D2·D5 | CSV 중복 제거·정렬 도구를 저장하고, 다음 세션에서 재사용 |
-| `test_d6_object_tree` | D6 | 문서 근거 조회 후 객체 트리 상태 변경, 결과 재검증 |
-| `test_d7_out_of_workspace_denied` | D7 | 작업 영역 밖 쓰기를 정책이 거부 |
-| `test_d8_multiturn_gated_write` | D8 | 다중 턴 + 권한 확인을 거친 파일 쓰기 |
-
-시나리오의 상세 설명과 기대값은 `specs/demo_case.md`, 입력 데이터는 `demorsc/`에 있다.
-
 전체 테스트와 품질 점검은 이렇게 돌린다.
 
 ```bash
-pytest -q              # 전체 테스트
-mypy src               # 타입 검사
-ruff check src tests   # 린트
+pytest -q
+mypy src
+ruff check src tests
+ruff format --check .
 ```
 
 ---
 
-## 방법 B — 로컬 모델로 직접 대화하며 시연하기
+## 로컬 모델로 직접 대화하며 시연하기
 
 키 없이 로컬에서 돌리는 경로를 1순위로 안내한다. 여기서는 [Ollama](https://ollama.com)를
 예로 든다.
@@ -68,7 +54,7 @@ ruff check src tests   # 린트
 
 ```bash
 # Ollama 설치 후, 코드 생성에 쓸 만한 모델을 받는다
-ollama pull qwen2.5-coder
+ollama pull qwen2.5-coder:7b
 # Ollama는 http://localhost:11434/v1 에 OpenAI 호환 엔드포인트를 연다
 ```
 
@@ -76,7 +62,7 @@ ollama pull qwen2.5-coder
 
 ```bash
 export AGENT_BASE_URL=http://localhost:11434/v1
-export AGENT_MODEL=qwen2.5-coder
+export AGENT_MODEL=qwen2.5-coder:7b
 # 호스팅 모델을 쓸 때만 키가 필요하다
 # export AGENT_API_KEY=sk-...
 ```
@@ -142,23 +128,34 @@ adaptive-agent chat
   기대: 이전 턴의 결과를 이어받아 표를 만들고, 파일 쓰기에서 `(y/n)` 확인 후 저장한다.
 
 > 로컬 모델의 실제 결과는 모델 성능에 따라 달라질 수 있다. 정확한 기대값을 결정적으로 보고
-> 싶다면 방법 A의 통합 테스트를 사용한다.
+> 싶다면 위 통합 테스트를 사용한다.
 
 ---
 
 ## CLI 사용법
 
-명령은 둘이다.
+명령은 셋이다.
 
 ```bash
 adaptive-agent version        # 버전 출력
 adaptive-agent chat           # 대화형 세션 시작
 adaptive-agent chat --docs-dir demorsc/docs   # 근거 조회용 문서 폴더 지정(기본값)
+
+# 작업 한 건을 비대화형으로 실행(스크립트·CI·반복 테스트용)
+adaptive-agent run "monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
+adaptive-agent run "events.csv에서 중복을 지우고 date로 정렬해 events-clean.csv로 저장해줘." --yes
+adaptive-agent run "..." --max-iterations 30   # 반복 상한 override
 ```
 
-세션 동작은 이렇다.
+`run`은 한 번 실행하고 결과를 출력한 뒤 종료한다. 비대화형이라 `(y/n)` 확인을 직접 받을 수
+없으므로, 파일 쓰기·도구 저장 같은 부수효과를 진행하려면 `--yes`로 모두 자동 승인한다.
+`--yes` 없이는 안전하게 거절한다. 자유 형식 되묻기(ask_user)는 비대화형에서 답할 수 없어
+한계가 있다.
+
+대화형 `chat` 세션 동작은 이렇다.
 
 - `you:` 프롬프트에 자연어로 요청을 적는다.
+- 인사, 모델명 질문, 짧은 잡담은 도구 계획 없이 바로 답한다.
 - 요청이 모호하면 에이전트가 되묻는다. 답을 입력하면 이어 진행한다.
 - 파일 쓰기, 도구 저장처럼 부수효과가 있는 단계에서 `(y/n)`을 묻는다. `y`로 승인, `n`으로 거절.
 - 작업이 끝나면 `agent:` 줄에 요약을 보여준다.
@@ -196,12 +193,19 @@ cat skills/*/SKILL.md
 | --- | --- | --- |
 | `AGENT_PROVIDER` | `openai-compatible` | provider 표식 |
 | `AGENT_BASE_URL` | `http://localhost:11434/v1` | chat completions 엔드포인트 |
-| `AGENT_MODEL` | `qwen2.5-coder` | 모델 이름 |
+| `AGENT_MODEL` | `qwen2.5-coder:7b` | 모델 이름 |
 | `AGENT_API_KEY` | (없음) | 호스팅 provider에서만 필요 |
 | `AGENT_MONITORING` | `off` | `off`, 또는 `langfuse`로 외부 모니터 연결 |
-
-반복 상한, 도구 타임아웃, 출력 제한, compaction 임계, 작업 영역·skill 디렉터리 같은 나머지
-값은 `AgentConfig`의 기본값을 따른다.
+| `AGENT_MAX_ITERATIONS` | `20` | 한 작업에서 허용하는 최대 루프 횟수 |
+| `AGENT_MAX_FIX_RETRIES` | `3` | 파싱 실패나 도구 연속 실패 허용 횟수 |
+| `AGENT_TOOL_TIMEOUT_SEC` | `20` | 생성 도구와 runPython 실행 타임아웃 |
+| `AGENT_LLM_TIMEOUT_SEC` | `180` | LLM HTTP 호출 타임아웃 |
+| `AGENT_MAX_OUTPUT_BYTES` | `65536` | 도구 stdout/stderr 보관 상한 |
+| `AGENT_COMPACTION_TOKEN_THRESHOLD` | `12000` | 대화 compaction 임계값 |
+| `AGENT_WORKSPACE_DIR` | `./workspace` | 파일 도구와 생성 도구 실행 작업 영역 |
+| `AGENT_SKILLS_DIR` | `./skills` | 승인된 도구 저장 위치 |
+| `AGENT_LOG_DIR` | `./logs` | JSONL 실행 로그 위치 |
+| `AGENT_NETWORK_DEFAULT` | `deny` | sandbox 네트워크 기본 정책 |
 
 ---
 
@@ -210,7 +214,8 @@ cat skills/*/SKILL.md
 - 프레임워크 없이 제어 루프를 직접 구현해 흐름을 코드에 드러낸다.
 - JSON action 프로토콜을 1차 채널로 두고, 복구·검증·재요청으로 약한 모델을 방어한다.
 - 생성 도구는 메타데이터를 가진 skill 라이브러리로 저장하고, 프롬프트에는 이름과 설명만 올린다.
-- 신뢰할 수 없는 코드는 subprocess로 격리한다.
+- 신뢰할 수 없는 코드는 workspace cwd의 subprocess로 격리하고, 세션 도구 코드는
+  `workspace/.session/` 아래에 둔다.
 - 권한 판단은 모델이 아니라 런타임이 내린다. 쓰기는 묻고, 작업 영역 밖은 거부한다.
 - 컨텍스트는 누적, 요약 compaction, 영속 skill의 세 층으로 둔다.
 
@@ -218,10 +223,10 @@ cat skills/*/SKILL.md
 
 ## 한계와 향후 작업
 
-- sandbox는 프로세스 수준 격리다. 파일시스템·네트워크 격리는 컨테이너나 자원 제한으로
-  보강해야 한다(네트워크는 기본 비활성이나 아직 강제하지는 않는다).
+- sandbox는 subprocess, timeout, 출력 제한, workspace 내부 스크립트 실행 제한을 제공한다.
+  macOS에서는 `sandbox-exec`가 있으면 `AGENT_NETWORK_DEFAULT=deny`일 때 네트워크도 차단한다.
+  더 강한 파일시스템 격리는 컨테이너나 OS sandbox 정책으로 보강해야 한다.
 - 생성 도구 품질은 모델과 검증 루프에 의존한다.
-- 환경 변수로 바꿀 수 있는 설정은 일부이며 나머지는 코드 기본값이다.
 - 복잡한 작업을 task list로 분해해 위임하는 동적 워크플로는 설계만 두고 향후 작업으로 남겼다.
 
 ## 라이선스

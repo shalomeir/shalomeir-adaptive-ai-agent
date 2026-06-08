@@ -13,7 +13,9 @@ from .base import Tool, ToolResult
 # only {entrypoint} is substituted.
 _RUNNER = """\
 import json, sys, importlib.util
-spec = importlib.util.spec_from_file_location("tool", "tool.py")
+from pathlib import Path
+tool_path = Path(__file__).with_name("tool.py")
+spec = importlib.util.spec_from_file_location("tool", tool_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 payload = json.loads(sys.stdin.read() or "{{}}")
@@ -35,6 +37,13 @@ class GeneratedToolManager:
         self.sandbox = sandbox
         self._specs: dict[str, ToolSpec] = {}
 
+    def _runner_rel_path(self, name: str) -> str:
+        root = self.sandbox.workspace.resolve()
+        runner = (self._dir(name) / "_runner.py").resolve()
+        if runner != root and root not in runner.parents:
+            raise ValueError("생성 도구 세션 디렉터리는 workspace 안에 있어야 합니다")
+        return str(runner.relative_to(root))
+
     def _dir(self, name: str) -> Path:
         d = self.session_dir / name
         d.mkdir(parents=True, exist_ok=True)
@@ -44,19 +53,15 @@ class GeneratedToolManager:
         """Write tool.py and _runner.py to the tool's directory."""
         d = self._dir(spec.name)
         (d / "tool.py").write_text(spec.code, encoding="utf-8")
-        (d / "_runner.py").write_text(
-            _RUNNER.format(entrypoint=spec.entrypoint), encoding="utf-8"
-        )
+        (d / "_runner.py").write_text(_RUNNER.format(entrypoint=spec.entrypoint), encoding="utf-8")
 
     def _invoke(self, spec: ToolSpec, payload: dict[str, Any]) -> ToolResult:
-        """Run _runner.py with JSON payload via a fresh sandbox scoped to the tool dir."""
-        sb = ExecutionSandbox(
-            self._dir(spec.name),
-            self.sandbox.timeout_sec,
-            self.sandbox.max_output_bytes,
-            self.sandbox.network,
-        )
-        res = sb.run_file("_runner.py", stdin=json.dumps(payload))
+        """Run _runner.py with the workspace as cwd so relative file paths work."""
+        try:
+            runner_path = self._runner_rel_path(spec.name)
+        except ValueError as e:
+            return ToolResult(ok=False, error=str(e))
+        res = self.sandbox.run_file(runner_path, stdin=json.dumps(payload))
         if res.timed_out:
             return ToolResult(ok=False, error="실행 시간 초과")
         if res.exit_code != 0:
@@ -68,7 +73,7 @@ class GeneratedToolManager:
             if line.startswith("__RESULT__"):
                 result_line = line
         if result_line is not None:
-            return ToolResult(ok=True, output=json.loads(result_line[len("__RESULT__"):]))
+            return ToolResult(ok=True, output=json.loads(result_line[len("__RESULT__") :]))
         return ToolResult(ok=False, error="도구가 결과를 반환하지 않았습니다")
 
     def smoke_test(self, spec: ToolSpec) -> ToolResult:

@@ -60,9 +60,7 @@ class SkillStore:
             encoding="utf-8",
         )
         # Human-readable summary for the skill directory.
-        (d / "SKILL.md").write_text(
-            f"# {spec.name}\n\n{spec.description}\n", encoding="utf-8"
-        )
+        (d / "SKILL.md").write_text(f"# {spec.name}\n\n{spec.description}\n", encoding="utf-8")
         return manifest
 
     def load_digests(self) -> list[ToolDigest]:

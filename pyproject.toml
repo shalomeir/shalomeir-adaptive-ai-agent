@@ -22,6 +22,7 @@ packages = ["src/adaptive_agent"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.ruff]

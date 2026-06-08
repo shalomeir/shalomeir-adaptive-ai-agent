@@ -7,6 +7,7 @@
 | 버전 | 날짜 | 변경 내용 |
 | --- | --- | --- |
 | 0.1 | 2026-06-01 | 최초 작성. 언어, 의존성 정책, 핵심 라이브러리, MCP·비동기·관측 방침 정의 |
+| 0.2 | 2026-06-08 | 현재 구현에 맞춰 sandbox 실행 경계와 환경 변수 설정 범위를 갱신 |
 
 ## 1. 문서 관리 원칙
 
@@ -50,7 +51,7 @@
 | pydantic v2 | 데이터 모델과 검증 | action, 도구 manifest, 설정, 로그 이벤트를 모델로 정의하고 검증. JSON schema도 여기서 뽑는다 |
 | httpx | LLM HTTP 호출 | OpenAI 호환 엔드포인트를 직접 호출한다. async 지원. 특정 벤더 SDK에 묶이지 않아 provider 비종속과 순수 구현 목표에 맞는다 |
 
-표준 라이브러리로 처리하는 부분: `asyncio`, `subprocess`, `resource`(POSIX 자원 제한), `json`, `pathlib`, `logging`, `dataclasses` 보조.
+표준 라이브러리로 처리하는 부분: `subprocess`, `json`, `pathlib`, `logging`, `dataclasses` 보조.
 
 벤더 SDK(openai, anthropic 등)는 쓰지 않는다. 금지 제약 때문이 아니라, httpx로 OpenAI 호환 규약만 맞추면 로컬 모델과 호스팅을 한 경로로 다룰 수 있어 더 순수하고 이식성이 좋기 때문이다.
 
@@ -104,9 +105,10 @@ MCP는 도구를 주고받는 프로토콜로만 쓴다. 제어 루프를 대신
 ## 9. 실행 격리
 
 - 생성 코드는 subprocess로 분리해 실행한다. 같은 프로세스의 직접 실행은 쓰지 않는다.
-- timeout, 작업 디렉터리 제한, 환경 변수 allowlist, 표준 출력·오류 크기 제한, 쓰기 경로 제한, 네트워크 기본 차단을 둔다.
-- POSIX에서는 `resource`로 CPU 시간과 메모리 상한을 건다.
-- 더 강한 격리(컨테이너, bubblewrap, firejail)는 운영 환경 옵션으로 문서화하되 MVP 필수는 아니다. 한계는 README에 명시한다.
+- 생성 도구와 `runPython`은 workspace를 cwd로 실행한다. 실행할 스크립트 경로는 workspace 안으로 제한하고, 세션 도구 코드는 `workspace/.session/` 아래에 둔다.
+- timeout, 환경 변수 allowlist, 표준 출력·오류 크기 제한, 쓰기 경로 정책, 네트워크 기본 차단을 둔다.
+- macOS에서는 `sandbox-exec`가 있으면 `networkDefault=deny`일 때 subprocess 네트워크 접근을 차단한다. 다른 환경에서는 subprocess 격리와 timeout·출력 제한이 기본선이다.
+- 더 강한 파일시스템 격리와 CPU·메모리 자원 제한(컨테이너, OS sandbox, cgroup 등)은 운영 환경 옵션으로 문서화하되 MVP 필수는 아니다. 한계는 README에 명시한다.
 
 ## 10. 로그와 관측
 

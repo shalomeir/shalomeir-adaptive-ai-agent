@@ -20,3 +20,10 @@ def test_output_truncated(tmp_path):
     res = sb.run_code("print('x' * 1000)")
     assert res.truncated is True
     assert len(res.stdout) <= 50
+
+
+def test_rejects_script_outside_workspace(tmp_path):
+    sb = ExecutionSandbox(workspace=tmp_path / "ws", timeout_sec=5, max_output_bytes=1000)
+    res = sb.run_file("../escape.py")
+    assert res.exit_code == 1
+    assert "workspace 밖" in res.stderr

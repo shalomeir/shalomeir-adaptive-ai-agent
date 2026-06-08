@@ -12,10 +12,26 @@ from rich.console import Console
 from .monitoring import Exporter, NoopExporter
 
 _ALLOWED = {
-    "durationMs", "model", "inputTokens", "outputTokens", "cacheHit", "actionType",
-    "parseOk", "retries", "toolName", "exitCode", "timedOut", "outputBytes",
-    "truncated", "policy", "policyReason", "verifyPassed", "verifyReason",
-    "fixIteration", "errorKind", "message",
+    "durationMs",
+    "model",
+    "inputTokens",
+    "outputTokens",
+    "cacheHit",
+    "actionType",
+    "parseOk",
+    "retries",
+    "toolName",
+    "exitCode",
+    "timedOut",
+    "outputBytes",
+    "truncated",
+    "policy",
+    "policyReason",
+    "verifyPassed",
+    "verifyReason",
+    "fixIteration",
+    "errorKind",
+    "message",
 }
 
 
@@ -24,8 +40,9 @@ def _now() -> str:
 
 
 class Tracer:
-    def __init__(self, log_dir: Path | str, console: Console | None = None,
-                 exporter: Exporter | None = None) -> None:
+    def __init__(
+        self, log_dir: Path | str, console: Console | None = None, exporter: Exporter | None = None
+    ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.log_dir / "events.jsonl"
@@ -34,7 +51,8 @@ class Tracer:
         # external monitor (e.g. Langfuse). Default no-op keeps it inert.
         self.exporter = exporter or NoopExporter()
         self._trace_id: str | None = None
-        self._span_id: str | None = None
+        # Span ids are kept as a stack so each event can record its parent.
+        self._span_stack: list[str] = []
 
     @contextmanager
     def trace(self) -> Iterator[str]:
@@ -46,19 +64,23 @@ class Tracer:
 
     @contextmanager
     def span(self) -> Iterator[str]:
-        prev = self._span_id
-        self._span_id = uuid.uuid4().hex
+        span_id = uuid.uuid4().hex
+        self._span_stack.append(span_id)
         try:
-            yield self._span_id
+            yield span_id
         finally:
-            self._span_id = prev
+            self._span_stack.pop()
 
     def log(self, kind: str, **fields: Any) -> None:
+        # The current span is the stack top; its parent is the one below it.
+        # Events emitted outside any span sit directly under the trace (no parent).
+        span_id = self._span_stack[-1] if self._span_stack else uuid.uuid4().hex
+        parent_span_id = self._span_stack[-2] if len(self._span_stack) >= 2 else None
         evt: dict[str, Any] = {
             "ts": _now(),
             "traceId": self._trace_id or "no-trace",
-            "spanId": self._span_id or uuid.uuid4().hex,
-            "parentSpanId": None,
+            "spanId": span_id,
+            "parentSpanId": parent_span_id,
             "kind": kind,
         }
         for key, value in fields.items():

@@ -16,6 +16,7 @@ def get_exporter(mode: str) -> Exporter:
     if mode == "langfuse":
         try:
             from .langfuse_exporter import LangfuseExporter  # type: ignore[import-untyped]  # optional extra
+
             return LangfuseExporter()
         except Exception:
             return NoopExporter()
