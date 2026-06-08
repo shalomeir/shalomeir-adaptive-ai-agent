@@ -17,6 +17,7 @@ def test_parse_action_ok():
     res = parse_action_text('{"action":"respond","text":"hi"}')
     assert res.ok
     assert res.action.action == "respond"
+    assert res.action.final is None
 
 
 def test_parse_direct_tool_action_as_call_tool():
@@ -25,6 +26,16 @@ def test_parse_direct_tool_action_as_call_tool():
     assert res.action.action == "call_tool"
     assert res.action.name == "runPython"
     assert res.action.input == {"code": "print(1)"}
+
+
+def test_parse_direct_tool_action_uses_top_level_fields_as_input():
+    res = parse_action_text(
+        '{"action":"writeFile","path":"world.md","content":"graph TD\\nscene --> ground\\n"}'
+    )
+    assert res.ok
+    assert res.action.action == "call_tool"
+    assert res.action.name == "writeFile"
+    assert res.action.input == {"path": "world.md", "content": "graph TD\nscene --> ground\n"}
 
 
 def test_parse_triple_quoted_code_field():

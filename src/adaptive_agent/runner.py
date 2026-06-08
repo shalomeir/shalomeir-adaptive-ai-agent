@@ -7,9 +7,10 @@ import io
 from pathlib import Path
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from .context import ContextManager
+from .action_validation import TurnExecutionState
+from .context import ContextManager, summarize_messages
 from .conversation import ConversationStore
 from .llm import LLMClient
 from .monitoring import Exporter
@@ -72,7 +73,7 @@ _SYSTEM = (
     "the header. For exact duplicate CSV rows, compare the complete row values. For grouped totals, "
     "group by the requested column only.\n"
     "When code is included in JSON, encode it as one valid JSON string with escaped newlines "
-    '(\\n); never place raw multiline code outside the string value.\n'
+    "(\\n); never place raw multiline code outside the string value.\n"
     "For file output, prefer returning the computed text/data from runPython or a created tool, then "
     "call writeFile with the final relative path and content. This lets the runtime apply its file "
     "write policy. Do not write files directly inside runPython.\n"
@@ -101,6 +102,7 @@ class RunnerDeps:
     log_dir: Path
     max_iterations: int = 20
     max_fix_retries: int = 3
+    compaction_token_threshold: int = 12000
     exporter: Exporter | None = None
     non_interactive: bool = False
 
@@ -110,6 +112,20 @@ class TurnResult:
     summary: str = ""
     observations: list[str] = field(default_factory=list)
     stopped_reason: str = "finish"
+
+
+@dataclass
+class _TurnLoopState:
+    result: TurnResult
+    turn_state: TurnExecutionState
+    effective_request: str
+    fix_failures: int = 0
+    parse_failures: int = 0
+    last_action_sig: str | None = None
+    action_repeats: int = 0
+
+
+_StepAction = Literal["dispatch", "continue", "break"]
 
 
 def _preview_text(text: str, limit: int = LLM_RESPONSE_LOG_CHARS) -> tuple[str, bool]:
@@ -131,118 +147,19 @@ class AgentRunner:
         self.tracer = Tracer(deps.log_dir, exporter=deps.exporter)
         self.conv = ConversationStore(system=_SYSTEM)
         self.ctx = ContextManager(
-            token_threshold=12000,
-            summarize=lambda msgs: f"이전 {len(msgs)}개 메시지 요약",
+            token_threshold=deps.compaction_token_threshold,
+            summarize=summarize_messages,
         )
         self.generated = generated
         self.skills = skills
         self.policy = policy
         self._session_tools: list[str] = []
         self._tool_result_cache: dict[str, ToolResult] = {}
-        self._suppressed_tool_names: set[str] = set()
-        self._confirmed_direct_writes: set[str] = set()
+        self._confirmed_write_paths: set[str] = set()
         if self.skills is not None and self.generated is not None:
             for digest in self.skills.load_digests():
                 spec = self.skills.load_spec(digest.name)
                 self.deps.registry.register(self.generated.create(spec))
-
-    def _direct_conversation_response(self, request: str) -> str | None:
-        """Handle lightweight chat that should not enter the tool-planning loop."""
-        text = request.strip()
-        lowered = text.lower()
-        compact = lowered.replace(" ", "")
-        if not text:
-            return "입력이 비어 있습니다. 짧게라도 말을 걸거나 실행할 작업을 적어 주세요."
-
-        if self._is_runtime_model_question(lowered, compact):
-            model = getattr(self.deps.llm, "model", "설정된 LLM")
-            base_url = getattr(self.deps.llm, "base_url", "설정된 엔드포인트")
-            return (
-                f"현재 이 adaptive-agent CLI는 `{model}` 모델을 쓰고 있습니다. "
-                f"엔드포인트는 `{base_url}`입니다."
-            )
-
-        if compact in {"안녕", "안녕.", "하이", "ㅎㅇ", "hello", "hi"}:
-            model = getattr(self.deps.llm, "model", "설정된 LLM")
-            return (
-                "안녕. 지금은 데모용 adaptive-agent CLI 세션이고, "
-                f"로컬 설정상 `{model}`로 응답하고 있어."
-            )
-
-        if compact in {"그냥대화", "그냥대화.", "대화", "대화.", "잡담", "잡담."}:
-            return "좋아. 도구 실행 말고 그냥 얘기해도 돼. 방금처럼 데모가 딱딱하면 바로 말해줘."
-
-        if compact in {
-            "뭐야",
-            "뭐야.",
-            "뭐냐",
-            "뭐냐.",
-            "머야",
-            "머야.",
-            "아니너뭐냐",
-            "아니너뭐냐.",
-            "너뭐냐",
-            "너뭐냐.",
-            "너뭐야",
-            "너뭐야.",
-        }:
-            model = getattr(self.deps.llm, "model", "설정된 LLM")
-            return (
-                "방금 답이 너무 일반적으로 나간 거야. "
-                f"정확히는 `{model}` 기반의 adaptive-agent CLI 런타임이야."
-            )
-
-        return None
-
-    def _is_runtime_model_question(self, lowered: str, compact: str) -> bool:
-        direct_forms = {
-            "너무슨모델?",
-            "너무슨모델",
-            "무슨모델?",
-            "무슨모델",
-            "모델명?",
-            "모델명",
-            "whatmodel?",
-            "whichmodel?",
-            "whatmodelareyou?",
-            "whichmodelareyou?",
-        }
-        if compact in direct_forms:
-            return True
-        has_model_term = any(term in lowered for term in ("모델", "model", "llm"))
-        asks_runtime = any(
-            term in lowered
-            for term in (
-                "너",
-                "현재",
-                "무슨",
-                "뭐",
-                "어떤",
-                "사용",
-                "쓰",
-                "which",
-                "what",
-                "using",
-                "are you",
-            )
-        )
-        return has_model_term and asks_runtime
-
-    def _outside_workspace_write_summary(self, request: str) -> str | None:
-        if not self._request_allows_file_write(request):
-            return None
-        candidates = re.findall(r"(?:\.\./|/|~)[^\s`'\";,)]*", request)
-        if not candidates:
-            return None
-        if self.policy is not None:
-            decision = self.policy.evaluate("out_of_workspace")
-            self.tracer.log(
-                kind="policy_decision",
-                policy=decision.decision,
-                policyReason=decision.reason,
-                toolName="request_path",
-            )
-        return "정책상 거부됨: out_of_workspace. 작업 영역 밖 경로에는 파일을 쓸 수 없습니다."
 
     def _action_signature(self, action: Any) -> str | None:
         """Stable key for detecting a model that repeats the same step forever.
@@ -258,12 +175,16 @@ class AgentRunner:
         if isinstance(action, CallTool):
             payload = json.dumps(action.input, sort_keys=True, ensure_ascii=False)
             return f"call_tool:{action.name}:{payload}"
-        if isinstance(action, Respond) and not action.final:
+        if isinstance(action, Respond) and action.final is False:
             return f"respond:{action.text}"
         return None
 
     def _blocked_ask_user_observation(self, question: str, request: str = "") -> str | None:
         """Convert invalid ask_user package prompts into a runtime observation."""
+        repeated_request = self._repeated_actionable_request_observation(question, request)
+        if repeated_request is not None:
+            return repeated_request
+
         lowered = question.lower()
         mentions_package = any(
             term in lowered
@@ -285,6 +206,15 @@ class AgentRunner:
                 "설치하거나 사용하지 말고, Python 표준 라이브러리(csv 등)만 사용해 현재 작업을 "
                 "계속 진행하세요."
             )
+        question_paths = self._mentioned_workspace_paths(question)
+        if len(question_paths) == 1:
+            structure_hint = self._workspace_structure_hint(question)
+            if structure_hint:
+                return (
+                    "질문에 나온 작업 영역 파일은 사용자에게 내용을 확인해 달라고 묻지 않습니다. "
+                    "readFile 또는 runPython으로 직접 열어 필요한 값을 확인하고 계속 진행하세요."
+                    f"\n{structure_hint}"
+                )
         known_paths = self._mentioned_workspace_paths(request)
         asks_for_known_paths = known_paths and any(
             term in lowered
@@ -328,6 +258,8 @@ class AgentRunner:
                 "string",
                 "numeric",
                 "number",
+                "형식",
+                "표현",
                 "확인해 주세요",
                 "확인해 주시면",
                 "알려주시면",
@@ -347,19 +279,42 @@ class AgentRunner:
             return (
                 "작업 영역 파일의 구조는 사용자에게 묻지 않습니다. readFile 또는 runPython으로 "
                 "파일을 직접 열어 최상위 타입과 필요한 필드를 확인한 뒤, 수정한 코드로 계속 "
-                "진행하세요."
+                "진행하세요." + (f"\n{structure_hint}" if structure_hint else "")
+            )
+        return None
+
+    def _repeated_actionable_request_observation(self, answer: str, request: str) -> str | None:
+        """Reject model replies that merely echo an actionable user request."""
+        if not self._mentioned_workspace_paths(request):
+            return None
+        request_compact = self._semantic_compact(request)
+        answer_compact = self._semantic_compact(answer)
+        if len(answer_compact) < 20:
+            return None
+        if answer_compact in request_compact or request_compact in answer_compact:
+            paths = self._mentioned_workspace_paths(request)
+            path_hint = (
+                f" 요청에 나온 파일 경로는 그대로 사용하세요: {', '.join(paths)}." if paths else ""
+            )
+            structure_hint = self._workspace_structure_hint(request)
+            return (
+                "사용자 요청을 최종 답변이나 질문으로 되풀이하지 마세요. 필요한 파일은 "
+                "readFile 또는 runPython으로 직접 열고, 계산/변환을 수행한 뒤 실제 결과로 "
+                "respond(final:true) 또는 finish를 반환하세요."
+                + path_hint
                 + (f"\n{structure_hint}" if structure_hint else "")
             )
         return None
+
+    def _semantic_compact(self, text: str) -> str:
+        return re.sub(r"\W+", "", text.lower())
 
     def _hitl_required_summary(self, question: str) -> str:
         return f"HITL 처리가 필요합니다: {question}"
 
     def _mentioned_workspace_paths(self, text: str) -> list[str]:
         """Extract likely workspace-relative data paths from a user/model message."""
-        candidates = re.findall(
-            r"(?:[\w.-]+/)*[\w.-]+\.(?:json|csv|md|txt)", text, flags=re.I
-        )
+        candidates = re.findall(r"(?:[\w.-]+/)*[\w.-]+\.(?:json|csv|md|txt)", text, flags=re.I)
         paths: list[str] = []
         for candidate in candidates:
             path = candidate.strip("`'\".,:;()[]{}")
@@ -392,9 +347,7 @@ class AgentRunner:
             if isinstance(value, dict):
                 keys = list(value.keys())
                 list_fields = {
-                    key: len(item)
-                    for key, item in value.items()
-                    if isinstance(item, list)
+                    key: len(item) for key, item in value.items() if isinstance(item, list)
                 }
                 object_fields = {
                     key: list(item.keys())[:8]
@@ -411,11 +364,15 @@ class AgentRunner:
                 return (
                     f"{path}: 최상위 타입은 dict, keys={keys}, "
                     f"listFields={list_fields}, objectFields={object_fields}."
+                    f" scalarPaths={self._json_scalar_paths(value)}."
                     f"{tree_hint}"
                 )
             if isinstance(value, list):
                 sample_type = type(value[0]).__name__ if value else "empty"
-                return f"{path}: 최상위 타입은 list, length={len(value)}, sampleType={sample_type}."
+                return (
+                    f"{path}: 최상위 타입은 list, length={len(value)}, sampleType={sample_type}, "
+                    f"scalarPaths={self._json_scalar_paths(value)}."
+                )
             return f"{path}: 최상위 타입은 {type(value).__name__}."
         if suffix == ".csv":
             rows = list(csv.reader(io.StringIO(content)))
@@ -427,59 +384,95 @@ class AgentRunner:
             return f"{path}: 텍스트 파일 미리보기 첫 줄={first_line!r}."
         return None
 
-    def _request_allows_file_write(self, request: str) -> bool:
+    def _json_scalar_paths(self, value: Any, max_paths: int = 20) -> list[str]:
+        paths: list[str] = []
+
+        def walk(current: Any, path: str, depth: int) -> None:
+            if len(paths) >= max_paths or depth > 8:
+                return
+            if isinstance(current, dict):
+                for key, item in current.items():
+                    next_path = f"{path}.{key}" if path else str(key)
+                    if isinstance(item, dict | list):
+                        walk(item, next_path, depth + 1)
+                    else:
+                        paths.append(next_path)
+                        if len(paths) >= max_paths:
+                            return
+                return
+            if isinstance(current, list):
+                for item in current[:3]:
+                    walk(item, f"{path}[]" if path else "[]", depth + 1)
+                    if len(paths) >= max_paths:
+                        return
+
+        walk(value, "", 0)
+        return paths
+
+    def _initial_file_context_observation(self, request: str) -> str | None:
+        structure_hint = self._workspace_structure_hint(request)
+        if not structure_hint:
+            return None
+        return (
+            "요청에 나온 작업 영역 파일을 미리 확인했습니다. 이 구조를 기준으로 코드를 작성하고, "
+            "파일 구조를 사용자에게 다시 묻지 마세요.\n"
+            f"{structure_hint}"
+        )
+
+    def _tool_failure_recovery_hint(self, request: str) -> str | None:
+        structure_hint = self._workspace_structure_hint(request)
+        if not structure_hint:
+            return None
+        return (
+            "파일 처리 코드가 실패했습니다. 같은 가정으로 재시도하지 말고, 아래 실제 구조를 "
+            "기준으로 코드를 고치세요. root.children 형태의 object tree면 직계 children만 "
+            "보지 말고 모든 descendants를 재귀 순회하세요.\n"
+            f"{structure_hint}"
+        )
+
+    def _request_forbids_file_write(self, request: str) -> bool:
         lowered = request.lower()
+        compact = lowered.replace(" ", "")
         return any(
             term in lowered
             for term in (
-                "저장",
-                "save",
-                "write",
-                "create",
-                "만들",
-                "생성",
-                "수정",
-                "update",
-                "제거",
-                "remove",
-                "delete",
-                ".md",
-                ".csv로",
-                ".txt",
+                "write or update 하지",
+                "write/update 하지",
+                "write 하지",
+                "update 하지",
+                "do not write",
+                "don't write",
+                "no write",
+                "read only",
+                "읽기 전용",
+                "저장하지",
+                "저장 하지",
+                "수정하지",
+                "수정 하지",
+                "업데이트하지",
+                "업데이트 하지",
+                "쓰지",
+                "쓰지는",
+                "파일로 저장하지",
+                "파일 만들지",
+            )
+        ) or any(
+            term in compact
+            for term in (
+                "writeorupdate하지",
+                "write/update하지",
+                "write하지",
+                "update하지",
+                "저장하지",
+                "수정하지",
+                "업데이트하지",
+                "파일로저장하지",
+                "파일만들지",
             )
         )
 
     def _is_side_effect_tool(self, name: str) -> bool:
         return name == "writeFile"
-
-    def _generated_tool_reuse_block(self, name: str, request: str) -> str | None:
-        if self._request_allows_file_write(request):
-            return None
-        tool = self.deps.registry.get(name)
-        if tool is None or tool.origin != "generated":
-            return None
-        text = f"{tool.name} {tool.description}".lower()
-        transformation_terms = (
-            "write",
-            "save",
-            "sort",
-            "clean",
-            "dedup",
-            "duplicate",
-            "remove",
-            "저장",
-            "정렬",
-            "정리",
-            "중복",
-            "제거",
-        )
-        if any(term in text for term in transformation_terms):
-            self._suppressed_tool_names.add(tool.name)
-            return (
-                f"{name} 생성 도구는 파일 변환 작업용으로 보이며 현재 요청은 읽기 전용입니다. "
-                "이번 턴 도구 목록에서 제외했습니다. runPython으로 필요한 값을 계산해 최종 답변하세요."
-            )
-        return None
 
     def _cached_tool_summary(self, name: str, result: ToolResult) -> str:
         if isinstance(result.output, dict):
@@ -488,13 +481,13 @@ class AgentRunner:
                 return f"{name} 실행은 이미 성공했습니다. 결과 파일: {path}"
         return f"{name} 실행은 이미 성공했습니다. 마지막 결과: {result.output}"
 
+    def _cached_tool_observation(self, name: str, result: ToolResult) -> str:
+        return f"도구 {name} 캐시 결과: {result.output}"
+
     def _plan_raw(self) -> str:
         with self.tracer.span():
-            digests = [
-                digest
-                for digest in self.deps.registry.digests()
-                if digest.name not in self._suppressed_tool_names
-            ]
+            digests = self.deps.registry.digests()
+            self.tracer.log(kind="llm_call_start", model=getattr(self.deps.llm, "model", None))
             raw = self.deps.llm.chat(self.conv.messages(), digests)
             preview, truncated = _preview_text(raw)
             self.tracer.log(
@@ -520,7 +513,7 @@ class AgentRunner:
             return True, None
         escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
         action_id = "out_of_workspace" if escapes else "write_file"
-        if action_id == "write_file" and path in self._confirmed_direct_writes:
+        if action_id == "write_file" and path in self._confirmed_write_paths:
             return True, None
         decision = self.policy.evaluate(action_id)
         self.tracer.log(
@@ -534,186 +527,246 @@ class AgentRunner:
         if decision.decision == "ASK_USER" and not self.policy.confirm(action_id):
             return False, "사용자가 작업을 거부했습니다."
         if action_id == "write_file":
-            self._confirmed_direct_writes.add(path)
+            self._confirmed_write_paths.add(path)
         return True, None
 
     def run_turn(self, request: str) -> TurnResult:
-        direct_response = self._direct_conversation_response(request)
-        if direct_response is not None:
-            self.conv.add_user(request)
-            self.conv.add_assistant(direct_response)
-            return TurnResult(summary=direct_response)
-        outside_write = self._outside_workspace_write_summary(request)
-        if outside_write is not None:
-            self.conv.add_user(request)
-            self.conv.add_assistant(outside_write)
-            return TurnResult(summary=outside_write)
-
-        self.conv.add_user(request)
-        result = TurnResult()
-        self._suppressed_tool_names.clear()
-        effective_request = request
-        fix_failures = 0
-        parse_failures = 0
-        last_action_sig: str | None = None
-        action_repeats = 0
+        state = self._start_turn(request)
         with self.tracer.trace():
             for _ in range(self.deps.max_iterations):
                 raw = self._plan_raw()
                 parsed = parse_action_text(raw)
                 if not parsed.ok or parsed.action is None:
-                    parse_failures += 1
-                    error = parsed.error or "알 수 없는 파싱 오류"
-                    self.tracer.log(kind="llm_call", parseOk=False)
-                    self.conv.add_observation(error)
-                    result.observations.append(error)
-                    # A model that keeps emitting invalid JSON will not recover by
-                    # looping to max_iterations — stop early instead of spinning.
-                    if parse_failures > self.deps.max_fix_retries:
-                        result.stopped_reason = "parse_failures"
+                    step = self._handle_parse_failure(state, parsed.error)
+                    if step == "break":
                         break
                     continue
-                parse_failures = 0
+
+                state.parse_failures = 0
                 action = parsed.action
+                state.turn_state.advance()
                 self.tracer.log(kind="llm_call", actionType=action.action, parseOk=True)
-                sig = self._action_signature(action)
-                if sig is not None and sig == last_action_sig:
-                    action_repeats += 1
-                else:
-                    action_repeats = 0
-                    last_action_sig = sig
-                if (
-                    isinstance(action, CallTool)
-                    and sig is not None
-                    and sig in self._tool_result_cache
-                    and action_repeats > self.deps.max_fix_retries
-                ):
-                    cached = self._tool_result_cache[sig]
-                    result.summary = self._cached_tool_summary(action.name, cached)
-                    result.stopped_reason = "cached_result"
+
+                sig, step = self._apply_loop_guards(state, action)
+                if step == "break":
                     break
-                if (
-                    isinstance(action, CallTool)
-                    and sig is not None
-                    and sig in self._tool_result_cache
-                    and action_repeats > 0
-                ):
-                    cached = self._tool_result_cache[sig]
-                    obs = f"도구 {action.name} 캐시 결과: {cached.output}"
-                    self.conv.add_observation(obs)
-                    result.observations.append(obs)
+                if step == "continue":
                     continue
-                if action_repeats > self.deps.max_fix_retries:
-                    # Keep the last real observation as the answer: do not push the
-                    # stop note into result.observations or finalize would surface
-                    # it instead of the actual result the tools already produced.
-                    self.conv.add_observation("같은 동작이 진전 없이 반복되어 작업을 중단합니다.")
-                    result.stopped_reason = "no_progress"
+
+                step = self._dispatch_action(state, action, sig)
+                if step == "break":
                     break
-                if (
-                    isinstance(action, CallTool)
-                    and action_repeats > 0
-                    and self._is_side_effect_tool(action.name)
-                ):
-                    self.conv.add_observation(
-                        "같은 부수효과 도구 호출이 반복되어 작업을 중단합니다."
-                    )
-                    result.stopped_reason = "no_progress"
-                    break
-                if isinstance(action, Finish):
-                    result.summary = action.summary or ""
-                    result.stopped_reason = "finish"
-                    break
-                if isinstance(action, Respond):
-                    self.conv.add_assistant(action.text)
-                    if action.final:
-                        result.summary = action.text
-                        result.stopped_reason = "finish"
-                        break
-                    self.conv.add_observation("계속 진행하세요.")
-                    continue
-                if isinstance(action, AskUser):
-                    blocked_ask = self._blocked_ask_user_observation(action.question, effective_request)
-                    if blocked_ask is not None:
-                        self.conv.add_observation(blocked_ask)
-                        result.observations.append(blocked_ask)
-                        continue
-                    if self.deps.non_interactive:
-                        result.summary = self._hitl_required_summary(action.question)
-                        result.stopped_reason = "hitl_required"
-                        break
-                    answer = self.deps.ask(action.question, action.choices)
-                    if answer == NON_INTERACTIVE_ASK:
-                        result.summary = self._hitl_required_summary(action.question)
-                        result.stopped_reason = "hitl_required"
-                        break
-                    obs = f"사용자 답변: {answer}"
-                    effective_request = f"{effective_request}\n{answer}"
-                    self.conv.add_observation(obs)
-                    result.observations.append(obs)
-                    continue
-                if isinstance(action, CallTool):
-                    generated_block = self._generated_tool_reuse_block(action.name, effective_request)
-                    if generated_block is not None:
-                        self.conv.add_observation(generated_block)
-                        result.observations.append(generated_block)
-                        continue
-                    if action.name == "writeFile" and not self._request_allows_file_write(effective_request):
-                        obs = (
-                            "현재 요청은 파일 저장을 요구하지 않습니다. writeFile을 실행하지 말고 "
-                            "계산 결과를 최종 답변으로 반환하세요."
-                        )
-                        self.conv.add_observation(obs)
-                        result.observations.append(obs)
-                        continue
-                    if self.policy is not None:
-                        allowed, blocked = self._gate(action.name, action.input)
-                        if not allowed:
-                            assert blocked is not None
-                            self.conv.add_observation(blocked)
-                            result.observations.append(blocked)
-                            continue
-                    res = self.deps.registry.call(action.name, action.input)
-                    self.tracer.log(kind="tool_call", toolName=action.name)
-                    if res.ok:
-                        fix_failures = 0
-                        assert sig is not None
-                        obs = f"도구 {action.name} 결과: {res.output}"
-                        self._tool_result_cache[sig] = res
-                    else:
-                        fix_failures += 1
-                        obs = f"도구 {action.name} 실패: {res.error}"
-                    self.conv.add_observation(obs)
-                    result.observations.append(obs)
-                    if not res.ok and fix_failures > self.deps.max_fix_retries:
-                        note = "연속 실패가 한계를 넘었습니다. 작업을 중단합니다."
-                        self.conv.add_observation(note)
-                        result.observations.append(note)
-                        result.stopped_reason = "consecutive_failures"
-                        break
-                    continue
-                if isinstance(action, CreateTool):
-                    self._tool_result_cache.clear()
-                    obs = self._handle_create(action)
-                    self.conv.add_observation(obs)
-                    result.observations.append(obs)
-                    continue
-                if isinstance(action, UpdateTool):
-                    self._tool_result_cache.clear()
-                    obs = self._handle_update(action)
-                    self.conv.add_observation(obs)
-                    result.observations.append(obs)
-                    continue
             else:
-                result.stopped_reason = "max_iterations"
-            if not result.summary and result.stopped_reason != "finish":
-                self._finalize_incomplete(result)
-            if result.stopped_reason == "finish":
-                self._offer_persist()
-            else:
-                self._session_tools.clear()
-            self.ctx.maybe_compact(self.conv)
-        return result
+                state.result.stopped_reason = "max_iterations"
+
+            self._finish_turn(state.result)
+        return state.result
+
+    def _start_turn(self, request: str) -> _TurnLoopState:
+        self.tracer.log(kind="turn_start")
+        self.conv.add_user(request)
+        result = TurnResult()
+        state = _TurnLoopState(
+            result=result,
+            turn_state=TurnExecutionState(
+                requires_execution=bool(self._mentioned_workspace_paths(request))
+            ),
+            effective_request=request,
+        )
+        if initial_file_context := self._initial_file_context_observation(request):
+            self._append_observation(state, initial_file_context)
+        return state
+
+    def _append_observation(self, state: _TurnLoopState, observation: str) -> None:
+        self.conv.add_observation(observation)
+        state.result.observations.append(observation)
+
+    def _handle_parse_failure(self, state: _TurnLoopState, error: str | None) -> _StepAction:
+        state.parse_failures += 1
+        observation = error or "알 수 없는 파싱 오류"
+        self.tracer.log(kind="llm_call", parseOk=False)
+        self._append_observation(state, observation)
+        if state.parse_failures > self.deps.max_fix_retries:
+            state.result.stopped_reason = "parse_failures"
+            return "break"
+        return "continue"
+
+    def _apply_loop_guards(
+        self, state: _TurnLoopState, action: Any
+    ) -> tuple[str | None, _StepAction]:
+        sig = self._action_signature(action)
+        if sig is not None and sig == state.last_action_sig:
+            state.action_repeats += 1
+        else:
+            state.action_repeats = 0
+            state.last_action_sig = sig
+
+        if (
+            isinstance(action, CallTool)
+            and sig is not None
+            and sig in self._tool_result_cache
+            and state.action_repeats > self.deps.max_fix_retries
+        ):
+            cached = self._tool_result_cache[sig]
+            state.result.summary = self._cached_tool_summary(action.name, cached)
+            state.result.stopped_reason = "cached_result"
+            return sig, "break"
+
+        if (
+            isinstance(action, CallTool)
+            and sig is not None
+            and sig in self._tool_result_cache
+            and state.action_repeats > 0
+        ):
+            cached = self._tool_result_cache[sig]
+            self._append_observation(state, self._cached_tool_observation(action.name, cached))
+            return sig, "continue"
+
+        if state.action_repeats > self.deps.max_fix_retries:
+            # Keep this runtime note out of result.observations so incomplete
+            # finalization can still surface the last real result if there was one.
+            self.conv.add_observation("같은 동작이 진전 없이 반복되어 작업을 중단합니다.")
+            state.result.stopped_reason = "no_progress"
+            return sig, "break"
+
+        if (
+            isinstance(action, CallTool)
+            and state.action_repeats > 0
+            and self._is_side_effect_tool(action.name)
+        ):
+            self.conv.add_observation("같은 부수효과 도구 호출이 반복되어 작업을 중단합니다.")
+            state.result.stopped_reason = "no_progress"
+            return sig, "break"
+
+        return sig, "dispatch"
+
+    def _dispatch_action(self, state: _TurnLoopState, action: Any, sig: str | None) -> _StepAction:
+        if isinstance(action, Finish):
+            return self._handle_finish_action(state, action)
+        if isinstance(action, Respond):
+            return self._handle_respond_action(state, action)
+        if isinstance(action, AskUser):
+            return self._handle_ask_user_action(state, action)
+        if isinstance(action, CallTool):
+            return self._handle_call_tool_action(state, action, sig)
+        if isinstance(action, CreateTool):
+            return self._handle_create_tool_action(state, action)
+        if isinstance(action, UpdateTool):
+            return self._handle_update_tool_action(state, action)
+        return "continue"
+
+    def _terminal_block(self, state: _TurnLoopState) -> str | None:
+        return state.turn_state.terminal_block_observation()
+
+    def _handle_finish_action(self, state: _TurnLoopState, action: Finish) -> _StepAction:
+        if terminal_block := self._terminal_block(state):
+            self._append_observation(state, terminal_block)
+            return "continue"
+        state.result.summary = action.summary or ""
+        state.result.stopped_reason = "finish"
+        return "break"
+
+    def _handle_respond_action(self, state: _TurnLoopState, action: Respond) -> _StepAction:
+        respond_is_final = action.final is not False
+        if respond_is_final:
+            repeated_request = self._repeated_actionable_request_observation(
+                action.text, state.effective_request
+            )
+            if repeated_request is not None:
+                self._append_observation(state, repeated_request)
+                return "continue"
+            if terminal_block := self._terminal_block(state):
+                self._append_observation(state, terminal_block)
+                return "continue"
+
+        self.conv.add_assistant(action.text)
+        if respond_is_final:
+            state.result.summary = action.text
+            state.result.stopped_reason = "finish"
+            return "break"
+        self._append_observation(state, "계속 진행하세요.")
+        return "continue"
+
+    def _handle_ask_user_action(self, state: _TurnLoopState, action: AskUser) -> _StepAction:
+        blocked_ask = self._blocked_ask_user_observation(action.question, state.effective_request)
+        if blocked_ask is not None:
+            self._append_observation(state, blocked_ask)
+            return "continue"
+        if self.deps.non_interactive:
+            state.result.summary = self._hitl_required_summary(action.question)
+            state.result.stopped_reason = "hitl_required"
+            return "break"
+        answer = self.deps.ask(action.question, action.choices)
+        if answer == NON_INTERACTIVE_ASK:
+            state.result.summary = self._hitl_required_summary(action.question)
+            state.result.stopped_reason = "hitl_required"
+            return "break"
+        state.effective_request = f"{state.effective_request}\n{answer}"
+        self._append_observation(state, f"사용자 답변: {answer}")
+        return "continue"
+
+    def _handle_call_tool_action(
+        self, state: _TurnLoopState, action: CallTool, sig: str | None
+    ) -> _StepAction:
+        if action.name == "writeFile" and self._request_forbids_file_write(state.effective_request):
+            self._append_observation(
+                state,
+                "현재 요청은 파일 쓰기를 금지합니다. writeFile을 실행하지 말고 "
+                "계산 결과를 최종 답변으로 반환하세요.",
+            )
+            return "continue"
+
+        if self.policy is not None:
+            allowed, blocked = self._gate(action.name, action.input)
+            if not allowed:
+                assert blocked is not None
+                self._append_observation(state, blocked)
+                return "continue"
+
+        res = self.deps.registry.call(action.name, action.input)
+        self.tracer.log(kind="tool_call", toolName=action.name)
+        if res.ok:
+            state.fix_failures = 0
+            assert sig is not None
+            observation = f"도구 {action.name} 결과: {res.output}"
+            self._tool_result_cache[sig] = res
+        else:
+            state.fix_failures += 1
+            observation = f"도구 {action.name} 실패: {res.error}"
+            recovery_hint = self._tool_failure_recovery_hint(state.effective_request)
+            if recovery_hint is not None:
+                observation = f"{observation}\n{recovery_hint}"
+
+        state.turn_state.record_tool_call(action.name, res.ok)
+        self._append_observation(state, observation)
+        if not res.ok and state.fix_failures > self.deps.max_fix_retries:
+            self._append_observation(state, "연속 실패가 한계를 넘었습니다. 작업을 중단합니다.")
+            state.result.stopped_reason = "consecutive_failures"
+            return "break"
+        return "continue"
+
+    def _handle_create_tool_action(self, state: _TurnLoopState, action: CreateTool) -> _StepAction:
+        self._tool_result_cache.clear()
+        observation = self._handle_create(action)
+        state.turn_state.record_tool_change(action.spec.name)
+        self._append_observation(state, observation)
+        return "continue"
+
+    def _handle_update_tool_action(self, state: _TurnLoopState, action: UpdateTool) -> _StepAction:
+        self._tool_result_cache.clear()
+        observation = self._handle_update(action)
+        state.turn_state.record_tool_change(action.name)
+        self._append_observation(state, observation)
+        return "continue"
+
+    def _finish_turn(self, result: TurnResult) -> None:
+        if not result.summary and result.stopped_reason != "finish":
+            self._finalize_incomplete(result)
+        if result.stopped_reason == "finish":
+            self._offer_persist()
+        else:
+            self._session_tools.clear()
+        self.ctx.maybe_compact(self.conv)
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
         """Surface a result when the loop ends without a completion signal.

@@ -49,3 +49,22 @@ def test_call_is_tool_name_format_insensitive():
     )
     res = reg.call("filterMonsters", {})
     assert res.ok and res.output == "hit"
+
+
+def test_call_validates_required_fields_before_handler():
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="writeFile",
+            description="write",
+            origin="builtin",
+            input_schema={"type": "object", "required": ["path", "content"]},
+            handler=lambda i: ToolResult(ok=True, output="should not run"),
+        )
+    )
+
+    res = reg.call("writeFile", {"path": "out.txt"})
+
+    assert not res.ok
+    assert "필수 필드" in (res.error or "")
+    assert "content" in (res.error or "")

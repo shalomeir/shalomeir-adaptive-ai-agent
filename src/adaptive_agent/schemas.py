@@ -41,7 +41,7 @@ class ToolSpec(_Wire):
 class Respond(BaseModel):
     action: Literal["respond"]
     text: str
-    final: bool = False
+    final: bool | None = None
 
 
 class AskUser(BaseModel):

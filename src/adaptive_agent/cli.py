@@ -82,6 +82,7 @@ def _assemble_runner(
         log_dir=Path(cfg.log_dir),
         max_iterations=max_iterations or cfg.max_iterations,
         max_fix_retries=cfg.max_fix_retries,
+        compaction_token_threshold=cfg.compaction_token_threshold,
         exporter=get_exporter(cfg.monitoring),
         non_interactive=non_interactive,
     )

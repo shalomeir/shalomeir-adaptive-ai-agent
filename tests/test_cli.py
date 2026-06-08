@@ -2,6 +2,7 @@ from typer.testing import CliRunner
 
 from adaptive_agent import cli
 from adaptive_agent.cli import app
+from adaptive_agent.config import AgentConfig
 from adaptive_agent.llm import FakeLLMClient
 
 
@@ -136,3 +137,23 @@ def test_run_without_yes_declines_write(monkeypatch, tmp_path):
     result = CliRunner().invoke(app, ["run", "write a file"])
     assert result.exit_code == 0
     assert not (tmp_path / "workspace" / "out.txt").exists()
+
+
+def test_assemble_runner_uses_configured_compaction_threshold(monkeypatch, tmp_path):
+    fake = _patch_llm(monkeypatch, ['{"action":"finish","summary":"ok"}'])
+    cfg = AgentConfig(
+        workspace_dir=str(tmp_path / "workspace"),
+        skills_dir=str(tmp_path / "skills"),
+        log_dir=str(tmp_path / "logs"),
+        compaction_token_threshold=5,
+    )
+
+    runner = cli._assemble_runner(
+        cfg,
+        docs_dir=str(tmp_path / "docs"),
+        free_ask=lambda *_a: "n",
+        confirm_ask=lambda *_a: "n",
+    )
+
+    assert runner.ctx.token_threshold == 5
+    assert runner.deps.llm is fake

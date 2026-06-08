@@ -101,7 +101,8 @@ async def dispatch(action, context) -> Result:
         case "finish":       return Result(terminal=True, observation=action.summary)
 ```
 
-`respond`는 텍스트를 사용자에게 보여준다. `final`이 참이면 종료로 본다.
+`respond`는 텍스트를 사용자에게 보여준다. `final`이 생략됐거나 참이면 종료로 본다.
+중간 상태 메시지로만 쓰려면 `final:false`를 명시해야 한다.
 
 ## 4. Tool call 워크플로
 

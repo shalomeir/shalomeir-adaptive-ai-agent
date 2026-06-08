@@ -27,41 +27,39 @@
 
 ## 2. 한 턴이 도는 과정
 
-`runner.py`의 `run_turn`이 전부의 중심이다. 최대 반복 안에서 LLM에게 묻고, 받은 action을
-분기 실행하고, 결과를 observation으로 쌓는다.
+`runner.py`의 `run_turn`은 한 턴의 루프 뼈대만 담당한다. 최대 반복 안에서 LLM에게 묻고,
+파싱 결과를 loop guard에 통과시킨 뒤 action dispatcher로 넘긴다. action별 세부 처리는
+`_handle_respond_action`, `_handle_call_tool_action` 같은 작은 메서드가 맡고, 턴 종료 정리는
+`_finish_turn`이 맡는다.
 
 ```python
 def run_turn(self, request: str) -> TurnResult:
-    direct_response = self._direct_conversation_response(request)
-    if direct_response is not None:
-        return TurnResult(summary=direct_response) # 0) 짧은 대화는 루프 밖에서 처리
-    self.conv.add_user(request)
-    result = TurnResult()
-    fix_failures = 0
+    state = self._start_turn(request)
     with self.tracer.trace():
         for _ in range(self.deps.max_iterations):
             raw = self._plan_raw()                 # 1) LLM 호출
             parsed = parse_action_text(raw)        # 2) 복구 + 검증
             if not parsed.ok or parsed.action is None:
-                self.conv.add_observation(parsed.error or "알 수 없는 파싱 오류")
-                continue                           #    깨지면 오류를 되먹이고 다시
-            action = parsed.action
-            if isinstance(action, Finish):         # 3) action 종류로 분기
-                result.summary = action.summary or ""
+                step = self._handle_parse_failure(state, parsed.error)
+                if step == "break":
+                    break
+                continue
+            sig, step = self._apply_loop_guards(state, parsed.action)
+            if step == "continue":
+                continue
+            if step == "break":
                 break
-            ...
+            step = self._dispatch_action(state, parsed.action, sig)  # 3) action 분기 실행
+            if step == "break":
+                break
         else:
-            result.stopped_reason = "max_iterations"   # 반복 소진 시 종료
-        if not result.summary and result.stopped_reason != "finish":
-            self._finalize_incomplete(result)      # 3.5) 미완결 종료 폴백
-        self._offer_persist()                      # 4) 생성 도구 저장 제안
-        self.ctx.maybe_compact(self.conv)          # 5) 길어지면 요약
-    return result
+            state.result.stopped_reason = "max_iterations"
+        self._finish_turn(state.result)            # 4) 미완결 폴백, 영속화, compaction
+    return state.result
 ```
 
-`_direct_conversation_response`는 인사, 모델명 질문, "그냥 대화" 같은 입력을 도구 계획으로
-오인하지 않게 하는 앞단이다. 이 경로는 LLM 호출도, 로그 이벤트도 만들지 않는다. 실제 작업
-요청만 아래 ReAct 루프에 들어간다.
+인사, 모델명 질문, 파일 작업 같은 입력은 모두 같은 ReAct 루프에 들어간다. 러너는 자연어
+문구를 세밀하게 해석하지 않고, 모델이 낸 action을 파싱한 뒤 도구·정책 경계에서 검증한다.
 
 종료는 다섯 갈래다: `finish` action, `final`이 참인 `respond`, 최대 반복 도달,
 도구 호출이 연속으로 실패해 상한을 넘는 경우, 그리고 LLM이 유효한 JSON action을
@@ -74,13 +72,17 @@ def run_turn(self, request: str) -> TurnResult:
 가능한 마지막 실행 결과만 추려 사용자용 종료 메시지를 만든다. 종료 사유는 `error` 이벤트로
 남겨 로그만으로도 추적되게 한다.
 
+`TurnExecutionState`는 파일 결과가 필요한 턴에서 생성/수정한 도구를 실제로 실행했는지 기록한다.
+이 상태 검증 덕분에 생성 도구를 등록만 하고 종료하는 흐름을 문장 패턴이 아니라 실행 증거로 막는다.
+
 ```python
 if not res.ok and fix_failures > self.deps.max_fix_retries:
     result.stopped_reason = "consecutive_failures"
     break
 ```
 
-`call_tool` 성공 시 실패 카운터를 0으로 되돌리고, 실패 시 1씩 올린다. 이 폐루프가 "실패를
+`call_tool`은 `ToolRegistry`에서 도구 존재와 필수 입력 필드를 먼저 확인한 뒤 실행된다.
+성공 시 실패 카운터를 0으로 되돌리고, 실패 시 1씩 올린다. 이 폐루프가 "실패를
 관찰해 고치고 다시 실행"하는 자가수정의 뼈대다. 실패 observation을 본 다음 턴에서 LLM이
 `update_tool`을 부르면 코드가 교체되고 재실행된다.
 
@@ -229,8 +231,9 @@ if self.skills is not None and self.generated is not None:
 ## 8. 컨텍스트 관리
 
 `ConversationStore`는 시스템 프롬프트를 본문과 분리해 보관한다. 시스템 접두가 매 턴 그대로라
-프롬프트 앞부분이 안정적이고, 변화는 끝에만 덧붙는다. `ContextManager`는 추정 토큰이 임계를
-넘으면 오래된 구간을 요약으로 접되, 코드가 강제로 보존하는 핵심 사실을 함께 남긴다.
+프롬프트 앞부분이 안정적이고, 변화는 끝에만 덧붙는다. `ContextManager`는 추정 토큰이 설정된
+임계를 넘으면 오래된 구간을 짧은 extractive summary로 접되, 코드가 강제로 보존하는 핵심 사실을
+함께 남긴다.
 `HttpLLMClient`는 provider payload를 만들 때 프로토콜 system prompt와 도구 목록을 하나의
 system 메시지로 합친다. 로컬 모델이 여러 system 메시지 중 도구 목록이나 최근 observation에
 끌려 action 규약을 잊는 것을 줄이기 위해, strict output contract를 항상 첫 system 메시지의

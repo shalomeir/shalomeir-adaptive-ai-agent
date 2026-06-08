@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 from ..python_repair import escape_newlines_in_string_literals
@@ -14,6 +16,108 @@ def _resolve(workspace: Path, rel: str) -> Path:
     if target != root and root not in target.parents:
         raise ValueError("workspace 밖 경로 접근은 허용되지 않습니다")
     return target
+
+
+def _blocked_python_imports(tree: ast.AST) -> list[str]:
+    blocked: list[str] = []
+    stdlib: set[str] = set(getattr(sys, "stdlib_module_names", set()))
+    for node in ast.walk(tree):
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [alias.name.split(".", 1)[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names = [node.module.split(".", 1)[0]]
+        for name in names:
+            if name == "__future__":
+                continue
+            if stdlib and name not in stdlib and name not in blocked:
+                blocked.append(name)
+    return blocked
+
+
+def _direct_write_path(tree: ast.AST) -> str | None:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        open_path = _open_write_path(node)
+        if open_path is not None:
+            return open_path
+        pathlib_path = _pathlib_write_path(node)
+        if pathlib_path is not None:
+            return pathlib_path
+    return None
+
+
+def _open_write_path(node: ast.Call) -> str | None:
+    if not isinstance(node.func, ast.Name) or node.func.id != "open":
+        return None
+    if not node.args or not isinstance(node.args[0], ast.Constant):
+        return None
+    path = node.args[0].value
+    if not isinstance(path, str):
+        return None
+    mode = "r"
+    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+        mode_value = node.args[1].value
+        if isinstance(mode_value, str):
+            mode = mode_value
+    for keyword in node.keywords:
+        if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+            mode_value = keyword.value.value
+            if isinstance(mode_value, str):
+                mode = mode_value
+    return path if any(flag in mode for flag in ("w", "a", "x", "+")) else None
+
+
+def _pathlib_write_path(node: ast.Call) -> str | None:
+    if not isinstance(node.func, ast.Attribute):
+        return None
+    if node.func.attr not in {"write_text", "write_bytes", "touch", "mkdir", "unlink", "rename"}:
+        return None
+    value = node.func.value
+    if isinstance(value, ast.Call):
+        return _path_constructor_arg(value)
+    return None
+
+
+def _path_constructor_arg(node: ast.Call) -> str | None:
+    if not node.args or not isinstance(node.args[0], ast.Constant):
+        return None
+    path = node.args[0].value
+    if not isinstance(path, str):
+        return None
+    if isinstance(node.func, ast.Name) and node.func.id == "Path":
+        return path
+    if (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "Path"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "pathlib"
+    ):
+        return path
+    return None
+
+
+def _guard_run_python_code(code: str) -> str | None:
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    blocked_imports = _blocked_python_imports(tree)
+    if blocked_imports:
+        return (
+            "runPython 코드는 Python 표준 라이브러리만 사용할 수 있습니다. "
+            f"외부 모듈을 import하지 마세요: {', '.join(blocked_imports)}. "
+            "별도 패키지 없이 문자열과 표준 라이브러리로 처리하세요."
+        )
+    direct_write = _direct_write_path(tree)
+    if direct_write is not None:
+        return (
+            f"runPython 안에서 파일을 직접 쓰려고 했습니다: {direct_write}. "
+            "파일 내용은 stdout으로 출력하거나 결과 content로 만들고, 저장은 writeFile "
+            "도구의 작업 영역 상대 경로로 처리하세요."
+        )
+    return None
 
 
 def build_file_tools(workspace: Path | str) -> list[Tool]:
@@ -91,6 +195,9 @@ def build_run_python(sandbox: ExecutionSandbox) -> Tool:
     def run_python(inp: dict[str, Any]) -> ToolResult:
         if "code" in inp:
             code = escape_newlines_in_string_literals(str(inp["code"]))
+            guard_error = _guard_run_python_code(code)
+            if guard_error is not None:
+                return ToolResult(ok=False, error=guard_error)
             if "def run(" in code and "__adaptive_agent_result" not in code:
                 code += (
                     "\n\nif __name__ == '__main__':\n"

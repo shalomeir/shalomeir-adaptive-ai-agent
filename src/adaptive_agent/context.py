@@ -11,6 +11,25 @@ def estimate_tokens(messages: list[Message]) -> int:
     return sum(len(m.content) for m in messages) // 4
 
 
+def summarize_messages(messages: list[Message], max_chars: int = 2000) -> str:
+    """Create a compact extractive summary for older conversation turns."""
+    rendered: list[str] = []
+    remaining = max_chars
+    for message in messages:
+        label = {"user": "user", "assistant": "agent", "tool": "tool"}.get(
+            message.role, message.role
+        )
+        content = " ".join(message.content.split())
+        line = f"{label}: {content}"
+        if len(line) > 300:
+            line = line[:297] + "..."
+        if len(line) + 1 > remaining:
+            break
+        rendered.append(line)
+        remaining -= len(line) + 1
+    return "\n".join(rendered) if rendered else f"이전 {len(messages)}개 메시지"
+
+
 class ContextManager:
     """Compacts a ConversationStore when estimated token usage exceeds the threshold.
 

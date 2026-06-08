@@ -111,10 +111,13 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
         return value
 
     if action in _DIRECT_TOOL_ACTIONS:
+        input_data = value.get("input")
+        if not isinstance(input_data, dict):
+            input_data = {key: item for key, item in value.items() if key != "action"}
         return {
             "action": "call_tool",
             "name": action,
-            "input": value.get("input", {}),
+            "input": input_data,
         }
 
     if action == "callTool":

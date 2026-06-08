@@ -60,7 +60,7 @@
       "properties": {
         "action": { "const": "respond" },
         "text": { "type": "string" },
-        "final": { "type": "boolean", "default": false }
+        "final": { "type": "boolean", "description": "생략하면 true처럼 최종 응답으로 처리한다. 중간 상태 메시지만 보낼 때 false를 명시한다." }
       },
       "additionalProperties": false
     },

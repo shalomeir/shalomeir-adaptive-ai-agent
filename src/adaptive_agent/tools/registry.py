@@ -39,14 +39,34 @@ class ToolRegistry:
     def digests(self) -> list[ToolDigest]:
         return [t.digest() for t in self._tools.values()]
 
-    def call(self, name: str, payload: dict[str, Any]) -> ToolResult:
+    def prepare_call(self, name: str, payload: dict[str, Any]) -> tuple[Tool | None, str | None]:
         tool = self._resolve(name)
         if tool is None:
-            return ToolResult(
-                ok=False,
-                error=f"'{name}' 도구가 없습니다. 도구 목록을 다시 보거나 create_tool로 만드세요.",
-            )
+            return None, f"'{name}' 도구가 없습니다. 도구 목록을 다시 보거나 create_tool로 만드세요."
+        error = self._validate_payload(tool, payload)
+        if error is not None:
+            return tool, error
+        return tool, None
+
+    def call(self, name: str, payload: dict[str, Any]) -> ToolResult:
+        tool, error = self.prepare_call(name, payload)
+        if tool is None:
+            assert error is not None
+            return ToolResult(ok=False, error=error)
+        if error is not None:
+            return ToolResult(ok=False, error=error)
         try:
             return tool.handler(payload)
         except Exception as e:
             return ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
+
+    def _validate_payload(self, tool: Tool, payload: dict[str, Any]) -> str | None:
+        schema = tool.input_schema
+        if schema.get("type") == "object" and not isinstance(payload, dict):
+            return f"{tool.name} input은 object여야 합니다."
+        required = schema.get("required", [])
+        if isinstance(required, list):
+            missing = [field for field in required if field not in payload]
+            if missing:
+                return f"{tool.name} input에 필수 필드가 없습니다: {', '.join(missing)}"
+        return None

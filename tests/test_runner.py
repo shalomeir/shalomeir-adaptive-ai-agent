@@ -1,5 +1,6 @@
 from adaptive_agent.runner import NON_INTERACTIVE_ASK, AgentRunner, RunnerDeps, _SYSTEM
 from adaptive_agent.llm import FakeLLMClient
+from adaptive_agent.schemas import Message, ToolDigest
 from adaptive_agent.tools.registry import ToolRegistry
 from adaptive_agent.tools.base import Tool, ToolResult
 
@@ -33,16 +34,44 @@ def read_log_events(runner):
     return [json.loads(line) for line in runner.tracer.path.read_text().splitlines()]
 
 
+class RecordingLLM:
+    def __init__(self, reply: str = '{"action":"finish","summary":"done"}') -> None:
+        self.reply = reply
+        self.calls = 0
+        self.messages: list[Message] = []
+
+    def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str:
+        self.calls += 1
+        self.messages = messages
+        return self.reply
+
+
 def test_respond_then_finish(tmp_path):
     runner = build_runner(
         tmp_path,
         [
-            '{"action":"respond","text":"working"}',
+            '{"action":"respond","text":"working","final":false}',
             '{"action":"finish","summary":"done"}',
         ],
     )
     result = runner.run_turn("start task")
     assert "done" in result.summary
+
+
+def test_respond_without_final_finishes_immediately(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"respond","text":"네, 어떻게 도와드릴 수 있을까요?"}',
+            '{"action":"respond","text":"should not be called"}',
+        ],
+    )
+
+    result = runner.run_turn("어어 안녕")
+
+    assert result.summary == "네, 어떻게 도와드릴 수 있을까요?"
+    assert result.stopped_reason == "finish"
+    assert runner.deps.llm.calls == 1
 
 
 def test_call_tool_observation(tmp_path):
@@ -69,6 +98,95 @@ def test_bad_json_then_recovers(tmp_path):
     assert "recovered" in result.summary
 
 
+def test_known_file_is_inspected_before_first_plan(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={
+                    "content": (
+                        '{"root":{"type":"Scene","children":[{"type":"Entity",'
+                        '"props":{"health":120},"children":[]}]}}'
+                    ),
+                    "truncated": False,
+                },
+            ),
+        )
+    )
+    llm = RecordingLLM()
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("world.json에서 health 평균을 알려줘")
+
+    rendered = "\n".join(message.content for message in llm.messages)
+    assert result.summary == "done"
+    assert "작업 영역 파일을 미리 확인했습니다" in rendered
+    assert "root는 object tree node처럼 보입니다" in rendered
+    assert "root.children[].props.health" in rendered
+
+
+def test_run_python_failure_repeats_file_structure_hint(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={
+                    "content": (
+                        '{"root":{"children":[{"type":"Container","children":[{"type":"Entity",'
+                        '"props":{"health":120},"children":[]}]}]}}'
+                    ),
+                    "truncated": False,
+                },
+            ),
+        )
+    )
+    reg.register(
+        Tool(
+            "runPython",
+            "run",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=False, error="KeyError: 'health'"),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"runPython","input":{"code":"bad"}}',
+                    '{"action":"finish","summary":"stopped"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("world.json에서 health 평균을 알려줘")
+
+    assert result.summary == "stopped"
+    assert any("모든 descendants를 재귀 순회" in o for o in result.observations)
+    assert any("root.children[].children[].props.health" in o for o in result.observations)
+
+
 def test_llm_response_preview_is_logged(tmp_path):
     runner = build_runner(
         tmp_path,
@@ -84,6 +202,7 @@ def test_llm_response_preview_is_logged(tmp_path):
     assert llm_events[0]["responsePreview"] == '{"action":"finish","summary":"logged"}'
     assert llm_events[0]["responseChars"] == len('{"action":"finish","summary":"logged"}')
     assert llm_events[0]["responseTruncated"] is False
+    assert any(event["kind"] == "llm_call_start" for event in events)
 
 
 def test_llm_response_preview_is_bounded(tmp_path):
@@ -120,7 +239,7 @@ def test_max_iterations_guard(tmp_path):
     # Distinct actions each turn keep advancing (no-progress guard does not fire),
     # so the run is bounded only by max_iterations.
     runner = build_runner(
-        tmp_path, [f'{{"action":"respond","text":"loop {i}"}}' for i in range(50)]
+        tmp_path, [f'{{"action":"respond","text":"loop {i}","final":false}}' for i in range(50)]
     )
     result = runner.run_turn("go")
     assert result.stopped_reason == "max_iterations"
@@ -134,8 +253,8 @@ def test_repeated_parse_failures_stop_early(tmp_path):
     assert result.stopped_reason == "parse_failures"
 
 
-def test_model_question_answers_without_llm_call(tmp_path):
-    llm = FakeLLMClient(replies=[])
+def test_model_question_enters_agent_loop(tmp_path):
+    llm = FakeLLMClient(replies=['{"action":"finish","summary":"runtime handled"}'])
     llm.model = "qwen2.5-coder:7b"
     llm.base_url = "http://localhost:11434/v1"
     runner = AgentRunner(
@@ -149,10 +268,10 @@ def test_model_question_answers_without_llm_call(tmp_path):
 
     result = runner.run_turn("너 무슨 모델?")
 
-    assert "qwen2.5-coder:7b" in result.summary
-    assert "http://localhost:11434/v1" in result.summary
-    assert llm.calls == 0
-    assert not runner.tracer.path.exists()
+    assert result.summary == "runtime handled"
+    assert llm.calls == 1
+    events = read_log_events(runner)
+    assert any(event["kind"] == "llm_call_start" for event in events)
 
 
 def test_model_word_in_task_still_enters_agent_loop(tmp_path):
@@ -166,8 +285,8 @@ def test_model_word_in_task_still_enters_agent_loop(tmp_path):
     assert result.summary == "loop used"
 
 
-def test_small_talk_answers_without_ask_user_boilerplate(tmp_path):
-    llm = FakeLLMClient(replies=[])
+def test_small_talk_enters_agent_loop(tmp_path):
+    llm = FakeLLMClient(replies=['{"action":"finish","summary":"chat handled"}'])
     llm.model = "qwen2.5-coder:7b"
     runner = AgentRunner(
         RunnerDeps(
@@ -180,9 +299,10 @@ def test_small_talk_answers_without_ask_user_boilerplate(tmp_path):
 
     result = runner.run_turn("그냥 대화.")
 
-    assert "도구 실행 말고 그냥 얘기" in result.summary
-    assert llm.calls == 0
-    assert not runner.tracer.path.exists()
+    assert result.summary == "chat handled"
+    assert llm.calls == 1
+    events = read_log_events(runner)
+    assert any(event["kind"] == "llm_call_start" for event in events)
 
 
 def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
@@ -190,6 +310,7 @@ def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
         tmp_path,
         [
             '{"action":"respond","text":"previous data result","final":true}',
+            '{"action":"respond","text":"runtime identity answer","final":true}',
         ],
     )
 
@@ -197,7 +318,7 @@ def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
     second = runner.run_turn("아니 너 뭐냐.")
 
     assert first.summary == "previous data result"
-    assert "adaptive-agent CLI" in second.summary
+    assert second.summary == "runtime identity answer"
     assert "previous data result" not in second.summary
 
 
@@ -326,12 +447,171 @@ def test_non_interactive_known_file_path_ask_is_auto_blocked(tmp_path):
         )
     )
 
-    result = runner.run_turn(
-        "events.csv를 정렬해서 events-clean.csv로 저장해줘."
-    )
+    result = runner.run_turn("events.csv를 정렬해서 events-clean.csv로 저장해줘.")
 
     assert result.summary == "continued"
     assert any("events.csv, events-clean.csv" in o for o in result.observations)
+
+
+def test_final_response_that_repeats_actionable_request_is_blocked(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            (
+                '{"action":"respond","text":"world.json에서 health가 100 미만인 Entity를 '
+                '모두 제거하고, 남은 Entity의 평균 health를 알려줘.","final":true}'
+            ),
+            '{"action":"finish","summary":"average health is 190"}',
+        ],
+    )
+
+    result = runner.run_turn(
+        "world.json에서 health가 100 미만인 Entity를 모두 제거하고, 남은 Entity의 평균 "
+        "health를 알려줘. write or update 하지는 말고."
+    )
+
+    assert result.summary == "average health is 190"
+    assert any("요청을 최종 답변이나 질문으로 되풀이하지" in o for o in result.observations)
+
+
+def test_ask_user_that_repeats_actionable_request_is_blocked(tmp_path):
+    asks = []
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"ask_user","question":"world.json 파일에서 health가 100 '
+                        '미만인 Entity를 제거한 후 남은 Entity의 평균 health를 알려줘."}'
+                    ),
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=ToolRegistry(),
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn(
+        "world.json 파일에서 health가 100 미만인 Entity를 제거한 후 남은 Entity의 평균 "
+        "health를 알려줘."
+    )
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert any("요청을 최종 답변이나 질문으로 되풀이하지" in o for o in result.observations)
+
+
+def test_file_format_ask_is_blocked_before_user_prompt(tmp_path):
+    asks = []
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={
+                    "content": '{"root":{"props":{},"children":[]}}',
+                    "truncated": False,
+                },
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"Entity는 어떤 형식으로 표현되어 있나요?"}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("world.json에서 Entity 평균 health를 알려줘")
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert any("파일을 직접 열어" in o for o in result.observations)
+
+
+def test_no_write_instruction_blocks_write_file_even_with_remove_word(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "writeFile",
+            "write",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=False, error="writeFile should not run"),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"call_tool","name":"writeFile","input":'
+                        '{"path":"world-clean.json","content":"{}"}}'
+                    ),
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn(
+        "world.json에서 health가 100 미만인 Entity를 제거하고 평균을 알려줘. "
+        "write or update 하지는 말고."
+    )
+
+    assert result.summary == "continued"
+    assert any("파일 쓰기를 금지합니다" in o for o in result.observations)
+    assert not any("writeFile should not run" in o for o in result.observations)
+
+
+def test_md_file_request_allows_write_file(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "writeFile",
+            "write",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=True, output={"path": inp["path"]}),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"writeFile","path":"world.md",'
+                        '"content":"graph TD\\nscene --> ground\\n"}'
+                    ),
+                    '{"action":"finish","summary":"saved"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "y",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("world.json 을 읽고 md 파일에 mermaid 로 표현해줘.")
+
+    assert result.summary == "saved"
+    assert any("world.md" in o for o in result.observations)
 
 
 def test_package_install_ask_is_blocked_before_user_prompt(tmp_path):
@@ -394,8 +674,45 @@ def test_file_structure_ask_is_blocked_before_user_prompt(tmp_path):
 
     assert result.summary == "continued"
     assert asks == []
-    assert any("파일을 직접 열어" in o for o in result.observations)
+    assert any("질문에 나온 작업 영역 파일" in o for o in result.observations)
     assert any("listFields={'items': 1}" in o for o in result.observations)
+
+
+def test_file_content_ask_with_path_in_question_is_blocked_before_user_prompt(tmp_path):
+    asks = []
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={"content": '{"monsters":[{"name":"Orc","hp":150}]}', "truncated": False},
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주실 수 있으신가요?"}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("글자 3개인 경우만 처리하라니까.")
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert any("질문에 나온 작업 영역 파일" in o for o in result.observations)
+    assert any("listFields={'monsters': 1}" in o for o in result.observations)
 
 
 def test_file_field_count_ask_is_blocked_before_user_prompt(tmp_path):

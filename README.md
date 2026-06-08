@@ -25,46 +25,33 @@ adaptive-agent version   # 0.1.0 이 찍히면 설치 성공
 
 ---
 
-## LLM 없이 데모 9종 바로 확인하기
+## 직접 대화하며 시연하기
 
-가장 빠르고 확실한 검증 경로다. 통합 테스트가 가짜 LLM으로 에이전트 루프를 그대로 돌리고,
-실제 생성 도구를 sandbox에서 실행해 결과 상태까지 검증한다. 모델 설치 없이 즉시 돌아간다.
+OpenAI API 키를 쓰는 호스팅 모델 방식과, 키 없이 로컬 [Ollama](https://ollama.com)로 돌리는
+방식 둘 다 가능하다. 처음 시연은 OpenAI 키 방식이 가장 간단하다.
 
-```bash
-pytest tests/test_demo_integration.py -v
-```
-
-전체 테스트와 품질 점검은 이렇게 돌린다.
+### 1) 모델 준비
 
 ```bash
-pytest -q
-mypy src
-ruff check src tests
-ruff format --check .
-```
+# 방법 A: OpenAI 호스팅 모델 사용
+cp .env.example .env
+# .env 아래쪽의 OpenAI 예시 블록을 주석 해제하고 AGENT_API_KEY만 본인 키로 바꾼다.
+# AGENT_BASE_URL=https://api.openai.com/v1
+# AGENT_MODEL=gpt-4o-mini
 
----
-
-## 로컬 모델로 직접 대화하며 시연하기
-
-키 없이 로컬에서 돌리는 경로를 1순위로 안내한다. 여기서는 [Ollama](https://ollama.com)를
-예로 든다.
-
-### 1) 로컬 모델 준비
-
-```bash
-# Ollama 설치 후, 코드 생성에 쓸 만한 모델을 받는다
+# 방법 B: Ollama 로컬 모델 사용
 ollama pull qwen2.5-coder:7b
-# Ollama는 http://localhost:11434/v1 에 OpenAI 호환 엔드포인트를 연다
 ```
 
 ### 2) 에이전트가 바라볼 엔드포인트 설정
 
+OpenAI를 쓸 때는 `.env.example`에서 복사한 `.env`의 OpenAI 설정을 그대로 쓰면 된다.
+
 ```bash
+# Ollama를 쓸 때만 아래처럼 로컬 OpenAI 호환 엔드포인트로 바꾼다
 export AGENT_BASE_URL=http://localhost:11434/v1
 export AGENT_MODEL=qwen2.5-coder:7b
-# 호스팅 모델을 쓸 때만 키가 필요하다
-# export AGENT_API_KEY=sk-...
+unset AGENT_API_KEY
 ```
 
 ### 3) 작업 영역에 데모 데이터 넣기
@@ -114,7 +101,7 @@ adaptive-agent chat
   기대: 새 도구를 만들지 않고 D2에서 저장한 도구를 다시 불러 쓴다. 결과는 고유 3행(a, b, c).
 
 - **D6 · 상태형 객체 트리**
-  입력: `world.json에서 health가 100 미만인 Entity를 모두 제거하고, 남은 Entity의 평균 health를 알려줘.`
+  입력: `world.json에서 health가 100 미만인 Entity를 제외하고, 남은 Entity의 평균 health를 알려줘.`
   기대: 에이전트가 먼저 트리 스키마와 허용 연산을 문서에서 조회하고, 트리를 고친 뒤 다시 읽어
   검증한다. 남는 Entity는 셋, 평균 health 190.
 
@@ -186,6 +173,26 @@ cat "$(ls -t logs/session-*.jsonl | head -1)" | python -m json.tool   # 또는 j
 ```bash
 ls skills/
 cat skills/*/SKILL.md
+```
+
+---
+
+## LLM 없이 데모 9종 바로 확인하기
+
+가장 빠르고 확실한 검증 경로다. 통합 테스트가 가짜 LLM으로 에이전트 루프를 그대로 돌리고,
+실제 생성 도구를 sandbox에서 실행해 결과 상태까지 검증한다. 모델 설치 없이 즉시 돌아간다.
+
+```bash
+pytest tests/test_demo_integration.py -v
+```
+
+전체 테스트와 품질 점검은 이렇게 돌린다.
+
+```bash
+pytest -q
+mypy src
+ruff check src tests
+ruff format --check .
 ```
 
 ---
