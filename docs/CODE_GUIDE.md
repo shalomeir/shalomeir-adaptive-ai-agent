@@ -257,8 +257,10 @@ except Exception:
     pass
 ```
 
-`runner.py`는 LLM 호출 직후 `llm_call` 이벤트에 응답 원문 preview, 전체 글자 수,
-잘림 여부를 기록한다. preview는 로컬 진단용이며 무한정 커지지 않도록 4000자로 제한한다.
+`Tracer`는 생성될 때 `sessionId`를 만들고 `logs/session-*.jsonl` 파일 하나에 그 세션의
+이벤트를 기록한다. `runner.py`는 LLM 호출 직후 `llm_call` 이벤트에 응답 원문 preview,
+전체 글자 수, 잘림 여부를 기록한다. preview는 로컬 진단용이며 무한정 커지지 않도록
+4000자로 제한한다.
 
 ## 10. 따라 읽는 순서
 

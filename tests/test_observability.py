@@ -4,7 +4,7 @@ from adaptive_agent.observability import Tracer
 
 
 def test_jsonl_event_written(tmp_path):
-    tracer = Tracer(log_dir=tmp_path)
+    tracer = Tracer(log_dir=tmp_path, session_id="session-test")
     with tracer.trace() as trace_id:
         tracer.log(
             kind="llm_call",
@@ -15,11 +15,12 @@ def test_jsonl_event_written(tmp_path):
             responseChars=19,
             responseTruncated=False,
         )
-    lines = (tmp_path / "events.jsonl").read_text().splitlines()
+    lines = tracer.path.read_text().splitlines()
     assert len(lines) == 1
     evt = json.loads(lines[0])
     assert evt["kind"] == "llm_call"
     assert evt["traceId"] == trace_id
+    assert evt["sessionId"] == "session-test"
     assert evt["model"] == "m"
     assert evt["responsePreview"] == '{"action":"finish"}'
     assert evt["responseChars"] == 19
@@ -34,7 +35,7 @@ def test_parent_span_id_propagated(tmp_path):
             tracer.log(kind="llm_call")
             with tracer.span():
                 tracer.log(kind="tool_call")
-    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    events = [json.loads(line) for line in tracer.path.read_text().splitlines()]
     outer, inner = events[0], events[1]
     assert outer["parentSpanId"] is None  # 최상위 span은 부모가 없다
     assert inner["parentSpanId"] == outer["spanId"]  # 중첩 span은 부모 spanId를 가리킨다
@@ -60,5 +61,18 @@ def test_exporter_failure_does_not_break_logging(tmp_path):
 
     tracer = Tracer(log_dir=tmp_path, exporter=BrokenExporter())
     tracer.log(kind="tool_call", toolName="echo")  # must not raise
-    lines = (tmp_path / "events.jsonl").read_text().splitlines()
+    lines = tracer.path.read_text().splitlines()
     assert len(lines) == 1
+
+
+def test_each_tracer_uses_a_separate_session_log_file(tmp_path):
+    first = Tracer(log_dir=tmp_path)
+    second = Tracer(log_dir=tmp_path)
+
+    first.log(kind="llm_call")
+    second.log(kind="llm_call")
+
+    assert first.path != second.path
+    assert first.path.exists()
+    assert second.path.exists()
+    assert len(list(tmp_path.glob("session-*.jsonl"))) == 2

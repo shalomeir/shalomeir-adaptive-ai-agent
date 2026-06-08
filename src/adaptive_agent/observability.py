@@ -42,13 +42,23 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _new_session_id() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"session-{stamp}-{uuid.uuid4().hex[:8]}"
+
+
 class Tracer:
     def __init__(
-        self, log_dir: Path | str, console: Console | None = None, exporter: Exporter | None = None
+        self,
+        log_dir: Path | str,
+        console: Console | None = None,
+        exporter: Exporter | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.log_dir / "events.jsonl"
+        self.session_id = session_id or _new_session_id()
+        self.path = self.log_dir / f"{self.session_id}.jsonl"
         self.console = console or Console()
         # Local JSONL is the always-on path; the exporter is the seam for an
         # external monitor (e.g. Langfuse). Default no-op keeps it inert.
@@ -82,6 +92,7 @@ class Tracer:
         evt: dict[str, Any] = {
             "ts": _now(),
             "traceId": self._trace_id or "no-trace",
+            "sessionId": self.session_id,
             "spanId": span_id,
             "parentSpanId": parent_span_id,
             "kind": kind,

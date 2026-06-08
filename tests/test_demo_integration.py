@@ -84,9 +84,14 @@ def _ask(question: str) -> str:
     return json.dumps({"action": "ask_user", "question": question})
 
 
+def _log_events(tmp_path: Path) -> list[dict[str, object]]:
+    paths = sorted((tmp_path / "logs").glob("session-*.jsonl"))
+    assert len(paths) == 1
+    return [json.loads(line) for line in paths[0].read_text().splitlines()]
+
+
 def _log_kinds(tmp_path: Path) -> list[str]:
-    lines = (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
-    return [json.loads(line)["kind"] for line in lines]
+    return [str(event["kind"]) for event in _log_events(tmp_path)]
 
 
 # ---------- D1: JSON query (read-only) ----------
@@ -500,8 +505,7 @@ def test_d4_ambiguous_then_clarified(tmp_path: Path) -> None:
     kinds_after_turn1 = _log_kinds(tmp_path)
     assert "tool_create" not in kinds_after_turn1
     assert not out.exists()
-    events = (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
-    assert any(json.loads(line).get("actionType") == "ask_user" for line in events)
+    assert any(event.get("actionType") == "ask_user" for event in _log_events(tmp_path))
 
     # turn 2 produces the same result as D2
     runner.run_turn("events.csv에서 중복 행 제거하고 date로 정렬해줘")

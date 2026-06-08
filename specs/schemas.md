@@ -341,10 +341,11 @@ JSONL 한 줄이 한 이벤트다.
 {
   "title": "LogEvent",
   "type": "object",
-  "required": ["ts", "traceId", "spanId", "kind"],
+  "required": ["ts", "traceId", "sessionId", "spanId", "kind"],
   "properties": {
     "ts": { "type": "string", "format": "date-time" },
     "traceId": { "type": "string" },
+    "sessionId": { "type": "string" },
     "spanId": { "type": "string" },
     "parentSpanId": { "type": ["string", "null"] },
     "kind": { "type": "string",

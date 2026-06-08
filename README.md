@@ -172,12 +172,13 @@ adaptive-agent run "..." --max-iterations 30   # 반복 상한 override
 | `./workspace/` | 에이전트가 읽고 쓰는 작업 영역(파일 도구는 이 안에서만 동작) |
 | `./workspace/.session/` | 세션 중 만든 생성 도구의 코드 |
 | `./skills/<이름>/` | 저장을 승인한 도구(`tool.py`, `manifest.json`, `SKILL.md`) |
-| `./logs/events.jsonl` | 한 줄에 한 이벤트인 실행 로그(LLM 호출, 도구 실행, 권한 결정, 검증) |
+| `./logs/session-*.jsonl` | 세션별 JSONL 실행 로그(LLM 호출, 도구 실행, 권한 결정, 검증) |
 
 실행 흐름을 들여다보려면 로그를 본다.
 
 ```bash
-cat logs/events.jsonl | python -m json.tool   # 또는 jq
+ls -t logs/session-*.jsonl | head -1
+cat "$(ls -t logs/session-*.jsonl | head -1)" | python -m json.tool   # 또는 jq
 ```
 
 저장된 도구를 확인하려면 skill 폴더를 본다.

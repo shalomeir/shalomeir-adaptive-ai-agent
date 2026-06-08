@@ -27,6 +27,12 @@ def build_runner(tmp_path, replies, ask="n"):
     )
 
 
+def read_log_events(runner):
+    import json
+
+    return [json.loads(line) for line in runner.tracer.path.read_text().splitlines()]
+
+
 def test_respond_then_finish(tmp_path):
     runner = build_runner(
         tmp_path,
@@ -64,8 +70,6 @@ def test_bad_json_then_recovers(tmp_path):
 
 
 def test_llm_response_preview_is_logged(tmp_path):
-    import json
-
     runner = build_runner(
         tmp_path,
         [
@@ -75,7 +79,7 @@ def test_llm_response_preview_is_logged(tmp_path):
 
     runner.run_turn("go")
 
-    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    events = read_log_events(runner)
     llm_events = [event for event in events if event["kind"] == "llm_call"]
     assert llm_events[0]["responsePreview"] == '{"action":"finish","summary":"logged"}'
     assert llm_events[0]["responseChars"] == len('{"action":"finish","summary":"logged"}')
@@ -83,14 +87,12 @@ def test_llm_response_preview_is_logged(tmp_path):
 
 
 def test_llm_response_preview_is_bounded(tmp_path):
-    import json
-
     raw = '{"action":"respond","text":"' + ("x" * 5000) + '"}'
     runner = build_runner(tmp_path, [raw])
 
     runner.run_turn("go")
 
-    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    events = read_log_events(runner)
     first_llm_event = next(event for event in events if event["kind"] == "llm_call")
     assert len(first_llm_event["responsePreview"]) == 4000
     assert first_llm_event["responseChars"] == len(raw)
@@ -133,7 +135,7 @@ def test_model_question_answers_without_llm_call(tmp_path):
     assert "qwen2.5-coder:7b" in result.summary
     assert "http://localhost:11434/v1" in result.summary
     assert llm.calls == 0
-    assert not (tmp_path / "events.jsonl").exists()
+    assert not runner.tracer.path.exists()
 
 
 def test_model_word_in_task_still_enters_agent_loop(tmp_path):
@@ -163,7 +165,7 @@ def test_small_talk_answers_without_ask_user_boilerplate(tmp_path):
 
     assert "도구 실행 말고 그냥 얘기" in result.summary
     assert llm.calls == 0
-    assert not (tmp_path / "events.jsonl").exists()
+    assert not runner.tracer.path.exists()
 
 
 def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
@@ -214,14 +216,12 @@ def test_incomplete_loop_reports_last_result(tmp_path):
 
 def test_cached_result_loop_does_not_log_error_event(tmp_path):
     # 이미 성공한 동일 tool call 반복은 실패가 아니라 캐시 종료이므로 error 이벤트로 남기지 않는다.
-    import json
-
     runner = build_runner(
         tmp_path,
         ['{"action":"call_tool","name":"echo","input":{"answer":42}}'] * 50,
     )
     runner.run_turn("go")
-    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    events = read_log_events(runner)
     errors = [e for e in events if e["kind"] == "error"]
     assert errors == []
 
