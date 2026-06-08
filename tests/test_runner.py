@@ -190,6 +190,30 @@ def test_ask_user_flow(tmp_path):
     assert any("events.csv" in o for o in result.observations)
 
 
+def test_package_install_ask_is_blocked_before_user_prompt(tmp_path):
+    asks = []
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"Pandas 모듈이 설치되어 있지 않습니다. 설치하시겠습니까?"}',
+                    '{"action":"ask_user","question":"Pandas를 사용할 수 없습니다. 대신 표준 라이브러리를 사용하여 저장해주세요."}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=ToolRegistry(),
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("dedup and sort events.csv")
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert len([o for o in result.observations if "표준 라이브러리" in o]) == 2
+
+
 def test_consecutive_failures_stop(tmp_path):
     reg = ToolRegistry()
     reg.register(

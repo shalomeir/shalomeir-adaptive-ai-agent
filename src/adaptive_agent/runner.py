@@ -48,10 +48,11 @@ _SYSTEM = (
     'print(json.dumps(result))" answers a one-off data question in one step. You do NOT need to '
     "readFile first or pass file contents through input; use readFile only to peek at a small file.\n"
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
-    "installed and will fail to import. Reuse an existing tool instead of recreating it. When a tool "
-    "fails, READ the error message carefully and fix it: use update_tool for a created tool, or call "
-    "the tool again with corrected input. Do not repeat the same question; if you already have what "
-    "you need, act. Keep tool names in kebab-case. When you have the answer, reply with respond "
+    "installed and will fail to import. NEVER ask the user to install packages; for CSV work use "
+    "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "
+    "READ the error message carefully and fix it: use update_tool for a created tool, or call the "
+    "tool again with corrected input. Do not repeat the same question; if you already have what you "
+    "need, act. Keep tool names in kebab-case. When you have the answer, reply with respond "
     "(final:true) or finish — do not keep calling tools."
 )
 
@@ -167,6 +168,31 @@ class AgentRunner:
         )
         return has_model_term and asks_runtime
 
+    def _blocked_ask_user_observation(self, question: str) -> str | None:
+        """Convert invalid ask_user package prompts into a runtime observation."""
+        lowered = question.lower()
+        mentions_package = any(
+            term in lowered
+            for term in (
+                "pandas",
+                "numpy",
+                "pip install",
+                "package",
+                "module",
+                "모듈",
+                "패키지",
+                "설치",
+            )
+        )
+        asks_to_proceed_with_stdlib = "표준 라이브러리" in question or "standard library" in lowered
+        if mentions_package or asks_to_proceed_with_stdlib:
+            return (
+                "패키지 설치 질문은 사용자에게 묻지 않습니다. pandas/numpy 같은 외부 패키지는 "
+                "설치하거나 사용하지 말고, Python 표준 라이브러리(csv 등)만 사용해 현재 작업을 "
+                "계속 진행하세요."
+            )
+        return None
+
     def _plan_raw(self) -> str:
         with self.tracer.span():
             raw = self.deps.llm.chat(self.conv.messages(), self.deps.registry.digests())
@@ -242,6 +268,11 @@ class AgentRunner:
                     self.conv.add_observation("계속 진행하세요.")
                     continue
                 if isinstance(action, AskUser):
+                    blocked_ask = self._blocked_ask_user_observation(action.question)
+                    if blocked_ask is not None:
+                        self.conv.add_observation(blocked_ask)
+                        result.observations.append(blocked_ask)
+                        continue
                     answer = self.deps.ask(action.question, action.choices)
                     obs = f"사용자 답변: {answer}"
                     self.conv.add_observation(obs)
