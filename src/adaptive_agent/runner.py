@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 from dataclasses import dataclass, field
 import io
@@ -71,7 +72,9 @@ _SYSTEM = (
     "READ the error message carefully and fix it: use update_tool for a created tool, or call the "
     "tool again with corrected input. Do not repeat the same question; if you already have what you "
     "need, act. Only call writeFile when the user explicitly asks to save, write, create, or update "
-    "a file. For read-only questions, answer with respond(final:true) or finish. Keep tool names in "
+    "a file. For read-only questions, answer with respond(final:true) or finish. If the user asks "
+    "for specific fields or aggregates, answer only those requested values instead of dumping full "
+    "records. Keep tool names in "
     "kebab-case. When you have the answer, reply with respond (final:true) or finish — do not keep "
     "calling tools."
 )
@@ -146,7 +149,20 @@ class AgentRunner:
         if compact in {"그냥대화", "그냥대화.", "대화", "대화.", "잡담", "잡담."}:
             return "좋아. 도구 실행 말고 그냥 얘기해도 돼. 방금처럼 데모가 딱딱하면 바로 말해줘."
 
-        if compact in {"뭐야", "뭐야.", "머야", "머야."}:
+        if compact in {
+            "뭐야",
+            "뭐야.",
+            "뭐냐",
+            "뭐냐.",
+            "머야",
+            "머야.",
+            "아니너뭐냐",
+            "아니너뭐냐.",
+            "너뭐냐",
+            "너뭐냐.",
+            "너뭐야",
+            "너뭐야.",
+        }:
             model = getattr(self.deps.llm, "model", "설정된 LLM")
             return (
                 "방금 답이 너무 일반적으로 나간 거야. "
@@ -243,6 +259,19 @@ class AgentRunner:
                 "데이터의 구조",
                 "json 구조",
                 "csv 구조",
+                "몇 개의 필드",
+                "몇개의 필드",
+                "필드",
+                "field",
+                "문자열",
+                "자료형",
+                "데이터 타입",
+                "data type",
+                "string",
+                "numeric",
+                "number",
+                "확인해 주세요",
+                "confirm",
             )
         )
         if asks_about_file_structure:
@@ -630,7 +659,35 @@ class AgentRunner:
                 self._finalize_incomplete(result)
             self._offer_persist()
             self.ctx.maybe_compact(self.conv)
+        result.summary = self._polish_final_summary(request, result.summary)
         return result
+
+    def _polish_final_summary(self, request: str, summary: str) -> str:
+        lowered = request.lower()
+        asks_for_names = "이름" in request or "name" in lowered
+        asks_for_average = "평균" in request or "average" in lowered or "avg" in lowered
+        if not (asks_for_names and asks_for_average):
+            return summary
+        match = re.search(
+            r"High HP Monsters:\s*(\[.*?\])\s*Average HP:\s*([0-9]+(?:\.[0-9]+)?)",
+            summary,
+            flags=re.DOTALL,
+        )
+        if match is None:
+            return summary
+        try:
+            records = ast.literal_eval(match.group(1))
+        except (SyntaxError, ValueError):
+            return summary
+        if not isinstance(records, list):
+            return summary
+        names = [str(record["name"]) for record in records if isinstance(record, dict) and "name" in record]
+        if not names:
+            return summary
+        average = float(match.group(2))
+        if any("\uac00" <= char <= "\ud7a3" for char in request):
+            return f"{', '.join(names)}의 평균 HP는 {average:.2f}입니다."
+        return f"Names: {', '.join(names)}\nAverage HP: {average:.2f}"
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
         """Surface a result when the loop ends without a completion signal.

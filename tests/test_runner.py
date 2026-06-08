@@ -132,6 +132,39 @@ def test_small_talk_answers_without_ask_user_boilerplate(tmp_path):
     assert not (tmp_path / "events.jsonl").exists()
 
 
+def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"respond","text":"previous data result","final":true}',
+        ],
+    )
+
+    first = runner.run_turn("analyze data")
+    second = runner.run_turn("아니 너 뭐냐.")
+
+    assert first.summary == "previous data result"
+    assert "adaptive-agent CLI" in second.summary
+    assert "previous data result" not in second.summary
+
+
+def test_polishes_record_dump_when_user_asked_for_names_and_average(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            (
+                '{"action":"respond","final":true,"text":"High HP Monsters: '
+                "[{'name': 'Orc', 'hp': 150}, {'name': 'Dragon', 'hp': 300}]"
+                '\\nAverage HP: 225.0"}'
+            ),
+        ],
+    )
+
+    result = runner.run_turn("hp가 100 이상인 이름과 평균 hp")
+
+    assert result.summary == "Orc, Dragon의 평균 HP는 225.00입니다."
+
+
 def test_incomplete_loop_reports_last_result(tmp_path):
     # 모델이 도구는 돌렸지만 finish/respond(final)로 끝맺지 못하고 같은 호출만 반복하면,
     # 캐시된 성공 결과로 중단하되 빈 요약 대신 마지막 결과를 돌려줘야 한다.
@@ -255,6 +288,78 @@ def test_file_structure_ask_is_blocked_before_user_prompt(tmp_path):
     assert asks == []
     assert any("파일을 직접 열어" in o for o in result.observations)
     assert any("listFields={'items': 1}" in o for o in result.observations)
+
+
+def test_file_field_count_ask_is_blocked_before_user_prompt(tmp_path):
+    asks = []
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={"content": '{"items":[{"name":"a","value":1}]}', "truncated": False},
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"데이터는 각각 몇 개의 필드를 가지고 있나요?"}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("data.json 분석해줘")
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert any("파일을 직접 열어" in o for o in result.observations)
+
+
+def test_file_field_type_ask_is_blocked_before_user_prompt(tmp_path):
+    asks = []
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={"content": '{"items":[{"name":"a","hp":100}]}', "truncated": False},
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"hp가 문자열로 표현되어 있는지 확인해 주세요."}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: asks.append(a) or "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("data.json에서 hp 평균을 알려줘")
+
+    assert result.summary == "continued"
+    assert asks == []
+    assert any("파일을 직접 열어" in o for o in result.observations)
 
 
 def test_consecutive_failures_stop(tmp_path):
