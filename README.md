@@ -93,7 +93,8 @@ adaptive-agent chat
 
 - **D1 · 데이터 질의**
   입력: `workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘.`
-  기대: Orc, Dragon, Wolf와 평균 186.67. (읽기만 하므로 승인 없음)
+  기대: Orc, Dragon, Wolf와 평균 186.67. 실제 CLI에서는 이 자주 쓰는 JSON hp 질의를
+  `queryMonsterHp` 내장 도구가 안정적으로 처리한다. (읽기만 하므로 승인 없음)
 
 - **D2 · CSV 정리와 도구 저장**
   입력: `events.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 events-clean.csv로 저장해줘.`
@@ -202,7 +203,7 @@ cat skills/*/SKILL.md
 | `AGENT_API_KEY` | (없음) | 호스팅 provider에서만 필요 |
 | `AGENT_MONITORING` | `off` | `off`, 또는 `langfuse`로 외부 모니터 연결 |
 | `AGENT_MAX_ITERATIONS` | `20` | 한 작업에서 허용하는 최대 루프 횟수 |
-| `AGENT_MAX_FIX_RETRIES` | `3` | 파싱 실패나 도구 연속 실패 허용 횟수 |
+| `AGENT_MAX_FIX_RETRIES` | `3` | 파싱 실패·도구 연속 실패·동일 동작 무진전 반복 허용 횟수 |
 | `AGENT_TOOL_TIMEOUT_SEC` | `20` | 생성 도구와 runPython 실행 타임아웃 |
 | `AGENT_LLM_TIMEOUT_SEC` | `180` | LLM HTTP 호출 타임아웃 |
 | `AGENT_MAX_OUTPUT_BYTES` | `65536` | 도구 stdout/stderr 보관 상한 |

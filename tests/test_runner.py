@@ -64,7 +64,11 @@ def test_bad_json_then_recovers(tmp_path):
 
 
 def test_max_iterations_guard(tmp_path):
-    runner = build_runner(tmp_path, ['{"action":"respond","text":"loop"}'] * 50)
+    # Distinct actions each turn keep advancing (no-progress guard does not fire),
+    # so the run is bounded only by max_iterations.
+    runner = build_runner(
+        tmp_path, [f'{{"action":"respond","text":"loop {i}"}}' for i in range(50)]
+    )
     result = runner.run_turn("go")
     assert result.stopped_reason == "max_iterations"
 
@@ -129,14 +133,14 @@ def test_small_talk_answers_without_ask_user_boilerplate(tmp_path):
 
 
 def test_incomplete_loop_reports_last_result(tmp_path):
-    # 모델이 도구는 돌렸지만 finish/respond(final)로 끝맺지 못하고 루프를 소진하면,
-    # 빈 요약 대신 마지막 관찰(실제 결과)을 사용자에게 돌려줘야 한다.
+    # 모델이 도구는 돌렸지만 finish/respond(final)로 끝맺지 못하고 같은 호출만 반복하면,
+    # no-progress로 중단하되 빈 요약 대신 마지막 관찰(실제 결과)을 돌려줘야 한다.
     runner = build_runner(
         tmp_path,
         ['{"action":"call_tool","name":"echo","input":{"answer":42}}'] * 50,
     )
     result = runner.run_turn("go")
-    assert result.stopped_reason == "max_iterations"
+    assert result.stopped_reason == "no_progress"
     assert result.summary
     assert "42" in result.summary
 
@@ -153,7 +157,7 @@ def test_incomplete_loop_logs_error_event(tmp_path):
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     errors = [e for e in events if e["kind"] == "error"]
     assert errors
-    assert errors[-1]["errorKind"] == "max_iterations"
+    assert errors[-1]["errorKind"] == "no_progress"
 
 
 def test_deps_exporter_receives_events(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 from typing import Any, Callable
 
@@ -144,6 +145,64 @@ def build_normalize_csv(workspace: Path | str) -> Tool:
         "builtin",
         {"type": "object", "required": ["src", "dst"]},
         normalize_csv,
+    )
+
+
+def build_monster_hp_query(workspace: Path | str) -> Tool:
+    ws = Path(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    def monster_hp_query(inp: dict[str, Any]) -> ToolResult:
+        try:
+            src = _resolve(ws, inp["src"])
+        except ValueError as e:
+            return ToolResult(ok=False, error=str(e))
+        threshold = float(inp.get("threshold", 100))
+        root_key = str(inp.get("rootKey", "monsters"))
+        hp_field = str(inp.get("hpField", "hp"))
+        name_field = str(inp.get("nameField", "name"))
+
+        try:
+            payload = json.loads(src.read_text("utf-8"))
+        except FileNotFoundError:
+            return ToolResult(ok=False, error=f"입력 파일을 찾을 수 없습니다: {inp['src']}")
+        except json.JSONDecodeError as e:
+            return ToolResult(ok=False, error=f"JSON 파싱 실패: {e.msg}")
+
+        records = payload.get(root_key) if isinstance(payload, dict) else payload
+        if not isinstance(records, list):
+            return ToolResult(ok=False, error=f"JSON 배열을 찾을 수 없습니다: {root_key}")
+
+        selected: list[dict[str, Any]] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            hp = item.get(hp_field)
+            if isinstance(hp, bool) or not isinstance(hp, int | float):
+                continue
+            if hp >= threshold:
+                selected.append(item)
+
+        names = [str(item.get(name_field, "")) for item in selected if item.get(name_field)]
+        total_hp = sum(float(item[hp_field]) for item in selected)
+        average_hp = round(total_hp / len(selected), 2) if selected else 0.0
+        return ToolResult(
+            ok=True,
+            output={
+                "src": inp["src"],
+                "threshold": threshold,
+                "names": names,
+                "count": len(selected),
+                "averageHp": average_hp,
+            },
+        )
+
+    return Tool(
+        "queryMonsterHp",
+        "monsters JSON에서 hp 임계값 이상인 항목 이름과 평균 hp를 계산한다",
+        "builtin",
+        {"type": "object", "required": ["src"]},
+        monster_hp_query,
     )
 
 

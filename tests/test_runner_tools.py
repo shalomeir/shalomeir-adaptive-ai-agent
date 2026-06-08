@@ -150,6 +150,30 @@ def test_run_python_failure_surfaces_stderr(tmp_path):
     assert "return" in res.error.lower() or "syntax" in res.error.lower()
 
 
+def test_repeated_ask_user_stops_with_no_progress(tmp_path):
+    # A weak model can spin emitting the same ask_user forever. These parse fine,
+    # so they never trip the failure counter — the no-progress guard must stop it
+    # instead of prompting the user to max_iterations.
+    ask_reply = '{"action":"ask_user","question":"무엇을 정리할까요?"}'
+    runner = build(tmp_path, [ask_reply] * 6)
+    result = runner.run_turn("데이터 좀 정리해줘")
+    assert result.stopped_reason == "no_progress"
+
+
+def test_repeated_identical_tool_call_stops_with_no_progress(tmp_path):
+    # Re-calling the same tool with identical input never advances state. Each call
+    # may succeed (so fix_failures resets), but the run is going nowhere.
+    create = (
+        '{"action":"create_tool","spec":{"name":"noop","description":"noop",'
+        '"code":"def run(input):\\n    return {\\"ok\\": True}",'
+        '"inputSchema":{"type":"object"}}}'
+    )
+    call = '{"action":"call_tool","name":"noop","input":{"x":1}}'
+    runner = build(tmp_path, [create] + [call] * 6)
+    result = runner.run_turn("noop forever")
+    assert result.stopped_reason == "no_progress"
+
+
 def test_update_unknown_tool_is_graceful(tmp_path):
     # The model may try to update a built-in or nonexistent tool; the runner
     # must not crash, just observe and move on.

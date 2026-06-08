@@ -8,7 +8,12 @@ from adaptive_agent.policy import PolicyManager
 from adaptive_agent.runner import AgentRunner, RunnerDeps
 from adaptive_agent.sandbox import ExecutionSandbox
 from adaptive_agent.skills import SkillStore
-from adaptive_agent.tools.builtins import build_file_tools, build_normalize_csv, build_search_docs
+from adaptive_agent.tools.builtins import (
+    build_file_tools,
+    build_monster_hp_query,
+    build_normalize_csv,
+    build_search_docs,
+)
 from adaptive_agent.tools.generated import GeneratedToolManager
 from adaptive_agent.tools.registry import ToolRegistry
 
@@ -32,6 +37,7 @@ def _runner(
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
+    reg.register(build_monster_hp_query(ws))
     reg.register(build_normalize_csv(ws))
     if docs_dir is not None:
         reg.register(build_search_docs(docs_dir))
@@ -111,6 +117,22 @@ def test_d1_json_query(tmp_path: Path) -> None:
     blob = " ".join(result.observations)
     assert "Orc" in blob and "Dragon" in blob and "Wolf" in blob
     assert "186.67" in blob
+
+
+def test_d1_live_prompt_uses_direct_monster_hp_query(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path)
+    shutil.copy(DEMORSC / "data" / "monsters.json", ws / "monsters.json")
+    runner = _runner(tmp_path, ws, replies=[], ask="n")
+
+    result = runner.run_turn(
+        "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
+    )
+
+    assert "Orc" in result.summary
+    assert "Dragon" in result.summary
+    assert "Wolf" in result.summary
+    assert "186.67" in result.summary
+    assert runner.deps.llm.calls == 0
 
 
 # ---------- D2 + D5: dedup/sort, persist, reuse ----------

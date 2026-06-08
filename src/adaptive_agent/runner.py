@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 import re
 from typing import Any, Callable
 
@@ -53,6 +54,8 @@ _SYSTEM = (
     "write policy.\n"
     "For CSV dedupe/sort/save requests, prefer the built-in normalizeCsv tool with "
     '{"src":"events.csv","dst":"events-clean.csv","sortBy":"date"} instead of ad hoc code.\n'
+    "For monsters.json hp threshold name/average requests, prefer the built-in queryMonsterHp "
+    'tool with {"src":"monsters.json","threshold":100} instead of ad hoc code.\n'
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
     "installed and will fail to import. NEVER ask the user to install packages; for CSV work use "
     "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "
@@ -174,6 +177,24 @@ class AgentRunner:
         )
         return has_model_term and asks_runtime
 
+    def _action_signature(self, action: Any) -> str | None:
+        """Stable key for detecting a model that repeats the same step forever.
+
+        Terminal actions (finish, final respond) return None — they end the loop,
+        so they can never spin. Everything else returns a content-sensitive key so
+        an identical ask_user, tool call, or non-final respond is recognized as a
+        repeat. These all parse fine and never trip the failure counter, so without
+        this guard a weak model loops to max_iterations while re-prompting the user.
+        """
+        if isinstance(action, AskUser):
+            return f"ask_user:{action.question}"
+        if isinstance(action, CallTool):
+            payload = json.dumps(action.input, sort_keys=True, ensure_ascii=False)
+            return f"call_tool:{action.name}:{payload}"
+        if isinstance(action, Respond) and not action.final:
+            return f"respond:{action.text}"
+        return None
+
     def _blocked_ask_user_observation(self, question: str) -> str | None:
         """Convert invalid ask_user package prompts into a runtime observation."""
         lowered = question.lower()
@@ -215,6 +236,28 @@ class AgentRunner:
         src = csv_paths[0]
         dst = csv_paths[1] if len(csv_paths) >= 2 else f"{Path(src).stem}-clean.csv"
         return {"src": src, "dst": dst, "sortBy": "date"}
+
+    def _parse_direct_monster_hp_query(self, request: str) -> dict[str, Any] | None:
+        lowered = request.lower()
+        if not (
+            ".json" in lowered
+            and "hp" in lowered
+            and ("몬스터" in request or "monster" in lowered)
+            and ("이름" in request or "name" in lowered)
+            and ("평균" in request or "average" in lowered or "avg" in lowered)
+        ):
+            return None
+        json_paths = re.findall(r"[\w.-]+\.json", request)
+        if not json_paths:
+            return None
+        threshold = 100.0
+        comparison = re.search(r"hp\s*(?:>=|=>)\s*(\d+(?:\.\d+)?)", request, re.IGNORECASE)
+        korean_min = re.search(r"(\d+(?:\.\d+)?)\s*이상", request)
+        if comparison is not None:
+            threshold = float(comparison.group(1))
+        elif korean_min is not None:
+            threshold = float(korean_min.group(1))
+        return {"src": json_paths[0], "threshold": threshold}
 
     def _plan_raw(self) -> str:
         with self.tracer.span():
@@ -259,6 +302,12 @@ class AgentRunner:
             return TurnResult(summary=direct_response)
 
         self.conv.add_user(request)
+        direct_monster_payload = self._parse_direct_monster_hp_query(request)
+        if direct_monster_payload is not None and any(
+            digest.name == "queryMonsterHp" for digest in self.deps.registry.digests()
+        ):
+            return self._run_direct_monster_hp_query(direct_monster_payload)
+
         direct_csv_payload = self._parse_direct_csv_normalize(request)
         if direct_csv_payload is not None and any(
             digest.name == "normalizeCsv" for digest in self.deps.registry.digests()
@@ -268,6 +317,8 @@ class AgentRunner:
         result = TurnResult()
         fix_failures = 0
         parse_failures = 0
+        last_action_sig: str | None = None
+        action_repeats = 0
         with self.tracer.trace():
             for _ in range(self.deps.max_iterations):
                 raw = self._plan_raw()
@@ -287,6 +338,19 @@ class AgentRunner:
                 parse_failures = 0
                 action = parsed.action
                 self.tracer.log(kind="llm_call", actionType=action.action, parseOk=True)
+                sig = self._action_signature(action)
+                if sig is not None and sig == last_action_sig:
+                    action_repeats += 1
+                else:
+                    action_repeats = 0
+                    last_action_sig = sig
+                if action_repeats > self.deps.max_fix_retries:
+                    # Keep the last real observation as the answer: do not push the
+                    # stop note into result.observations or finalize would surface
+                    # it instead of the actual result the tools already produced.
+                    self.conv.add_observation("같은 동작이 진전 없이 반복되어 작업을 중단합니다.")
+                    result.stopped_reason = "no_progress"
+                    break
                 if isinstance(action, Finish):
                     result.summary = action.summary or ""
                     result.stopped_reason = "finish"
@@ -383,6 +447,30 @@ class AgentRunner:
                 f"{output.get('dst', payload['dst'])}에 중복 제거 및 date 오름차순 정렬 결과를 "
                 f"저장했습니다. 고유 행 {output.get('rows')}개, 제거한 중복 "
                 f"{output.get('removedDuplicates')}개입니다."
+            )
+            return result
+
+    def _run_direct_monster_hp_query(self, payload: dict[str, Any]) -> TurnResult:
+        result = TurnResult()
+        with self.tracer.trace():
+            res = self.deps.registry.call("queryMonsterHp", payload)
+            self.tracer.log(kind="tool_call", toolName="queryMonsterHp")
+            if not res.ok:
+                obs = f"도구 queryMonsterHp 실패: {res.error}"
+                self.conv.add_observation(obs)
+                result.observations.append(obs)
+                result.summary = obs
+                result.stopped_reason = "direct_tool_failure"
+                self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
+                return result
+            obs = f"도구 queryMonsterHp 결과: {res.output}"
+            self.conv.add_observation(obs)
+            result.observations.append(obs)
+            output = res.output or {}
+            names = ", ".join(output.get("names", [])) or "없음"
+            result.summary = (
+                f"hp가 {output.get('threshold', payload['threshold']):g} 이상인 몬스터는 "
+                f"{names}입니다. 평균 hp는 {output.get('averageHp')}입니다."
             )
             return result
 
