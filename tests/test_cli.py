@@ -25,6 +25,17 @@ def test_run_command_reports_summary(monkeypatch, tmp_path):
     assert "completed-xyz" in result.stdout
 
 
+def test_chat_exits_on_empty_piped_stdin(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    fake = _patch_llm(monkeypatch, ['{"action":"finish","summary":"should-not-run"}'])
+
+    result = CliRunner().invoke(app, ["chat"], input="")
+
+    assert result.exit_code == 0
+    assert "세션을 시작합니다" in result.stdout
+    assert fake.calls == 0
+
+
 def test_run_yes_auto_approves_write(monkeypatch, tmp_path):
     # --yes는 파일 쓰기 y/n 게이트를 자동 승인해, 비대화형에서도 부수효과가 진행된다.
     monkeypatch.chdir(tmp_path)

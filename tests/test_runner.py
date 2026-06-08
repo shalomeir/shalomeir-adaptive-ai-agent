@@ -226,12 +226,14 @@ def test_ask_user_flow(tmp_path):
     assert any("events.csv" in o for o in result.observations)
 
 
-def test_non_interactive_ask_ends_with_hitl_required(tmp_path):
+def test_non_interactive_file_structure_ask_is_auto_blocked(tmp_path):
     runner = AgentRunner(
         RunnerDeps(
             llm=FakeLLMClient(
                 replies=[
                     '{"action":"ask_user","question":"몬스터 데이터 구조를 확인해 주세요."}',
+                    '{"action":"ask_user","question":"파일 내부 root 키의 값이 리스트인 경우 이름을 알려주세요."}',
+                    '{"action":"finish","summary":"continued"}',
                 ]
             ),
             registry=ToolRegistry(),
@@ -243,8 +245,29 @@ def test_non_interactive_ask_ends_with_hitl_required(tmp_path):
 
     result = runner.run_turn("monsters.json 분석")
 
+    assert result.summary == "continued"
+    assert sum("파일을 직접 열어" in o for o in result.observations) == 2
+
+
+def test_non_interactive_general_ask_ends_with_hitl_required(tmp_path):
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"어떤 데이터를 정리할까요?"}',
+                ]
+            ),
+            registry=ToolRegistry(),
+            ask=lambda *a: NON_INTERACTIVE_ASK,
+            log_dir=tmp_path,
+            non_interactive=True,
+        )
+    )
+
+    result = runner.run_turn("데이터 좀 정리해줘")
+
     assert result.stopped_reason == "hitl_required"
-    assert result.summary == "HITL 처리가 필요합니다: 몬스터 데이터 구조를 확인해 주세요."
+    assert result.summary == "HITL 처리가 필요합니다: 어떤 데이터를 정리할까요?"
     assert not any("사용자 답변: n" in o for o in result.observations)
 
 

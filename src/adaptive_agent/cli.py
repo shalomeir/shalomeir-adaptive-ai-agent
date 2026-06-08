@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 from typing import Callable
 
 import typer
@@ -93,6 +94,8 @@ def chat(docs_dir: str = "demorsc/docs") -> None:
         try:
             request = Prompt.ask("[cyan]you[/cyan]")
         except (EOFError, KeyboardInterrupt):
+            break
+        if not request.strip() and not sys.stdin.isatty():
             break
         if request.strip().lower() in {"exit", "quit"}:
             break

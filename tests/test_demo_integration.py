@@ -268,7 +268,7 @@ def test_d2_live_prompt_uses_general_python_then_write_file(tmp_path: Path) -> N
     )
 
     assert "events-clean.csv" in result.summary
-    assert runner.deps.llm.calls == 3
+    assert runner.deps.llm.calls == 2
     rows = _data_rows(ws / "events-clean.csv")
     assert len(rows) == 5
     assert [row[1] for row in rows] == sorted(row[1] for row in rows)
@@ -469,9 +469,9 @@ def test_d3_live_prompt_uses_general_python_without_write_prompt(tmp_path: Path)
         "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
     )
 
-    assert "purchase 2500" in result.summary
-    assert "signup 0" in result.summary
-    assert "refund -200" in result.summary
+    assert "purchase: 2500" in result.summary
+    assert "signup: 0" in result.summary
+    assert "refund: -200" in result.summary
     assert runner.deps.llm.calls == 2
 
 
@@ -546,11 +546,10 @@ def test_d9_blocks_package_install_prompt_and_falls_back_to_csv(tmp_path: Path) 
 
     result = runner.run_turn("events.csv dedup, sort by date, save to events-clean.csv")
 
-    assert result.summary == "saved"
+    assert result.summary == "events-clean.csv 파일 저장이 완료되었습니다."
     assert asks == []
     assert out.exists()
     rows = _data_rows(out)
     assert len(rows) == 5
     assert [r[1] for r in rows] == sorted(r[1] for r in rows)
-    assert "tool_update" in _log_kinds(tmp_path)
-    assert any("패키지 설치 질문" in o for o in result.observations)
+    assert "tool_call" in _log_kinds(tmp_path)

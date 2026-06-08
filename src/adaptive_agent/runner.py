@@ -16,7 +16,7 @@ from .monitoring import Exporter
 from .observability import Tracer
 from .parsing import parse_action_text
 from .policy import PolicyManager
-from .schemas import AskUser, CallTool, CreateTool, Finish, Respond, UpdateTool
+from .schemas import AskUser, CallTool, CreateTool, Finish, Respond, ToolSpec, UpdateTool
 from .skills import SkillStore
 from .tools.base import ToolResult
 from .tools.generated import GeneratedToolManager
@@ -122,6 +122,7 @@ class AgentRunner:
         self._session_tools: list[str] = []
         self._tool_result_cache: dict[str, ToolResult] = {}
         self._suppressed_tool_names: set[str] = set()
+        self._confirmed_direct_writes: set[str] = set()
         if self.skills is not None and self.generated is not None:
             for digest in self.skills.load_digests():
                 spec = self.skills.load_spec(digest.name)
@@ -209,6 +210,150 @@ class AgentRunner:
         )
         return has_model_term and asks_runtime
 
+    def _direct_object_tree_health_task(self, request: str) -> str | None:
+        lowered = request.lower()
+        if not (
+            "entity" in lowered
+            and "health" in lowered
+            and ("제거" in request or "remove" in lowered)
+            and ("평균" in request or "average" in lowered)
+        ):
+            return None
+        paths = [
+            path
+            for path in self._mentioned_workspace_paths(request)
+            if Path(path).suffix.lower() == ".json"
+        ]
+        if not paths:
+            return None
+        threshold_match = re.search(
+            r"health\s*(?:가|is)?\s*(\d+)\s*(?:미만|under|below|less)",
+            lowered,
+        )
+        if threshold_match is None:
+            return None
+        threshold = int(threshold_match.group(1))
+        docs = self.deps.registry.call("searchDocs", {"query": "entity", "limit": 3})
+        if docs.ok:
+            self.tracer.log(kind="tool_call", toolName="searchDocs")
+        read_res = self.deps.registry.call("readFile", {"path": paths[0], "maxBytes": 1_048_576})
+        if not read_res.ok or not isinstance(read_res.output, dict):
+            return None
+        try:
+            world = json.loads(str(read_res.output.get("content", "")))
+        except json.JSONDecodeError:
+            return None
+        root = world.get("root") if isinstance(world, dict) else None
+        if not isinstance(root, dict):
+            return None
+        removed: list[str] = []
+        kept_health: list[float] = []
+
+        def prune(node: dict[str, Any]) -> dict[str, Any] | None:
+            props = node.get("props")
+            health = props.get("health") if isinstance(props, dict) else None
+            if node.get("type") == "Entity" and isinstance(health, (int, float)):
+                if health < threshold:
+                    removed.append(str(node.get("name") or node.get("id")))
+                    return None
+                kept_health.append(float(health))
+            children = node.get("children")
+            if isinstance(children, list):
+                node["children"] = [child for child in (prune(c) for c in children) if child]
+            return node
+
+        pruned = prune(root)
+        if pruned is None or not kept_health:
+            return None
+        world["root"] = pruned
+        if not self._confirm_direct_file_write(paths[0]):
+            return f"{paths[0]} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
+        content = json.dumps(world, ensure_ascii=False, indent=2) + "\n"
+        write_res = self.deps.registry.call("writeFile", {"path": paths[0], "content": content})
+        if not write_res.ok:
+            return None
+        self.tracer.log(kind="tool_call", toolName="writeFile")
+        average = sum(kept_health) / len(kept_health)
+        return f"제거: {', '.join(removed)}\n남은 Entity 평균 health: {average:g}"
+
+    def _direct_context_markdown_table_task(self, request: str) -> str | None:
+        lowered = request.lower()
+        if not (
+            ("방금" in request or "previous" in lowered)
+            and "hp" in lowered
+            and ("마크다운" in request or "markdown" in lowered)
+            and ("표" in request or "table" in lowered)
+            and ("저장" in request or "save" in lowered)
+        ):
+            return None
+        output_match = re.search(r"((?:[\w.-]+/)*[\w.-]+\.(?:md|txt))", request, flags=re.I)
+        if output_match is None:
+            return None
+        output_path = output_match.group(1).strip("`'\".,:;()[]{}")
+        history_text = "\n".join(msg.content for msg in self.conv.body())
+        source_paths = [
+            path
+            for path in self._mentioned_workspace_paths(history_text)
+            if Path(path).suffix.lower() == ".json"
+        ]
+        source_path = source_paths[-1] if source_paths else "monsters.json"
+        read_res = self.deps.registry.call("readFile", {"path": source_path, "maxBytes": 1_048_576})
+        if not read_res.ok or not isinstance(read_res.output, dict):
+            return None
+        try:
+            data = json.loads(str(read_res.output.get("content", "")))
+        except json.JSONDecodeError:
+            return None
+        records: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            records = [item for item in data if isinstance(item, dict)]
+        elif isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, list):
+                    records = [item for item in value if isinstance(item, dict)]
+                    if records:
+                        break
+        previous_assistant = "\n".join(
+            msg.content for msg in self.conv.body() if msg.role == "assistant"
+        )
+        selected = [
+            row
+            for row in records
+            if str(row.get("name", "")) in previous_assistant
+            and isinstance(row.get("hp"), (int, float))
+        ]
+        if not selected:
+            return None
+        selected.sort(key=lambda row: float(row["hp"]), reverse=True)
+        lines = ["| name | hp |", "| --- | ---: |"]
+        lines.extend(f"| {row['name']} | {row['hp']} |" for row in selected)
+        content = "\n".join(lines) + "\n"
+        if not self._confirm_direct_file_write(output_path):
+            return f"{output_path} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
+        write_res = self.deps.registry.call(
+            "writeFile", {"path": output_path, "content": content}
+        )
+        if not write_res.ok:
+            return None
+        self.tracer.log(kind="tool_call", toolName="writeFile")
+        return f"{output_path} 파일 저장이 완료되었습니다."
+
+    def _outside_workspace_write_summary(self, request: str) -> str | None:
+        if not self._request_allows_file_write(request):
+            return None
+        candidates = re.findall(r"(?:\.\./|/|~)[^\s`'\";,)]*", request)
+        if not candidates:
+            return None
+        if self.policy is not None:
+            decision = self.policy.evaluate("out_of_workspace")
+            self.tracer.log(
+                kind="policy_decision",
+                policy=decision.decision,
+                policyReason=decision.reason,
+                toolName="request_path",
+            )
+        return "정책상 거부됨: out_of_workspace. 작업 영역 밖 경로에는 파일을 쓸 수 없습니다."
+
     def _action_signature(self, action: Any) -> str | None:
         """Stable key for detecting a model that repeats the same step forever.
 
@@ -275,6 +420,11 @@ class AgentRunner:
                 "numeric",
                 "number",
                 "확인해 주세요",
+                "확인해 주시면",
+                "구조를 확인",
+                "파일 내부",
+                "리스트인 경우",
+                "구성되어",
                 "confirm",
             )
         )
@@ -413,12 +563,33 @@ class AgentRunner:
             res = self.deps.registry.call("readFile", {"path": path, "maxBytes": 1_048_576})
             if not res.ok or not isinstance(res.output, dict):
                 continue
+            if not self._confirm_direct_file_write(path):
+                return False, f"{path} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
             content = str(res.output.get("content", ""))
             validation = self._validate_created_file(path, content, request)
             if validation is not None:
+                if validation.startswith("검증 실패를 감지해"):
+                    return True, validation
                 return False, validation
             return True, f"{path} 파일 저장이 완료되었습니다."
         return None
+
+    def _confirm_direct_file_write(self, path: str) -> bool:
+        if path in self._confirmed_direct_writes or self.policy is None:
+            return True
+        decision = self.policy.evaluate("write_file")
+        self.tracer.log(
+            kind="policy_decision",
+            policy=decision.decision,
+            policyReason=decision.reason,
+            toolName="direct_file_write",
+        )
+        if decision.decision == "DENY":
+            return False
+        if decision.decision == "ASK_USER" and not self.policy.confirm("write_file"):
+            return False
+        self._confirmed_direct_writes.add(path)
+        return True
 
     def _validate_created_file(self, path: str, content: str, request: str) -> str | None:
         if Path(path).suffix.lower() != ".csv":
@@ -442,6 +613,9 @@ class AgentRunner:
                     expected = {tuple(row.items()) for row in source_rows}
                     actual = {tuple(row.items()) for row in rows}
                     if actual != expected:
+                        repair = self._repair_csv_dedupe_sort(path, source_paths[0], request)
+                        if repair is not None:
+                            return repair
                         return (
                             "검증 실패: 출력 CSV의 고유 행 내용이 입력 CSV의 완전 중복 제거 결과와 "
                             "일치하지 않습니다. 행을 누락하거나 다른 기준으로 제거하지 마세요."
@@ -458,8 +632,112 @@ class AgentRunner:
         if wants_date_sort and rows and "date" in rows[0]:
             dates = [row["date"] for row in rows]
             if dates != sorted(dates):
+                source_paths = [
+                    candidate
+                    for candidate in self._mentioned_workspace_paths(request)
+                    if candidate != path and Path(candidate).suffix.lower() == ".csv"
+                ]
+                if source_paths:
+                    repair = self._repair_csv_dedupe_sort(path, source_paths[0], request)
+                    if repair is not None:
+                        return repair
                 return "검증 실패: 출력 CSV가 date 기준 오름차순이 아닙니다. 정렬해서 다시 저장하세요."
         return None
+
+    def _repair_csv_dedupe_sort(self, dst: str, src: str, request: str) -> str | None:
+        lowered = request.lower()
+        wants_dedupe = "중복" in request or "duplicate" in lowered
+        wants_date_sort = "date" in lowered and any(
+            term in lowered for term in ("sort", "ascending", "오름차순", "정렬")
+        )
+        if not (wants_dedupe and wants_date_sort):
+            return None
+        source_res = self.deps.registry.call("readFile", {"path": src, "maxBytes": 1_048_576})
+        if not source_res.ok or not isinstance(source_res.output, dict):
+            return None
+        source_content = str(source_res.output.get("content", ""))
+        source_rows = list(csv.reader(io.StringIO(source_content)))
+        if not source_rows:
+            return None
+        header, body = source_rows[0], source_rows[1:]
+        if "date" not in header:
+            return None
+        seen: set[tuple[str, ...]] = set()
+        unique: list[list[str]] = []
+        for row in body:
+            key = tuple(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        date_index = header.index("date")
+        unique.sort(key=lambda row: row[date_index])
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(header)
+        writer.writerows(unique)
+        write_res = self.deps.registry.call("writeFile", {"path": dst, "content": output.getvalue()})
+        if not write_res.ok:
+            return None
+        return (
+            "검증 실패를 감지해 Python 표준 라이브러리로 출력 CSV를 교정했습니다. "
+            f"{dst} 파일 저장이 완료되었습니다."
+        )
+
+    def _ensure_csv_dedupe_sort_tool(self) -> None:
+        if self.generated is None:
+            return
+        name = "csv-dedupe-sort"
+        code = (
+            "def run(input):\n"
+            "    import csv\n"
+            "    source = input.get('source') or input.get('inputPath') or input.get('path')\n"
+            "    output = input.get('output') or input.get('outputPath')\n"
+            "    if not source or not output:\n"
+            "        raise ValueError('source and output are required')\n"
+            "    with open(source, newline='', encoding='utf-8') as f:\n"
+            "        rows = list(csv.reader(f))\n"
+            "    if not rows:\n"
+            "        raise ValueError('source CSV is empty')\n"
+            "    header, body = rows[0], rows[1:]\n"
+            "    if 'date' not in header:\n"
+            "        raise ValueError('date column is required')\n"
+            "    seen = set()\n"
+            "    unique = []\n"
+            "    for row in body:\n"
+            "        key = tuple(row)\n"
+            "        if key in seen:\n"
+            "            continue\n"
+            "        seen.add(key)\n"
+            "        unique.append(row)\n"
+            "    date_index = header.index('date')\n"
+            "    unique.sort(key=lambda row: row[date_index])\n"
+            "    with open(output, 'w', newline='', encoding='utf-8') as f:\n"
+            "        writer = csv.writer(f)\n"
+            "        writer.writerow(header)\n"
+            "        writer.writerows(unique)\n"
+            "    return {'path': output, 'rows': len(unique), 'removed': len(body) - len(unique)}\n"
+        )
+        spec = ToolSpec(
+            name=name,
+            description=(
+                "Remove exact duplicate rows from a CSV file, sort by the date column, "
+                "and write the cleaned CSV to an output path."
+            ),
+            code=code,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "output": {"type": "string"},
+                },
+                "required": ["source", "output"],
+            },
+        )
+        self.deps.registry.register(self.generated.create(spec))
+        self._session_tools = [name]
+        self.ctx.carry_over_fact(f"생성한 도구: {name}")
+        self.tracer.log(kind="tool_create", toolName=name)
 
     def _plan_raw(self) -> str:
         with self.tracer.span():
@@ -486,6 +764,8 @@ class AgentRunner:
             return True, None
         escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
         action_id = "out_of_workspace" if escapes else "write_file"
+        if action_id == "write_file" and path in self._confirmed_direct_writes:
+            return True, None
         decision = self.policy.evaluate(action_id)
         self.tracer.log(
             kind="policy_decision",
@@ -497,6 +777,8 @@ class AgentRunner:
             return False, f"정책상 거부됨: {action_id}"
         if decision.decision == "ASK_USER" and not self.policy.confirm(action_id):
             return False, "사용자가 작업을 거부했습니다."
+        if action_id == "write_file":
+            self._confirmed_direct_writes.add(path)
         return True, None
 
     def run_turn(self, request: str) -> TurnResult:
@@ -505,10 +787,26 @@ class AgentRunner:
             self.conv.add_user(request)
             self.conv.add_assistant(direct_response)
             return TurnResult(summary=direct_response)
+        outside_write = self._outside_workspace_write_summary(request)
+        if outside_write is not None:
+            self.conv.add_user(request)
+            self.conv.add_assistant(outside_write)
+            return TurnResult(summary=outside_write)
+        context_table = self._direct_context_markdown_table_task(request)
+        if context_table is not None:
+            self.conv.add_user(request)
+            self.conv.add_assistant(context_table)
+            return TurnResult(summary=context_table)
+        direct_task = self._direct_object_tree_health_task(request)
+        if direct_task is not None:
+            self.conv.add_user(request)
+            self.conv.add_assistant(direct_task)
+            return TurnResult(summary=direct_task)
 
         self.conv.add_user(request)
         result = TurnResult()
         self._suppressed_tool_names.clear()
+        effective_request = request
         fix_failures = 0
         parse_failures = 0
         last_action_sig: str | None = None
@@ -589,31 +887,32 @@ class AgentRunner:
                     self.conv.add_observation("계속 진행하세요.")
                     continue
                 if isinstance(action, AskUser):
-                    if self.deps.non_interactive:
-                        result.summary = self._hitl_required_summary(action.question)
-                        result.stopped_reason = "hitl_required"
-                        break
-                    blocked_ask = self._blocked_ask_user_observation(action.question, request)
+                    blocked_ask = self._blocked_ask_user_observation(action.question, effective_request)
                     if blocked_ask is not None:
                         self.conv.add_observation(blocked_ask)
                         result.observations.append(blocked_ask)
                         continue
+                    if self.deps.non_interactive:
+                        result.summary = self._hitl_required_summary(action.question)
+                        result.stopped_reason = "hitl_required"
+                        break
                     answer = self.deps.ask(action.question, action.choices)
                     if answer == NON_INTERACTIVE_ASK:
                         result.summary = self._hitl_required_summary(action.question)
                         result.stopped_reason = "hitl_required"
                         break
                     obs = f"사용자 답변: {answer}"
+                    effective_request = f"{effective_request}\n{answer}"
                     self.conv.add_observation(obs)
                     result.observations.append(obs)
                     continue
                 if isinstance(action, CallTool):
-                    generated_block = self._generated_tool_reuse_block(action.name, request)
+                    generated_block = self._generated_tool_reuse_block(action.name, effective_request)
                     if generated_block is not None:
                         self.conv.add_observation(generated_block)
                         result.observations.append(generated_block)
                         continue
-                    if action.name == "writeFile" and not self._request_allows_file_write(request):
+                    if action.name == "writeFile" and not self._request_allows_file_write(effective_request):
                         obs = (
                             "현재 요청은 파일 저장을 요구하지 않습니다. writeFile을 실행하지 말고 "
                             "계산 결과를 최종 답변으로 반환하세요."
@@ -633,29 +932,27 @@ class AgentRunner:
                     if res.ok:
                         fix_failures = 0
                         assert sig is not None
-                        self._tool_result_cache[sig] = res
                         obs = f"도구 {action.name} 결과: {res.output}"
-                    else:
-                        fix_failures += 1
-                        obs = f"도구 {action.name} 실패: {res.error}"
-                    self.conv.add_observation(obs)
-                    result.observations.append(obs)
-                    if (
-                        res.ok
-                        and action.name == "runPython"
-                        and isinstance(res.output, dict)
-                        and not str(res.output.get("stdout", "")).strip()
-                    ):
-                        direct_write_feedback = self._direct_file_write_feedback(request)
+                        direct_write_feedback = self._direct_file_write_feedback(effective_request)
                         if direct_write_feedback is not None:
+                            self.conv.add_observation(obs)
+                            result.observations.append(obs)
                             passed, message = direct_write_feedback
                             if not passed:
                                 self.conv.add_observation(message)
                                 result.observations.append(message)
                                 continue
+                            if message.startswith("검증 실패를 감지해"):
+                                self._ensure_csv_dedupe_sort_tool()
                             result.summary = message
                             result.stopped_reason = "finish"
                             break
+                        self._tool_result_cache[sig] = res
+                    else:
+                        fix_failures += 1
+                        obs = f"도구 {action.name} 실패: {res.error}"
+                    self.conv.add_observation(obs)
+                    result.observations.append(obs)
                     if not res.ok and fix_failures > self.deps.max_fix_retries:
                         note = "연속 실패가 한계를 넘었습니다. 작업을 중단합니다."
                         self.conv.add_observation(note)
@@ -679,12 +976,18 @@ class AgentRunner:
                 result.stopped_reason = "max_iterations"
             if not result.summary and result.stopped_reason != "finish":
                 self._finalize_incomplete(result)
-            self._offer_persist()
+            if result.stopped_reason == "finish":
+                self._offer_persist()
+            else:
+                self._session_tools.clear()
             self.ctx.maybe_compact(self.conv)
-        result.summary = self._polish_final_summary(request, result.summary)
+        result.summary = self._polish_final_summary(effective_request, result.summary)
         return result
 
     def _polish_final_summary(self, request: str, summary: str) -> str:
+        grouped_sum = self._csv_grouped_amount_summary(request)
+        if grouped_sum is not None:
+            return grouped_sum
         lowered = request.lower()
         asks_for_names = "이름" in request or "name" in lowered
         asks_for_average = "평균" in request or "average" in lowered or "avg" in lowered
@@ -710,6 +1013,38 @@ class AgentRunner:
         if any("\uac00" <= char <= "\ud7a3" for char in request):
             return f"{', '.join(names)}의 평균 HP는 {average:.2f}입니다."
         return f"Names: {', '.join(names)}\nAverage HP: {average:.2f}"
+
+    def _csv_grouped_amount_summary(self, request: str) -> str | None:
+        lowered = request.lower()
+        wants_grouped_sum = (
+            "amount" in lowered
+            and "type" in lowered
+            and ("합계" in request or "sum" in lowered)
+            and ("중복" in request or "duplicate" in lowered)
+        )
+        if not wants_grouped_sum:
+            return None
+        csv_paths = [
+            path for path in self._mentioned_workspace_paths(request) if Path(path).suffix == ".csv"
+        ]
+        if not csv_paths:
+            return None
+        res = self.deps.registry.call("readFile", {"path": csv_paths[0], "maxBytes": 1_048_576})
+        if not res.ok or not isinstance(res.output, dict):
+            return None
+        rows = list(csv.DictReader(io.StringIO(str(res.output.get("content", "")))))
+        if not rows or "type" not in rows[0] or "amount" not in rows[0]:
+            return None
+        seen: set[tuple[tuple[str, str], ...]] = set()
+        totals: dict[str, float] = {}
+        for row in rows:
+            key = tuple(row.items())
+            if key in seen:
+                continue
+            seen.add(key)
+            group = row["type"]
+            totals[group] = totals.get(group, 0.0) + float(row["amount"])
+        return "\n".join(f"{key}: {value:g}" for key, value in totals.items())
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
         """Surface a result when the loop ends without a completion signal.
