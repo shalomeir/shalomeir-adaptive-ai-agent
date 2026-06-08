@@ -47,6 +47,9 @@ _SYSTEM = (
     'with code "import json\\ndata = json.load(open(\\"monsters.json\\"))\\nresult = ...\\n'
     'print(json.dumps(result))" answers a one-off data question in one step. You do NOT need to '
     "readFile first or pass file contents through input; use readFile only to peek at a small file.\n"
+    "For file output, prefer returning the computed text/data from runPython or a created tool, then "
+    "call writeFile with the final relative path and content. This lets the runtime apply its file "
+    "write policy.\n"
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
     "installed and will fail to import. NEVER ask the user to install packages; for CSV work use "
     "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "

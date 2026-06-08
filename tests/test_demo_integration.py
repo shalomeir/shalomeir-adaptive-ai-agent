@@ -130,6 +130,13 @@ NORMALIZE_CODE = (
     "        w = csv.writer(f); w.writerow(header); w.writerows(uniq)\n"
     "    return {'rows': len(uniq)}\n"
 )
+PANDAS_BAD_NORMALIZE_CODE = (
+    "import pandas as pd\n"
+    "def run(input):\n"
+    "    df = pd.read_csv(input['src']).drop_duplicates().sort_values('date')\n"
+    "    df.to_csv(input['dst'], index=False)\n"
+    "    return {'rows': len(df)}\n"
+)
 
 
 def _data_rows(path: Path) -> list[list[str]]:
@@ -148,7 +155,7 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
         ws_a,
         [
             _create("normalize-csv", NORMALIZE_CODE),
-            _call("normalize-csv", {"src": str(ws_a / "events.csv"), "dst": str(out1)}),
+            _call("normalize-csv", {"src": "events.csv", "dst": "out1.csv"}),
             _finish(),
         ],
         ask="y",
@@ -361,7 +368,7 @@ def test_d4_ambiguous_then_clarified(tmp_path: Path) -> None:
             _finish("waiting for clarification"),
             # turn 2: concrete request → dedup + sort like D2
             _create("normalize-csv", NORMALIZE_CODE),
-            _call("normalize-csv", {"src": str(ws / "events.csv"), "dst": str(out)}),
+            _call("normalize-csv", {"src": "events.csv", "dst": "out.csv"}),
             _finish(),
         ],
         ask="events.csv를 중복 제거하고 date로 정렬",
@@ -381,3 +388,48 @@ def test_d4_ambiguous_then_clarified(tmp_path: Path) -> None:
     assert len(rows) == 5
     dates = [r[1] for r in rows]
     assert dates == sorted(dates)
+
+
+# ---------- D9: external package detour is blocked, then stdlib fallback works ----------
+def test_d9_blocks_package_install_prompt_and_falls_back_to_csv(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path)
+    shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
+    out = ws / "events-clean.csv"
+    asks: list[tuple] = []
+    reg = ToolRegistry()
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    sandbox = ExecutionSandbox(ws, timeout_sec=10, max_output_bytes=16384)
+    deps = RunnerDeps(
+        llm=FakeLLMClient(
+            replies=[
+                _create("normalize-csv", PANDAS_BAD_NORMALIZE_CODE),
+                _call("normalize-csv", {"src": "events.csv", "dst": "events-clean.csv"}),
+                _ask("Pandas 모듈이 설치되어 있지 않습니다. 설치하시겠습니까?"),
+                _ask("Pandas를 사용할 수 없습니다. 대신 표준 라이브러리로 진행해도 될까요?"),
+                _update("normalize-csv", NORMALIZE_CODE),
+                _call("normalize-csv", {"src": "events.csv", "dst": "events-clean.csv"}),
+                _finish("saved"),
+            ]
+        ),
+        registry=reg,
+        ask=lambda *a: asks.append(a) or "no",
+        log_dir=tmp_path / "logs",
+    )
+    runner = AgentRunner(
+        deps,
+        generated=GeneratedToolManager(ws / ".session", sandbox),
+        skills=SkillStore(tmp_path / "skills"),
+        policy=PolicyManager(ask=lambda q: "y"),
+    )
+
+    result = runner.run_turn("events.csv dedup, sort by date, save to events-clean.csv")
+
+    assert result.summary == "saved"
+    assert asks == []
+    assert out.exists()
+    rows = _data_rows(out)
+    assert len(rows) == 5
+    assert [r[1] for r in rows] == sorted(r[1] for r in rows)
+    assert "tool_update" in _log_kinds(tmp_path)
+    assert any("패키지 설치 질문" in o for o in result.observations)
