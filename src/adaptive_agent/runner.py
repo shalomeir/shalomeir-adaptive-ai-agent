@@ -240,6 +240,22 @@ class AgentRunner:
             )
         return "정책상 거부됨: out_of_workspace. 작업 영역 밖 경로에는 파일을 쓸 수 없습니다."
 
+    def _initial_clarification_question(self, request: str) -> str | None:
+        """Ask directly for underspecified data-cleanup tasks before planning."""
+        lowered = request.lower()
+        has_data_term = any(term in lowered for term in ("data", "데이터", "파일"))
+        asks_cleanup = any(
+            term in lowered
+            for term in ("정리", "clean", "normalize", "정렬", "sort", "중복", "dedup")
+        )
+        has_path = bool(self._mentioned_workspace_paths(request))
+        if has_data_term and asks_cleanup and not has_path:
+            return (
+                "어떤 데이터를 어떻게 정리할까요? 파일명과 원하는 작업을 같이 알려주세요. "
+                "예: events.csv에서 중복 제거하고 date로 정렬해줘."
+            )
+        return None
+
     def _object_tree_numeric_filter_fallback(self, request: str) -> str | None:
         """Handle common object-tree mutations without binding to a demo file."""
         lowered = request.lower()
@@ -980,6 +996,21 @@ class AgentRunner:
         result = TurnResult()
         self._suppressed_tool_names.clear()
         effective_request = request
+        initial_question = self._initial_clarification_question(request)
+        if initial_question is not None:
+            if self.deps.non_interactive:
+                result.summary = self._hitl_required_summary(initial_question)
+                result.stopped_reason = "hitl_required"
+                return result
+            answer = self.deps.ask(initial_question, None)
+            if answer == NON_INTERACTIVE_ASK:
+                result.summary = self._hitl_required_summary(initial_question)
+                result.stopped_reason = "hitl_required"
+                return result
+            obs = f"사용자 답변: {answer}"
+            effective_request = f"{effective_request}\n{answer}"
+            self.conv.add_observation(obs)
+            result.observations.append(obs)
         fix_failures = 0
         parse_failures = 0
         last_action_sig: str | None = None

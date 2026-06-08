@@ -267,7 +267,11 @@ def test_non_interactive_general_ask_ends_with_hitl_required(tmp_path):
     result = runner.run_turn("데이터 좀 정리해줘")
 
     assert result.stopped_reason == "hitl_required"
-    assert result.summary == "HITL 처리가 필요합니다: 어떤 데이터를 정리할까요?"
+    assert result.summary == (
+        "HITL 처리가 필요합니다: 어떤 데이터를 어떻게 정리할까요? "
+        "파일명과 원하는 작업을 같이 알려주세요. "
+        "예: events.csv에서 중복 제거하고 date로 정렬해줘."
+    )
     assert not any("사용자 답변: n" in o for o in result.observations)
 
 

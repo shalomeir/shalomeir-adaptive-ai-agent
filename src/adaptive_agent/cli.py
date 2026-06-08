@@ -48,10 +48,7 @@ def _ask(question: str, choices: list[str] | None = None) -> str:
 def _confirm(question: str) -> str:
     """Render policy confirmations separately from open-ended chat."""
     console.print(f"[green]agent[/green]: {question}")
-    answer = Prompt.ask("[cyan]you[/cyan]", default="n")
-    if answer.strip().lower() in {"exit", "quit"}:
-        raise EOFError
-    return answer
+    return Prompt.ask("[cyan]you[/cyan]", default="n")
 
 
 def _assemble_runner(

@@ -158,9 +158,23 @@ def test_repeated_ask_user_stops_with_no_progress(tmp_path):
     # instead of prompting the user to max_iterations.
     ask_reply = '{"action":"ask_user","question":"무엇을 정리할까요?"}'
     runner = build(tmp_path, [ask_reply] * 6)
-    result = runner.run_turn("데이터 좀 정리해줘")
+    result = runner.run_turn("작업을 도와줘")
     assert result.stopped_reason == "no_progress"
     assert result.summary == "작업이 진전 없이 반복되어 중단했습니다."
+
+
+def test_vague_data_cleanup_gets_initial_clarification_before_llm(tmp_path):
+    answers = []
+    runner = build(tmp_path, ['{"action":"finish","summary":"continued"}'])
+    runner.deps.ask = lambda *a: answers.append(a[0]) or "events.csv를 중복 제거해줘"
+
+    result = runner.run_turn("데이터 좀 정리해줘.")
+
+    assert result.summary == "continued"
+    assert answers == [
+        "어떤 데이터를 어떻게 정리할까요? 파일명과 원하는 작업을 같이 알려주세요. "
+        "예: events.csv에서 중복 제거하고 date로 정렬해줘."
+    ]
 
 
 def test_incomplete_summary_hides_internal_tool_creation_observation(tmp_path):
