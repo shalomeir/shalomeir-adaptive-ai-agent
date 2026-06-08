@@ -19,6 +19,7 @@ from .skills import SkillStore
 from .tools.builtins import (
     build_ask_user,
     build_file_tools,
+    build_normalize_csv,
     build_run_python,
     build_search_docs,
 )
@@ -60,6 +61,7 @@ def _assemble_runner(
     registry = ToolRegistry()
     for tool in build_file_tools(cfg.workspace_dir):
         registry.register(tool)
+    registry.register(build_normalize_csv(cfg.workspace_dir))
     registry.register(build_run_python(sandbox))
     registry.register(build_search_docs(docs_dir))
     registry.register(build_ask_user(free_ask))

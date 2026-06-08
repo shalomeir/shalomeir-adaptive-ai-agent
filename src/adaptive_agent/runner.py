@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Callable
 
 from .context import ContextManager
@@ -50,6 +51,8 @@ _SYSTEM = (
     "For file output, prefer returning the computed text/data from runPython or a created tool, then "
     "call writeFile with the final relative path and content. This lets the runtime apply its file "
     "write policy.\n"
+    "For CSV dedupe/sort/save requests, prefer the built-in normalizeCsv tool with "
+    '{"src":"events.csv","dst":"events-clean.csv","sortBy":"date"} instead of ad hoc code.\n'
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
     "installed and will fail to import. NEVER ask the user to install packages; for CSV work use "
     "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "
@@ -196,6 +199,23 @@ class AgentRunner:
             )
         return None
 
+    def _parse_direct_csv_normalize(self, request: str) -> dict[str, Any] | None:
+        lowered = request.lower()
+        if not (
+            ".csv" in lowered
+            and "date" in lowered
+            and any(term in request for term in ("중복", "duplicate"))
+            and any(term in request for term in ("정렬", "sort"))
+            and any(term in request for term in ("저장", "save"))
+        ):
+            return None
+        csv_paths = re.findall(r"[\w.-]+\.csv", request)
+        if not csv_paths:
+            return None
+        src = csv_paths[0]
+        dst = csv_paths[1] if len(csv_paths) >= 2 else f"{Path(src).stem}-clean.csv"
+        return {"src": src, "dst": dst, "sortBy": "date"}
+
     def _plan_raw(self) -> str:
         with self.tracer.span():
             raw = self.deps.llm.chat(self.conv.messages(), self.deps.registry.digests())
@@ -205,14 +225,17 @@ class AgentRunner:
     def _gate(self, name: str, payload: dict[str, Any]) -> tuple[bool, str | None]:
         """Consult the policy before a side-effecting tool call.
 
-        Returns (allowed, observation_if_blocked). Only writeFile is gated for now:
+        Returns (allowed, observation_if_blocked). File-writing tools are gated:
         an out-of-workspace target is denied outright; an in-workspace write asks
         the user. Other tools are allowed.
         """
         assert self.policy is not None
-        if name != "writeFile":
+        if name == "writeFile":
+            path = str(payload.get("path", ""))
+        elif name == "normalizeCsv":
+            path = str(payload.get("dst", ""))
+        else:
             return True, None
-        path = str(payload.get("path", ""))
         escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
         action_id = "out_of_workspace" if escapes else "write_file"
         decision = self.policy.evaluate(action_id)
@@ -236,6 +259,12 @@ class AgentRunner:
             return TurnResult(summary=direct_response)
 
         self.conv.add_user(request)
+        direct_csv_payload = self._parse_direct_csv_normalize(request)
+        if direct_csv_payload is not None and any(
+            digest.name == "normalizeCsv" for digest in self.deps.registry.digests()
+        ):
+            return self._run_direct_csv_normalize(direct_csv_payload)
+
         result = TurnResult()
         fix_failures = 0
         parse_failures = 0
@@ -323,6 +352,39 @@ class AgentRunner:
             self._offer_persist()
             self.ctx.maybe_compact(self.conv)
         return result
+
+    def _run_direct_csv_normalize(self, payload: dict[str, Any]) -> TurnResult:
+        result = TurnResult()
+        with self.tracer.trace():
+            if self.policy is not None:
+                allowed, blocked = self._gate("normalizeCsv", payload)
+                if not allowed:
+                    assert blocked is not None
+                    self.conv.add_observation(blocked)
+                    result.observations.append(blocked)
+                    result.summary = blocked
+                    result.stopped_reason = "policy_denied"
+                    return result
+            res = self.deps.registry.call("normalizeCsv", payload)
+            self.tracer.log(kind="tool_call", toolName="normalizeCsv")
+            if not res.ok:
+                obs = f"도구 normalizeCsv 실패: {res.error}"
+                self.conv.add_observation(obs)
+                result.observations.append(obs)
+                result.summary = obs
+                result.stopped_reason = "direct_tool_failure"
+                self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
+                return result
+            obs = f"도구 normalizeCsv 결과: {res.output}"
+            self.conv.add_observation(obs)
+            result.observations.append(obs)
+            output = res.output or {}
+            result.summary = (
+                f"{output.get('dst', payload['dst'])}에 중복 제거 및 date 오름차순 정렬 결과를 "
+                f"저장했습니다. 고유 행 {output.get('rows')}개, 제거한 중복 "
+                f"{output.get('removedDuplicates')}개입니다."
+            )
+            return result
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
         """Surface a result when the loop ends without a completion signal.

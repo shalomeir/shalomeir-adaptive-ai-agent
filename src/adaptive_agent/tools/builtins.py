@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Any, Callable
 
@@ -86,6 +87,66 @@ def build_file_tools(workspace: Path | str) -> list[Tool]:
     ]
 
 
+def build_normalize_csv(workspace: Path | str) -> Tool:
+    ws = Path(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    def normalize_csv(inp: dict[str, Any]) -> ToolResult:
+        try:
+            src = _resolve(ws, inp["src"])
+            dst = _resolve(ws, inp["dst"])
+        except ValueError as e:
+            return ToolResult(ok=False, error=str(e))
+        sort_by = str(inp.get("sortBy", "date"))
+        try:
+            with src.open(newline="", encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+        except FileNotFoundError:
+            return ToolResult(ok=False, error=f"입력 파일을 찾을 수 없습니다: {inp['src']}")
+        if not rows:
+            return ToolResult(ok=False, error="CSV 파일이 비어 있습니다")
+
+        header, body = rows[0], rows[1:]
+        if sort_by not in header:
+            return ToolResult(ok=False, error=f"정렬 기준 컬럼이 없습니다: {sort_by}")
+
+        seen: set[tuple[str, ...]] = set()
+        unique_rows: list[list[str]] = []
+        for row in body:
+            key = tuple(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(row)
+
+        sort_index = header.index(sort_by)
+        unique_rows.sort(key=lambda row: row[sort_index])
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with dst.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(header)
+            writer.writerows(unique_rows)
+
+        return ToolResult(
+            ok=True,
+            output={
+                "src": inp["src"],
+                "dst": inp["dst"],
+                "rows": len(unique_rows),
+                "removedDuplicates": len(body) - len(unique_rows),
+                "sortBy": sort_by,
+            },
+        )
+
+    return Tool(
+        "normalizeCsv",
+        "CSV에서 완전히 중복된 행을 제거하고 지정 컬럼 기준 오름차순으로 정렬해 저장한다",
+        "builtin",
+        {"type": "object", "required": ["src", "dst"]},
+        normalize_csv,
+    )
+
+
 def build_run_python(sandbox: ExecutionSandbox) -> Tool:
     def run_python(inp: dict[str, Any]) -> ToolResult:
         if "code" in inp:
@@ -121,8 +182,8 @@ def build_run_python(sandbox: ExecutionSandbox) -> Tool:
     return Tool(
         "runPython",
         "제한된 Python 스크립트를 격리 실행한다. input.code에 최상위 스크립트를 넣는다 — "
-        "함수 본문이 아니므로 return을 쓰지 말고 결과는 print로 출력한다. 처리할 데이터는 "
-        "먼저 readFile로 읽어 코드 문자열 안에 직접 넣는다(스크립트에 input 변수는 없다).",
+        "함수 본문이 아니므로 return을 쓰지 말고 결과는 print로 출력한다. 스크립트는 "
+        "workspace를 cwd로 실행하므로 events.csv 같은 상대 경로를 직접 열 수 있다.",
         "builtin",
         {"type": "object"},
         run_python,

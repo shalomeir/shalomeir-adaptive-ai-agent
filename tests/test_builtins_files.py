@@ -1,4 +1,6 @@
-from adaptive_agent.tools.builtins import build_file_tools
+import csv
+
+from adaptive_agent.tools.builtins import build_file_tools, build_normalize_csv
 
 
 def test_write_then_read(tmp_path):
@@ -34,3 +36,24 @@ def test_list_files_with_symlinked_workspace(tmp_path):
     res = tools["listFiles"].handler({"path": "."})
     assert res.ok
     assert "x.txt" in [e["path"] for e in res.output["entries"]]
+
+
+def test_normalize_csv_dedupes_and_sorts(tmp_path):
+    (tmp_path / "events.csv").write_text(
+        "id,date,type,amount\n"
+        "3,2026-03-02,purchase,1200\n"
+        "1,2026-01-15,signup,0\n"
+        "2,2026-02-20,purchase,800\n"
+        "2,2026-02-20,purchase,800\n"
+        "4,2026-01-15,refund,-200\n",
+        encoding="utf-8",
+    )
+    tool = build_normalize_csv(tmp_path)
+
+    res = tool.handler({"src": "events.csv", "dst": "events-clean.csv", "sortBy": "date"})
+
+    assert res.ok
+    with (tmp_path / "events-clean.csv").open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.reader(fh))[1:]
+    assert len(rows) == 4
+    assert [row[1] for row in rows] == sorted(row[1] for row in rows)

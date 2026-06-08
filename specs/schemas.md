@@ -7,6 +7,7 @@
 | 버전 | 날짜 | 변경 내용 |
 | --- | --- | --- |
 | 0.1 | 2026-06-01 | 최초 작성. action 프로토콜, 내장 도구 입출력, ToolSpec, manifest, 로그 이벤트, 설정 스키마 정의 |
+| 0.2 | 2026-06-08 | CSV 중복 제거·정렬 내장 도구 `normalizeCsv` 계약 추가 |
 
 ## 0. 규약
 
@@ -244,7 +245,20 @@ def run(input: dict) -> dict:
       "truncated": { "type": "boolean" } } } }
 ```
 
-### 3.5 createTool
+### 3.5 normalizeCsv
+
+```json
+{ "input": { "type": "object", "required": ["src", "dst"],
+    "properties": { "src": { "type": "string" }, "dst": { "type": "string" },
+      "sortBy": { "type": "string", "default": "date" } },
+    "additionalProperties": false },
+  "output": { "type": "object", "required": ["src", "dst", "rows", "removedDuplicates", "sortBy"],
+    "properties": { "src": { "type": "string" }, "dst": { "type": "string" },
+      "rows": { "type": "integer" }, "removedDuplicates": { "type": "integer" },
+      "sortBy": { "type": "string" } } } }
+```
+
+### 3.6 createTool
 
 입력은 2절 ToolSpec과 같다.
 
@@ -256,7 +270,7 @@ def run(input: dict) -> dict:
       "trustedStatus": { "type": "string", "enum": ["untrusted", "session", "persisted"] } } } }
 ```
 
-### 3.6 updateTool
+### 3.7 updateTool
 
 ```json
 { "input": { "type": "object", "required": ["name", "code"],

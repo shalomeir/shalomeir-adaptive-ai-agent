@@ -2,7 +2,7 @@ from adaptive_agent.runner import AgentRunner, RunnerDeps
 from adaptive_agent.llm import FakeLLMClient
 from adaptive_agent.tools.registry import ToolRegistry
 from adaptive_agent.tools.generated import GeneratedToolManager
-from adaptive_agent.tools.builtins import build_file_tools
+from adaptive_agent.tools.builtins import build_file_tools, build_normalize_csv
 from adaptive_agent.skills import SkillStore
 from adaptive_agent.sandbox import ExecutionSandbox
 from adaptive_agent.policy import PolicyManager
@@ -96,6 +96,7 @@ def _write_runner(tmp_path, path, ask):
     reg = ToolRegistry()
     for t in build_file_tools(ws):
         reg.register(t)
+    reg.register(build_normalize_csv(ws))
     deps = RunnerDeps(
         llm=FakeLLMClient(
             replies=[

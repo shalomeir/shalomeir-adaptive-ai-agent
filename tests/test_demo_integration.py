@@ -8,7 +8,7 @@ from adaptive_agent.policy import PolicyManager
 from adaptive_agent.runner import AgentRunner, RunnerDeps
 from adaptive_agent.sandbox import ExecutionSandbox
 from adaptive_agent.skills import SkillStore
-from adaptive_agent.tools.builtins import build_file_tools, build_search_docs
+from adaptive_agent.tools.builtins import build_file_tools, build_normalize_csv, build_search_docs
 from adaptive_agent.tools.generated import GeneratedToolManager
 from adaptive_agent.tools.registry import ToolRegistry
 
@@ -32,6 +32,7 @@ def _runner(
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
+    reg.register(build_normalize_csv(ws))
     if docs_dir is not None:
         reg.register(build_search_docs(docs_dir))
     sandbox = ExecutionSandbox(ws, timeout_sec=10, max_output_bytes=16384)
@@ -188,6 +189,24 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
     rows2 = _data_rows(out2)
     assert len(rows2) == 3
     assert [r[0] for r in rows2] == ["a", "b", "c"]
+
+
+def test_d2_live_prompt_uses_direct_csv_normalize(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path)
+    shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
+    runner = _runner(tmp_path, ws, replies=[], ask="y")
+
+    result = runner.run_turn(
+        "events.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 "
+        "events-clean.csv로 저장해줘."
+    )
+
+    assert "events-clean.csv" in result.summary
+    assert runner.deps.llm.calls == 0
+    rows = _data_rows(ws / "events-clean.csv")
+    assert len(rows) == 5
+    assert [row[1] for row in rows] == sorted(row[1] for row in rows)
+    assert [row[0] for row in rows] == ["1", "4", "2", "3", "5"]
 
 
 # ---------- D6: object tree grounding + state manip + verify ----------

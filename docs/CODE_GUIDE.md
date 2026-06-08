@@ -120,6 +120,8 @@ def parse_action_text(raw: str) -> ParseResult:
 
 내장 도구와 생성 도구를 같은 `Tool` 추상으로 다룬다. 레지스트리는 실행도 하지만, 프롬프트에는
 이름·설명만 담은 digest로 노출한다. 캐시 안정성을 위해 전체 스키마와 코드는 평소에 넣지 않는다.
+명확한 CSV 중복 제거·정렬·저장 요청은 `normalizeCsv` 내장 도구가 처리해, 로컬 모델이
+불안정한 ad hoc 검증 스크립트를 반복하지 않게 한다.
 
 ```python
 @dataclass
