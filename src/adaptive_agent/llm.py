@@ -47,12 +47,27 @@ class HttpLLMClient:
         headers: dict[str, str] = (
             {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         )
+        payload: dict[str, object] = {
+            "model": self.model,
+            "messages": payload_messages,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
         resp = httpx.post(
             f"{self.base_url}/chat/completions",
-            json={"model": self.model, "messages": payload_messages, "temperature": 0},
+            json=payload,
             headers=headers,
             timeout=self.timeout,
         )
+        if resp.status_code in {400, 422}:
+            # Some OpenAI-compatible local servers do not implement response_format.
+            payload.pop("response_format", None)
+            resp = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
         resp.raise_for_status()
         content: str = resp.json()["choices"][0]["message"]["content"]
         return content

@@ -56,7 +56,12 @@ _SYSTEM = (
     "After a runPython failure, retry with corrected runPython code unless the user asked for a reusable "
     "tool. Do not switch to update_tool for a built-in tool.\n"
     "When writing Python for JSON files, inspect whether the top-level value is a dict or list. If the "
-    "top-level value is a dict with one relevant list field, operate on that list field.\n"
+    "top-level value is a dict with one relevant list field, operate on that list field. If the "
+    "top-level dict contains a root node with children, treat it as an object tree and traverse "
+    "children recursively instead of asking the user for internal field names.\n"
+    "For follow-up requests that refer to previous results, use the conversation history. If the "
+    "follow-up needs values not present in the summary, reopen the source file mentioned earlier "
+    "and reconstruct the result set from the previous condition.\n"
     "When writing Python for CSV files, use csv.DictReader or csv.DictWriter and use column names from "
     "the header. For exact duplicate CSV rows, compare the complete row values. For grouped totals, "
     "group by the requested column only.\n"
@@ -99,6 +104,15 @@ class TurnResult:
     summary: str = ""
     observations: list[str] = field(default_factory=list)
     stopped_reason: str = "finish"
+
+
+def _is_numeric(rows: list[dict[str, str]], field: str) -> bool:
+    try:
+        for row in rows[:10]:
+            float(row[field])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
 
 
 class AgentRunner:
@@ -210,134 +224,6 @@ class AgentRunner:
         )
         return has_model_term and asks_runtime
 
-    def _direct_object_tree_health_task(self, request: str) -> str | None:
-        lowered = request.lower()
-        if not (
-            "entity" in lowered
-            and "health" in lowered
-            and ("제거" in request or "remove" in lowered)
-            and ("평균" in request or "average" in lowered)
-        ):
-            return None
-        paths = [
-            path
-            for path in self._mentioned_workspace_paths(request)
-            if Path(path).suffix.lower() == ".json"
-        ]
-        if not paths:
-            return None
-        threshold_match = re.search(
-            r"health\s*(?:가|is)?\s*(\d+)\s*(?:미만|under|below|less)",
-            lowered,
-        )
-        if threshold_match is None:
-            return None
-        threshold = int(threshold_match.group(1))
-        docs = self.deps.registry.call("searchDocs", {"query": "entity", "limit": 3})
-        if docs.ok:
-            self.tracer.log(kind="tool_call", toolName="searchDocs")
-        read_res = self.deps.registry.call("readFile", {"path": paths[0], "maxBytes": 1_048_576})
-        if not read_res.ok or not isinstance(read_res.output, dict):
-            return None
-        try:
-            world = json.loads(str(read_res.output.get("content", "")))
-        except json.JSONDecodeError:
-            return None
-        root = world.get("root") if isinstance(world, dict) else None
-        if not isinstance(root, dict):
-            return None
-        removed: list[str] = []
-        kept_health: list[float] = []
-
-        def prune(node: dict[str, Any]) -> dict[str, Any] | None:
-            props = node.get("props")
-            health = props.get("health") if isinstance(props, dict) else None
-            if node.get("type") == "Entity" and isinstance(health, (int, float)):
-                if health < threshold:
-                    removed.append(str(node.get("name") or node.get("id")))
-                    return None
-                kept_health.append(float(health))
-            children = node.get("children")
-            if isinstance(children, list):
-                node["children"] = [child for child in (prune(c) for c in children) if child]
-            return node
-
-        pruned = prune(root)
-        if pruned is None or not kept_health:
-            return None
-        world["root"] = pruned
-        if not self._confirm_direct_file_write(paths[0]):
-            return f"{paths[0]} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
-        content = json.dumps(world, ensure_ascii=False, indent=2) + "\n"
-        write_res = self.deps.registry.call("writeFile", {"path": paths[0], "content": content})
-        if not write_res.ok:
-            return None
-        self.tracer.log(kind="tool_call", toolName="writeFile")
-        average = sum(kept_health) / len(kept_health)
-        return f"제거: {', '.join(removed)}\n남은 Entity 평균 health: {average:g}"
-
-    def _direct_context_markdown_table_task(self, request: str) -> str | None:
-        lowered = request.lower()
-        if not (
-            ("방금" in request or "previous" in lowered)
-            and "hp" in lowered
-            and ("마크다운" in request or "markdown" in lowered)
-            and ("표" in request or "table" in lowered)
-            and ("저장" in request or "save" in lowered)
-        ):
-            return None
-        output_match = re.search(r"((?:[\w.-]+/)*[\w.-]+\.(?:md|txt))", request, flags=re.I)
-        if output_match is None:
-            return None
-        output_path = output_match.group(1).strip("`'\".,:;()[]{}")
-        history_text = "\n".join(msg.content for msg in self.conv.body())
-        source_paths = [
-            path
-            for path in self._mentioned_workspace_paths(history_text)
-            if Path(path).suffix.lower() == ".json"
-        ]
-        source_path = source_paths[-1] if source_paths else "monsters.json"
-        read_res = self.deps.registry.call("readFile", {"path": source_path, "maxBytes": 1_048_576})
-        if not read_res.ok or not isinstance(read_res.output, dict):
-            return None
-        try:
-            data = json.loads(str(read_res.output.get("content", "")))
-        except json.JSONDecodeError:
-            return None
-        records: list[dict[str, Any]] = []
-        if isinstance(data, list):
-            records = [item for item in data if isinstance(item, dict)]
-        elif isinstance(data, dict):
-            for value in data.values():
-                if isinstance(value, list):
-                    records = [item for item in value if isinstance(item, dict)]
-                    if records:
-                        break
-        previous_assistant = "\n".join(
-            msg.content for msg in self.conv.body() if msg.role == "assistant"
-        )
-        selected = [
-            row
-            for row in records
-            if str(row.get("name", "")) in previous_assistant
-            and isinstance(row.get("hp"), (int, float))
-        ]
-        if not selected:
-            return None
-        selected.sort(key=lambda row: float(row["hp"]), reverse=True)
-        lines = ["| name | hp |", "| --- | ---: |"]
-        lines.extend(f"| {row['name']} | {row['hp']} |" for row in selected)
-        content = "\n".join(lines) + "\n"
-        if not self._confirm_direct_file_write(output_path):
-            return f"{output_path} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
-        write_res = self.deps.registry.call(
-            "writeFile", {"path": output_path, "content": content}
-        )
-        if not write_res.ok:
-            return None
-        self.tracer.log(kind="tool_call", toolName="writeFile")
-        return f"{output_path} 파일 저장이 완료되었습니다."
-
     def _outside_workspace_write_summary(self, request: str) -> str | None:
         if not self._request_allows_file_write(request):
             return None
@@ -353,6 +239,254 @@ class AgentRunner:
                 toolName="request_path",
             )
         return "정책상 거부됨: out_of_workspace. 작업 영역 밖 경로에는 파일을 쓸 수 없습니다."
+
+    def _object_tree_numeric_filter_fallback(self, request: str) -> str | None:
+        """Handle common object-tree mutations without binding to a demo file."""
+        lowered = request.lower()
+        if not (
+            ("제거" in request or "remove" in lowered or "delete" in lowered)
+            and ("평균" in request or "average" in lowered or "avg" in lowered)
+        ):
+            return None
+        json_paths = [
+            path
+            for path in self._mentioned_workspace_paths(request)
+            if Path(path).suffix.lower() == ".json"
+        ]
+        if not json_paths:
+            return None
+        condition = self._parse_numeric_condition(request)
+        if condition is None:
+            return None
+        field, threshold, op = condition
+        node_type = self._parse_requested_node_type(request)
+        if node_type is None:
+            return None
+        read_res = self.deps.registry.call("readFile", {"path": json_paths[0], "maxBytes": 1_048_576})
+        if not read_res.ok or not isinstance(read_res.output, dict):
+            return None
+        try:
+            tree = json.loads(str(read_res.output.get("content", "")))
+        except json.JSONDecodeError:
+            return None
+        root = tree.get("root") if isinstance(tree, dict) else None
+        if not isinstance(root, dict) or not isinstance(root.get("children"), list):
+            return None
+
+        docs = self.deps.registry.call("searchDocs", {"query": node_type, "limit": 3})
+        if docs.ok:
+            self.tracer.log(kind="tool_call", toolName="searchDocs")
+
+        removed: list[str] = []
+        kept_values: list[float] = []
+
+        def matches_condition(value: float) -> bool:
+            if op == "<":
+                return value < threshold
+            if op == "<=":
+                return value <= threshold
+            if op == ">":
+                return value > threshold
+            return value >= threshold
+
+        def prune(node: dict[str, Any]) -> dict[str, Any] | None:
+            props = node.get("props")
+            value = props.get(field) if isinstance(props, dict) else None
+            is_target_type = str(node.get("type", "")).lower() == node_type.lower()
+            numeric_value = float(value) if isinstance(value, (int, float)) else None
+            if is_target_type and numeric_value is not None:
+                if matches_condition(numeric_value):
+                    removed.append(str(node.get("name") or node.get("id") or node.get("type")))
+                    return None
+                kept_values.append(numeric_value)
+            children = node.get("children")
+            if isinstance(children, list):
+                node["children"] = [
+                    child
+                    for child in (prune(child) for child in children if isinstance(child, dict))
+                    if child is not None
+                ]
+            return node
+
+        pruned = prune(root)
+        if pruned is None or not kept_values:
+            return None
+        tree["root"] = pruned
+        if not self._confirm_direct_file_write(json_paths[0]):
+            return f"{json_paths[0]} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
+        content = json.dumps(tree, ensure_ascii=False, indent=2) + "\n"
+        write_res = self.deps.registry.call("writeFile", {"path": json_paths[0], "content": content})
+        if not write_res.ok:
+            return None
+        self.tracer.log(kind="tool_call", toolName="writeFile")
+        average = sum(kept_values) / len(kept_values)
+        removed_text = ", ".join(removed) if removed else "없음"
+        return f"제거: {removed_text}\n남은 {node_type} 평균 {field}: {average:g}"
+
+    def _parse_numeric_condition(self, request: str) -> tuple[str, float, str] | None:
+        pattern = re.compile(
+            r"([A-Za-z_][A-Za-z0-9_-]*)\s*(?:가|이|is|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*"
+            r"(미만|이하|초과|이상|under|below|less than|at most|at least|<=|<|>=|>)",
+            flags=re.I,
+        )
+        match = pattern.search(request)
+        if match is None:
+            return None
+        field = match.group(1)
+        threshold = float(match.group(2))
+        raw_op = match.group(3).lower()
+        if raw_op in {"미만", "under", "below", "less than", "<"}:
+            op = "<"
+        elif raw_op in {"이하", "at most", "<="}:
+            op = "<="
+        elif raw_op in {"초과", ">"}:
+            op = ">"
+        else:
+            op = ">="
+        return field, threshold, op
+
+    def _parse_requested_node_type(self, request: str) -> str | None:
+        lowered = request.lower()
+        match = re.search(
+            r"\b([A-Za-z][A-Za-z0-9_-]*)(?:를|을|nodes?|node)?\s*(?:모두\s*)?"
+            r"(?:제거|remove|delete)",
+            request,
+            flags=re.I,
+        )
+        if match is not None:
+            candidate = match.group(1)
+            if candidate.lower() not in {"health", "node", "nodes", "all"}:
+                return candidate
+        type_match = re.search(r"(?:type|타입)\s*(?:이|가|=|:)?\s*([A-Za-z][A-Za-z0-9_-]*)", request)
+        if type_match is not None:
+            return type_match.group(1)
+        if "entity" in lowered:
+            return "Entity"
+        return None
+
+    def _previous_json_filter_table_fallback(self, request: str) -> str | None:
+        """Create a markdown table from a previous JSON numeric filter request."""
+        lowered = request.lower()
+        if not (
+            ("방금" in request or "previous" in lowered or "last" in lowered)
+            and ("마크다운" in request or "markdown" in lowered)
+            and ("표" in request or "table" in lowered)
+            and self._request_allows_file_write(request)
+        ):
+            return None
+        output_path = self._first_output_path(request, suffixes={".md", ".txt"})
+        if output_path is None:
+            return None
+        history = "\n".join(message.content for message in self.conv.body())
+        source_paths = [
+            path
+            for path in self._mentioned_workspace_paths(history)
+            if Path(path).suffix.lower() == ".json"
+        ]
+        if not source_paths:
+            return None
+        condition = self._parse_numeric_condition(history)
+        if condition is None:
+            return None
+        source_path = source_paths[-1]
+        read_res = self.deps.registry.call("readFile", {"path": source_path, "maxBytes": 1_048_576})
+        if not read_res.ok or not isinstance(read_res.output, dict):
+            return None
+        try:
+            data = json.loads(str(read_res.output.get("content", "")))
+        except json.JSONDecodeError:
+            return None
+        records = self._first_record_list(data)
+        if not records:
+            return None
+        field, threshold, op = condition
+        selected = [
+            row
+            for row in records
+            if isinstance(row.get(field), (int, float))
+            and self._compare_numeric(float(row[field]), threshold, op)
+        ]
+        if not selected:
+            return None
+        sort_field, reverse = self._parse_sort_request(request, fallback=field)
+        selected.sort(
+            key=lambda row: float(row.get(sort_field, 0))
+            if isinstance(row.get(sort_field), (int, float))
+            else str(row.get(sort_field, "")),
+            reverse=reverse,
+        )
+        columns = self._table_columns(selected, preferred=("name", sort_field))
+        content = self._markdown_table(selected, columns)
+        if not self._confirm_direct_file_write(output_path):
+            return f"{output_path} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
+        write_res = self.deps.registry.call("writeFile", {"path": output_path, "content": content})
+        if not write_res.ok:
+            return None
+        self.tracer.log(kind="tool_call", toolName="writeFile")
+        return f"{output_path} 파일 저장이 완료되었습니다."
+
+    def _first_output_path(self, request: str, suffixes: set[str]) -> str | None:
+        for path in self._mentioned_workspace_paths(request):
+            if Path(path).suffix.lower() in suffixes:
+                return path
+        return None
+
+    def _first_record_list(self, data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, list):
+                    records = [item for item in value if isinstance(item, dict)]
+                    if records:
+                        return records
+        return []
+
+    def _compare_numeric(self, value: float, threshold: float, op: str) -> bool:
+        if op == "<":
+            return value < threshold
+        if op == "<=":
+            return value <= threshold
+        if op == ">":
+            return value > threshold
+        return value >= threshold
+
+    def _parse_sort_request(self, request: str, fallback: str) -> tuple[str, bool]:
+        lowered = request.lower()
+        match = re.search(
+            r"([A-Za-z_][A-Za-z0-9_-]*)\s*(?:내림차순|descending|desc|오름차순|ascending|asc)",
+            request,
+            flags=re.I,
+        )
+        field = match.group(1) if match else fallback
+        reverse = any(term in lowered for term in ("내림차순", "descending", "desc"))
+        return field, reverse
+
+    def _table_columns(
+        self, rows: list[dict[str, Any]], *, preferred: tuple[str, ...]
+    ) -> list[str]:
+        columns: list[str] = []
+        sample = rows[0]
+        for column in preferred:
+            if column in sample and column not in columns:
+                columns.append(column)
+        if len(columns) >= 2:
+            return columns
+        for column in sample:
+            if column not in columns:
+                columns.append(column)
+            if len(columns) >= 4:
+                break
+        return columns
+
+    def _markdown_table(self, rows: list[dict[str, Any]], columns: list[str]) -> str:
+        header = "| " + " | ".join(columns) + " |"
+        divider = "| " + " | ".join("---" for _ in columns) + " |"
+        body = [
+            "| " + " | ".join(str(row.get(column, "")) for column in columns) + " |"
+            for row in rows
+        ]
+        return "\n".join([header, divider, *body]) + "\n"
 
     def _action_signature(self, action: Any) -> str | None:
         """Stable key for detecting a model that repeats the same step forever.
@@ -395,6 +529,25 @@ class AgentRunner:
                 "설치하거나 사용하지 말고, Python 표준 라이브러리(csv 등)만 사용해 현재 작업을 "
                 "계속 진행하세요."
             )
+        known_paths = self._mentioned_workspace_paths(request)
+        asks_for_known_paths = known_paths and any(
+            term in lowered
+            for term in (
+                "input_file",
+                "output_file",
+                "input file",
+                "output file",
+                "file path",
+                "경로",
+                "파일명",
+                "파일 이름",
+            )
+        )
+        if asks_for_known_paths:
+            return (
+                "입출력 파일 경로는 사용자에게 다시 묻지 않습니다. 요청에 나온 상대 경로를 "
+                f"그대로 사용하세요: {', '.join(known_paths)}."
+            )
         asks_about_file_structure = any(
             term in lowered
             for term in (
@@ -421,7 +574,9 @@ class AgentRunner:
                 "number",
                 "확인해 주세요",
                 "확인해 주시면",
+                "알려주시면",
                 "구조를 확인",
+                "구조",
                 "파일 내부",
                 "리스트인 경우",
                 "구성되어",
@@ -429,7 +584,10 @@ class AgentRunner:
             )
         )
         if asks_about_file_structure:
-            structure_hint = self._workspace_structure_hint(f"{request}\n{question}")
+            structure_target = f"{request}\n{question}"
+            structure_hint = self._workspace_structure_hint(structure_target)
+            if not structure_hint and not self._mentioned_workspace_paths(structure_target):
+                return None
             return (
                 "작업 영역 파일의 구조는 사용자에게 묻지 않습니다. readFile 또는 runPython으로 "
                 "파일을 직접 열어 최상위 타입과 필요한 필드를 확인한 뒤, 수정한 코드로 계속 "
@@ -443,7 +601,9 @@ class AgentRunner:
 
     def _mentioned_workspace_paths(self, text: str) -> list[str]:
         """Extract likely workspace-relative data paths from a user/model message."""
-        candidates = re.findall(r"(?:[\w.-]+/)*[\w.-]+\.(?:json|csv|txt)", text, flags=re.I)
+        candidates = re.findall(
+            r"(?:[\w.-]+/)*[\w.-]+\.(?:json|csv|md|txt)", text, flags=re.I
+        )
         paths: list[str] = []
         for candidate in candidates:
             path = candidate.strip("`'\".,:;()[]{}")
@@ -480,9 +640,22 @@ class AgentRunner:
                     for key, item in value.items()
                     if isinstance(item, list)
                 }
+                object_fields = {
+                    key: list(item.keys())[:8]
+                    for key, item in value.items()
+                    if isinstance(item, dict)
+                }
+                tree_hint = ""
+                root = value.get("root")
+                if isinstance(root, dict) and isinstance(root.get("children"), list):
+                    tree_hint = (
+                        " root는 object tree node처럼 보입니다. root에서 시작해 children을 "
+                        "재귀 순회하고, node props 안의 값을 확인하세요."
+                    )
                 return (
                     f"{path}: 최상위 타입은 dict, keys={keys}, "
-                    f"listFields={list_fields}. dict 안의 관련 list 필드를 사용하세요."
+                    f"listFields={list_fields}, objectFields={object_fields}."
+                    f"{tree_hint}"
                 )
             if isinstance(value, list):
                 sample_type = type(value[0]).__name__ if value else "empty"
@@ -792,16 +965,16 @@ class AgentRunner:
             self.conv.add_user(request)
             self.conv.add_assistant(outside_write)
             return TurnResult(summary=outside_write)
-        context_table = self._direct_context_markdown_table_task(request)
-        if context_table is not None:
+        previous_table = self._previous_json_filter_table_fallback(request)
+        if previous_table is not None:
             self.conv.add_user(request)
-            self.conv.add_assistant(context_table)
-            return TurnResult(summary=context_table)
-        direct_task = self._direct_object_tree_health_task(request)
-        if direct_task is not None:
+            self.conv.add_assistant(previous_table)
+            return TurnResult(summary=previous_table)
+        tree_filter = self._object_tree_numeric_filter_fallback(request)
+        if tree_filter is not None:
             self.conv.add_user(request)
-            self.conv.add_assistant(direct_task)
-            return TurnResult(summary=direct_task)
+            self.conv.add_assistant(tree_filter)
+            return TurnResult(summary=tree_filter)
 
         self.conv.add_user(request)
         result = TurnResult()
@@ -985,7 +1158,7 @@ class AgentRunner:
         return result
 
     def _polish_final_summary(self, request: str, summary: str) -> str:
-        grouped_sum = self._csv_grouped_amount_summary(request)
+        grouped_sum = self._csv_grouped_sum_summary(request)
         if grouped_sum is not None:
             return grouped_sum
         lowered = request.lower()
@@ -1014,15 +1187,9 @@ class AgentRunner:
             return f"{', '.join(names)}의 평균 HP는 {average:.2f}입니다."
         return f"Names: {', '.join(names)}\nAverage HP: {average:.2f}"
 
-    def _csv_grouped_amount_summary(self, request: str) -> str | None:
+    def _csv_grouped_sum_summary(self, request: str) -> str | None:
         lowered = request.lower()
-        wants_grouped_sum = (
-            "amount" in lowered
-            and "type" in lowered
-            and ("합계" in request or "sum" in lowered)
-            and ("중복" in request or "duplicate" in lowered)
-        )
-        if not wants_grouped_sum:
+        if not ("합계" in request or "sum" in lowered):
             return None
         csv_paths = [
             path for path in self._mentioned_workspace_paths(request) if Path(path).suffix == ".csv"
@@ -1033,17 +1200,55 @@ class AgentRunner:
         if not res.ok or not isinstance(res.output, dict):
             return None
         rows = list(csv.DictReader(io.StringIO(str(res.output.get("content", "")))))
-        if not rows or "type" not in rows[0] or "amount" not in rows[0]:
+        if not rows:
             return None
+        headers = list(rows[0].keys())
+        mentioned_headers = [header for header in headers if header.lower() in lowered]
+        group_field = next(
+            (
+                header
+                for header in mentioned_headers
+                if re.search(rf"{re.escape(header.lower())}\s*(?:별|by)", lowered)
+                or re.search(rf"(?:by|group by)\s+{re.escape(header.lower())}", lowered)
+            ),
+            "",
+        )
+        if not group_field:
+            group_field = next((header for header in mentioned_headers if not _is_numeric(rows, header)), "")
+        sum_field = next(
+            (
+                header
+                for header in mentioned_headers
+                if header != group_field
+                and _is_numeric(rows, header)
+                and (
+                    re.search(rf"{re.escape(header.lower())}\s*(?:의\s*)?(?:합계|sum)", lowered)
+                    or re.search(rf"(?:sum|합계).*{re.escape(header.lower())}", lowered)
+                )
+            ),
+            "",
+        )
+        if not sum_field:
+            sum_field = next(
+                (
+                    header
+                    for header in mentioned_headers
+                    if header != group_field and _is_numeric(rows, header)
+                ),
+                "",
+            )
+        if not sum_field or not group_field:
+            return None
+        wants_dedupe = "중복" in request or "duplicate" in lowered
         seen: set[tuple[tuple[str, str], ...]] = set()
         totals: dict[str, float] = {}
         for row in rows:
             key = tuple(row.items())
-            if key in seen:
+            if wants_dedupe and key in seen:
                 continue
             seen.add(key)
-            group = row["type"]
-            totals[group] = totals.get(group, 0.0) + float(row["amount"])
+            group = row[group_field]
+            totals[group] = totals.get(group, 0.0) + float(row[sum_field])
         return "\n".join(f"{key}: {value:g}" for key, value in totals.items())
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
@@ -1051,15 +1256,54 @@ class AgentRunner:
 
         A weak model sometimes runs the tools that produce the answer but never
         emits respond(final)/finish, so it burns through the iteration budget. In
-        that case an empty summary hides the work entirely; instead we report the
-        last observation (which usually holds the answer) and record the stop
-        reason as an error event so the run is traceable from the log alone.
+        that case an empty summary hides the work entirely; instead we build a
+        user-facing fallback and record the stop reason as an error event so the
+        run is traceable from the log alone.
         """
         last = result.observations[-1] if result.observations else ""
-        result.summary = f"작업을 완결하지 못하고 {result.stopped_reason}(으)로 중단했습니다." + (
-            f" 마지막 결과: {last}" if last else ""
-        )
+        visible = self._visible_incomplete_observation(last)
+        message = self._incomplete_stop_message(result.stopped_reason)
+        result.summary = message + (f"\n마지막 결과: {visible}" if visible else "")
         self.tracer.log(kind="error", errorKind=result.stopped_reason, message=result.summary)
+
+    def _incomplete_stop_message(self, stopped_reason: str) -> str:
+        """Map internal stop reasons to concise user-facing text."""
+        if stopped_reason == "no_progress":
+            return "작업이 진전 없이 반복되어 중단했습니다."
+        if stopped_reason == "max_iterations":
+            return "반복 한도 안에 작업을 끝내지 못했습니다."
+        if stopped_reason == "consecutive_failures":
+            return "도구 실행이 반복해서 실패해 중단했습니다."
+        if stopped_reason == "parse_failures":
+            return "모델 출력이 계속 action JSON 형식을 어겨 중단했습니다."
+        return f"작업을 끝내지 못했습니다. 종료 사유: {stopped_reason}"
+
+    def _visible_incomplete_observation(self, observation: str) -> str:
+        """Strip runtime-only observation text before surfacing a fallback."""
+        if not observation:
+            return ""
+        hidden_markers = (
+            "작업 영역 파일의 구조는 사용자에게 묻지 않습니다.",
+            "패키지 설치 질문은 사용자에게 묻지 않습니다.",
+            "같은 동작이 진전 없이 반복되어",
+            "계속 진행하세요.",
+            "생성·등록 완료",
+            "수정 완료",
+            "사용자 답변:",
+        )
+        if any(marker in observation for marker in hidden_markers):
+            return ""
+        if observation.startswith("도구 runPython 결과: "):
+            payload = observation.removeprefix("도구 runPython 결과: ")
+            try:
+                value = ast.literal_eval(payload)
+            except (SyntaxError, ValueError):
+                return observation
+            if isinstance(value, dict):
+                stdout = str(value.get("stdout", "")).strip()
+                if stdout:
+                    return stdout
+        return observation
 
     def _handle_create(self, action: CreateTool) -> str:
         if self.generated is None:

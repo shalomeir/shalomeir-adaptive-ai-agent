@@ -160,6 +160,22 @@ def test_repeated_ask_user_stops_with_no_progress(tmp_path):
     runner = build(tmp_path, [ask_reply] * 6)
     result = runner.run_turn("데이터 좀 정리해줘")
     assert result.stopped_reason == "no_progress"
+    assert result.summary == "작업이 진전 없이 반복되어 중단했습니다."
+
+
+def test_incomplete_summary_hides_internal_tool_creation_observation(tmp_path):
+    create = (
+        '{"action":"create_tool","spec":{"name":"read-json","description":"read json",'
+        '"code":"def run(input):\\n    return {}",'
+        '"inputSchema":{"type":"object"}}}'
+    )
+    runner = build(tmp_path, [create] * 30)
+
+    result = runner.run_turn("json 파일을 분석해줘")
+
+    assert result.stopped_reason == "max_iterations"
+    assert result.summary == "반복 한도 안에 작업을 끝내지 못했습니다."
+    assert "생성·등록" not in result.summary
 
 
 def test_repeated_identical_tool_call_reuses_cached_result(tmp_path):
@@ -199,7 +215,7 @@ def test_repeated_identical_write_file_prompts_only_once(tmp_path):
     result = runner.run_turn("write once")
 
     assert result.stopped_reason == "cached_result"
-    assert asks == ["'write_file' 작업을 진행할까요? (y/n)"]
+    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
     assert (ws / "out.txt").read_text() == "hello"
 
 
@@ -232,7 +248,7 @@ def test_run_python_direct_file_write_can_finish_from_created_file(tmp_path):
     assert result.stopped_reason == "finish"
     assert result.summary == "out.csv 파일 저장이 완료되었습니다."
     assert (ws / "out.csv").read_text() == "a,b\n"
-    assert asks == ["'write_file' 작업을 진행할까요? (y/n)"]
+    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
 
 
 def test_ask_user_answer_extends_file_write_intent(tmp_path):
@@ -410,13 +426,13 @@ def test_final_csv_grouped_amount_summary_recomputes_after_dedupe(tmp_path):
     assert result.summary == "purchase: 2500\nsignup: 0\nrefund: -200"
 
 
-def test_direct_object_tree_health_task_prunes_and_averages(tmp_path):
+def test_object_tree_numeric_filter_fallback_is_schema_generic(tmp_path):
     ws = tmp_path / "ws"
     docs = tmp_path / "docs"
     ws.mkdir()
     docs.mkdir()
-    docs.joinpath("schema.md").write_text("Entity nodes store health in props.")
-    ws.joinpath("world.json").write_text(
+    docs.joinpath("schema.md").write_text("Actor nodes store mana in props.")
+    ws.joinpath("arena.json").write_text(
         json.dumps(
             {
                 "root": {
@@ -426,16 +442,16 @@ def test_direct_object_tree_health_task_prunes_and_averages(tmp_path):
                     "children": [
                         {
                             "id": "low",
-                            "type": "Entity",
-                            "name": "Low",
-                            "props": {"health": 80},
+                            "type": "Actor",
+                            "name": "LowMana",
+                            "props": {"mana": 20},
                             "children": [],
                         },
                         {
                             "id": "high",
-                            "type": "Entity",
-                            "name": "High",
-                            "props": {"health": 120},
+                            "type": "Actor",
+                            "name": "HighMana",
+                            "props": {"mana": 80},
                             "children": [],
                         },
                     ],
@@ -448,36 +464,37 @@ def test_direct_object_tree_health_task_prunes_and_averages(tmp_path):
     for tool in build_file_tools(ws):
         reg.register(tool)
     reg.register(build_search_docs(docs))
-    deps = RunnerDeps(
-        llm=FakeLLMClient(replies=[]),
-        registry=reg,
-        ask=lambda *a: "y",
-        log_dir=tmp_path,
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(replies=[]),
+            registry=reg,
+            ask=lambda *a: "y",
+            log_dir=tmp_path,
+        ),
+        policy=PolicyManager(ask=lambda q: asks.append(q) or "y"),
     )
-    runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: asks.append(q) or "y"))
 
     result = runner.run_turn(
-        "world.json에서 health가 100 미만인 Entity를 모두 제거하고, "
-        "남은 Entity의 평균 health를 알려줘."
+        "arena.json에서 mana가 50 미만인 Actor를 모두 제거하고, 남은 Actor의 평균 mana를 알려줘."
     )
 
-    assert result.summary == "제거: Low\n남은 Entity 평균 health: 120"
-    assert asks == ["'write_file' 작업을 진행할까요? (y/n)"]
-    world = json.loads(ws.joinpath("world.json").read_text())
-    assert [child["id"] for child in world["root"]["children"]] == ["high"]
+    assert result.summary == "제거: LowMana\n남은 Actor 평균 mana: 80"
+    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
+    arena = json.loads(ws.joinpath("arena.json").read_text())
+    assert [child["id"] for child in arena["root"]["children"]] == ["high"]
+    assert runner.deps.llm.calls == 0
 
 
-def test_direct_context_markdown_table_uses_previous_result(tmp_path):
+def test_previous_json_filter_table_fallback_reconstructs_and_sorts(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
-    ws.joinpath("monsters.json").write_text(
+    ws.joinpath("players.json").write_text(
         json.dumps(
             {
-                "monsters": [
-                    {"name": "Orc", "hp": 150},
-                    {"name": "Dragon", "hp": 300},
-                    {"name": "Wolf", "hp": 110},
-                    {"name": "Slime", "hp": 20},
+                "players": [
+                    {"name": "A", "score": 10, "team": "red"},
+                    {"name": "B", "score": 30, "team": "blue"},
+                    {"name": "C", "score": 20, "team": "red"},
                 ]
             }
         )
@@ -495,16 +512,20 @@ def test_direct_context_markdown_table_uses_previous_result(tmp_path):
         ),
         policy=PolicyManager(ask=lambda q: asks.append(q) or "y"),
     )
-    runner.conv.add_user("workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름을 알려줘.")
-    runner.conv.add_assistant("몬스터 이름: Orc, Dragon, Wolf\n평균 HP: 186.67")
+    runner.conv.add_user("players.json에서 score가 15 이상인 player 이름과 평균 score를 알려줘.")
+    runner.conv.add_assistant("B, C의 평균 score는 25입니다.")
 
-    result = runner.run_turn("방금 필터된 결과를 hp 내림차순 마크다운 표로 table.md에 저장해줘.")
+    result = runner.run_turn("방금 필터된 결과를 score 내림차순 마크다운 표로 out.md에 저장해줘.")
 
-    assert result.summary == "table.md 파일 저장이 완료되었습니다."
-    assert ws.joinpath("table.md").read_text() == (
-        "| name | hp |\n| --- | ---: |\n| Dragon | 300 |\n| Orc | 150 |\n| Wolf | 110 |\n"
+    assert result.summary == "out.md 파일 저장이 완료되었습니다."
+    assert ws.joinpath("out.md").read_text() == (
+        "| name | score |\n"
+        "| --- | --- |\n"
+        "| B | 30 |\n"
+        "| C | 20 |\n"
     )
-    assert asks == ["'write_file' 작업을 진행할까요? (y/n)"]
+    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
+    assert runner.deps.llm.calls == 0
 
 
 def test_outside_workspace_write_request_is_denied_before_tools(tmp_path):

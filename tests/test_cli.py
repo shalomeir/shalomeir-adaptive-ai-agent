@@ -36,6 +36,57 @@ def test_chat_exits_on_empty_piped_stdin(monkeypatch, tmp_path):
     assert fake.calls == 0
 
 
+def test_chat_renders_clarification_as_dialogue(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_llm(
+        monkeypatch,
+        [
+            '{"action":"ask_user","question":"어떤 파일을 정리할까요?"}',
+            '{"action":"finish","summary":"알겠습니다."}',
+        ],
+    )
+
+    result = CliRunner().invoke(app, ["chat"], input="데이터 정리해줘\nevents.csv\nexit\n")
+
+    assert result.exit_code == 0
+    assert "agent: 어떤 파일을 정리할까요?" in result.stdout
+    assert "agent: 알겠습니다." in result.stdout
+
+
+def test_chat_exit_during_clarification_ends_session(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    fake = _patch_llm(
+        monkeypatch,
+        [
+            '{"action":"ask_user","question":"어떤 파일을 정리할까요?"}',
+            '{"action":"finish","summary":"should-not-run"}',
+        ],
+    )
+
+    result = CliRunner().invoke(app, ["chat"], input="데이터 정리해줘\nexit\n")
+
+    assert result.exit_code == 0
+    assert fake.calls == 1
+    assert "should-not-run" not in result.stdout
+
+
+def test_chat_renders_policy_confirmation_as_dialogue(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_llm(
+        monkeypatch,
+        [
+            '{"action":"call_tool","name":"writeFile","input":{"path":"out.txt","content":"hi"}}',
+            '{"action":"finish","summary":"저장했습니다."}',
+        ],
+    )
+
+    result = CliRunner().invoke(app, ["chat"], input="out.txt 저장해줘\ny\nexit\n")
+
+    assert result.exit_code == 0
+    assert "agent: 파일 쓰기가 필요합니다. 진행할까요? (y/n)" in result.stdout
+    assert "agent: out.txt 파일 저장이 완료되었습니다." in result.stdout
+
+
 def test_run_yes_auto_approves_write(monkeypatch, tmp_path):
     # --yes는 파일 쓰기 y/n 게이트를 자동 승인해, 비대화형에서도 부수효과가 진행된다.
     monkeypatch.chdir(tmp_path)

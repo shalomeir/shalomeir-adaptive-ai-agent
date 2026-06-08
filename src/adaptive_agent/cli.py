@@ -36,9 +36,22 @@ def version() -> None:
     console.print(__version__)
 
 
-def _ask(question: str, _choices: list[str] | None = None) -> str:
-    # choices is part of the protocol signature but not rendered here
-    return Prompt.ask(question)
+def _ask(question: str, choices: list[str] | None = None) -> str:
+    """Render an agent clarification as dialogue instead of a raw prompt."""
+    console.print(f"[green]agent[/green]: {question}")
+    answer = Prompt.ask("[cyan]you[/cyan]", choices=choices)
+    if answer.strip().lower() in {"exit", "quit"}:
+        raise EOFError
+    return answer
+
+
+def _confirm(question: str) -> str:
+    """Render policy confirmations separately from open-ended chat."""
+    console.print(f"[green]agent[/green]: {question}")
+    answer = Prompt.ask("[cyan]you[/cyan]", default="n")
+    if answer.strip().lower() in {"exit", "quit"}:
+        raise EOFError
+    return answer
 
 
 def _assemble_runner(
@@ -88,7 +101,7 @@ def chat(docs_dir: str = "demorsc/docs") -> None:
     """대화형 에이전트 세션을 시작한다."""
     load_dotenv()  # read provider settings from a local .env if present
     cfg = AgentConfig.load()
-    runner = _assemble_runner(cfg, docs_dir, free_ask=_ask, confirm_ask=lambda q: Prompt.ask(q))
+    runner = _assemble_runner(cfg, docs_dir, free_ask=_ask, confirm_ask=_confirm)
     console.print("[bold]세션을 시작합니다. 'exit'로 종료.[/bold]")
     while True:
         try:
@@ -99,7 +112,10 @@ def chat(docs_dir: str = "demorsc/docs") -> None:
             break
         if request.strip().lower() in {"exit", "quit"}:
             break
-        result = runner.run_turn(request)
+        try:
+            result = runner.run_turn(request)
+        except (EOFError, KeyboardInterrupt):
+            break
         console.print(f"[green]agent[/green]: {result.summary or '작업을 마쳤습니다.'}")
 
 

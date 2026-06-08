@@ -271,6 +271,30 @@ def test_non_interactive_general_ask_ends_with_hitl_required(tmp_path):
     assert not any("사용자 답변: n" in o for o in result.observations)
 
 
+def test_non_interactive_known_file_path_ask_is_auto_blocked(tmp_path):
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"input_file과 output_file의 경로를 입력해주세요."}',
+                    '{"action":"finish","summary":"continued"}',
+                ]
+            ),
+            registry=ToolRegistry(),
+            ask=lambda *a: NON_INTERACTIVE_ASK,
+            log_dir=tmp_path,
+            non_interactive=True,
+        )
+    )
+
+    result = runner.run_turn(
+        "events.csv를 정렬해서 events-clean.csv로 저장해줘."
+    )
+
+    assert result.summary == "continued"
+    assert any("events.csv, events-clean.csv" in o for o in result.observations)
+
+
 def test_package_install_ask_is_blocked_before_user_prompt(tmp_path):
     asks = []
     runner = AgentRunner(

@@ -56,5 +56,25 @@ class PolicyManager:
 
     def confirm(self, action_id: str) -> bool:
         """Prompt the user and return True only when they explicitly agree."""
-        answer = self._ask(f"'{action_id}' 작업을 진행할까요? (y/n)")
+        answer = self._ask(_confirmation_text(action_id))
         return answer.strip().lower() in {"y", "yes"}
+
+
+def _confirmation_text(action_id: str) -> str:
+    """Return a user-facing confirmation prompt for a policy action."""
+    if action_id == "write_file":
+        return "파일 쓰기가 필요합니다. 진행할까요? (y/n)"
+    if action_id == "persist_tool":
+        return "방금 만든 도구를 다음 세션에서도 재사용하도록 저장할까요? (y/n)"
+    if action_id.startswith("persist:"):
+        name = action_id.split(":", 1)[1]
+        return f"생성한 도구 '{name}'을(를) 다음 세션에서도 재사용하도록 저장할까요? (y/n)"
+    if action_id == "update_persisted_tool":
+        return "저장된 도구를 수정해야 합니다. 진행할까요? (y/n)"
+    if action_id == "network_access":
+        return "네트워크 접근이 필요합니다. 진행할까요? (y/n)"
+    if action_id == "long_run":
+        return "오래 걸릴 수 있는 작업입니다. 진행할까요? (y/n)"
+    if action_id == "destructive":
+        return "되돌리기 어려운 작업입니다. 진행할까요? (y/n)"
+    return f"{action_id} 작업을 진행할까요? (y/n)"

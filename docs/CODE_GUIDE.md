@@ -70,8 +70,9 @@ def run_turn(self, request: str) -> TurnResult:
 
 뒤의 두 갈래(최대 반복·연속 실패)는 완료 신호 없이 끝나므로 `summary`가 비어 있다.
 약한 모델이 답을 내는 도구는 다 돌려놓고 `respond(final)`/`finish`로 끝맺지 못해 반복을
-소진하는 경우가 그렇다. `_finalize_incomplete`가 이때 마지막 observation(대개 실제 결과)을
-요약으로 노출하고, 종료 사유를 `error` 이벤트로 남겨 로그만으로도 추적되게 한다.
+소진하는 경우가 그렇다. `_finalize_incomplete`는 이때 내부 observation을 그대로 노출하지 않고,
+가능한 마지막 실행 결과만 추려 사용자용 종료 메시지를 만든다. 종료 사유는 `error` 이벤트로
+남겨 로그만으로도 추적되게 한다.
 
 ```python
 if not res.ok and fix_failures > self.deps.max_fix_retries:

@@ -22,6 +22,8 @@ def test_out_of_workspace_is_denied():
 
 
 def test_confirm_uses_callback():
+    prompts = []
     answers = iter(["y"])
-    pm = PolicyManager(ask=lambda q: next(answers))
+    pm = PolicyManager(ask=lambda q: prompts.append(q) or next(answers))
     assert pm.confirm("write_file") is True
+    assert prompts == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
