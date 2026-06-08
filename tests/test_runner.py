@@ -201,21 +201,9 @@ def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
     assert "previous data result" not in second.summary
 
 
-def test_polishes_record_dump_when_user_asked_for_names_and_average(tmp_path):
-    runner = build_runner(
-        tmp_path,
-        [
-            (
-                '{"action":"respond","final":true,"text":"High HP Monsters: '
-                "[{'name': 'Orc', 'hp': 150}, {'name': 'Dragon', 'hp': 300}]"
-                '\\nAverage HP: 225.0"}'
-            ),
-        ],
-    )
-
-    result = runner.run_turn("hp가 100 이상인 이름과 평균 hp")
-
-    assert result.summary == "Orc, Dragon의 평균 HP는 225.00입니다."
+def test_system_prompt_tells_model_not_to_dump_full_records():
+    assert "specific fields or aggregates" in _SYSTEM
+    assert "instead of dumping full records" in _SYSTEM
 
 
 def test_incomplete_loop_reports_last_result(tmp_path):
@@ -318,11 +306,7 @@ def test_non_interactive_general_ask_ends_with_hitl_required(tmp_path):
     result = runner.run_turn("데이터 좀 정리해줘")
 
     assert result.stopped_reason == "hitl_required"
-    assert result.summary == (
-        "HITL 처리가 필요합니다: 어떤 데이터를 어떻게 정리할까요? "
-        "파일명과 원하는 작업을 같이 알려주세요. "
-        "예: events.csv에서 중복 제거하고 date로 정렬해줘."
-    )
+    assert result.summary == "HITL 처리가 필요합니다: 어떤 데이터를 정리할까요?"
     assert not any("사용자 답변: n" in o for o in result.observations)
 
 

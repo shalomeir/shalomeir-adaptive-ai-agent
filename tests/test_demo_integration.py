@@ -273,7 +273,7 @@ def test_d2_live_prompt_uses_general_python_then_write_file(tmp_path: Path) -> N
     )
 
     assert "events-clean.csv" in result.summary
-    assert runner.deps.llm.calls == 2
+    assert runner.deps.llm.calls == 3
     rows = _data_rows(ws / "events-clean.csv")
     assert len(rows) == 5
     assert [row[1] for row in rows] == sorted(row[1] for row in rows)
@@ -465,7 +465,7 @@ def test_d3_live_prompt_uses_general_python_without_write_prompt(tmp_path: Path)
         ws,
         [
             _call("runPython", {"code": code}),
-            _finish("purchase 2500, signup 0, refund -200"),
+            _finish("purchase: 2500\nsignup: 0\nrefund: -200"),
         ],
         ask="n",
     )
@@ -550,7 +550,7 @@ def test_d9_blocks_package_install_prompt_and_falls_back_to_csv(tmp_path: Path) 
 
     result = runner.run_turn("events.csv dedup, sort by date, save to events-clean.csv")
 
-    assert result.summary == "events-clean.csv 파일 저장이 완료되었습니다."
+    assert result.summary == "saved"
     assert asks == []
     assert out.exists()
     rows = _data_rows(out)

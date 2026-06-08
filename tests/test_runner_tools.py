@@ -163,18 +163,21 @@ def test_repeated_ask_user_stops_with_no_progress(tmp_path):
     assert result.summary == "작업이 진전 없이 반복되어 중단했습니다."
 
 
-def test_vague_data_cleanup_gets_initial_clarification_before_llm(tmp_path):
+def test_vague_data_cleanup_uses_llm_ask_user_flow(tmp_path):
     answers = []
-    runner = build(tmp_path, ['{"action":"finish","summary":"continued"}'])
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"ask_user","question":"어떤 데이터를 어떻게 정리할까요?"}',
+            '{"action":"finish","summary":"continued"}',
+        ],
+    )
     runner.deps.ask = lambda *a: answers.append(a[0]) or "events.csv를 중복 제거해줘"
 
     result = runner.run_turn("데이터 좀 정리해줘.")
 
     assert result.summary == "continued"
-    assert answers == [
-        "어떤 데이터를 어떻게 정리할까요? 파일명과 원하는 작업을 같이 알려주세요. "
-        "예: events.csv에서 중복 제거하고 date로 정렬해줘."
-    ]
+    assert answers == ["어떤 데이터를 어떻게 정리할까요?"]
 
 
 def test_incomplete_summary_hides_internal_tool_creation_observation(tmp_path):
@@ -248,7 +251,8 @@ def test_run_python_direct_file_write_can_finish_from_created_file(tmp_path):
                 (
                     '{"action":"call_tool","name":"runPython","input":'
                     '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"a,b\\\\n\\")"}}'
-                )
+                ),
+                '{"action":"finish","summary":"out.csv 파일 저장이 완료되었습니다."}',
             ]
         ),
         registry=reg,
@@ -262,7 +266,7 @@ def test_run_python_direct_file_write_can_finish_from_created_file(tmp_path):
     assert result.stopped_reason == "finish"
     assert result.summary == "out.csv 파일 저장이 완료되었습니다."
     assert (ws / "out.csv").read_text() == "a,b\n"
-    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
+    assert asks == []
 
 
 def test_ask_user_answer_extends_file_write_intent(tmp_path):
@@ -282,6 +286,7 @@ def test_ask_user_answer_extends_file_write_intent(tmp_path):
                     '{"action":"call_tool","name":"runPython","input":'
                     '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"id,date\\\\n1,2026-01-01\\\\n2,2026-01-02\\\\n\\")"}}'
                 ),
+                '{"action":"finish","summary":"out.csv 파일 저장이 완료되었습니다."}',
             ]
         ),
         registry=reg,
@@ -297,9 +302,24 @@ def test_ask_user_answer_extends_file_write_intent(tmp_path):
     assert (ws / "out.csv").read_text() == "id,date\n1,2026-01-01\n2,2026-01-02\n"
 
 
-def test_run_python_direct_file_write_validates_requested_csv_sort(tmp_path):
+def test_csv_transform_is_done_by_python_and_write_file_tools(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
+    (ws / "input.csv").write_text("id,date\n2,2026-01-02\n1,2026-01-01\n2,2026-01-02\n")
+    content = "id,date\n1,2026-01-01\n2,2026-01-02\n"
+    code = (
+        "import csv, io, json\n"
+        "rows = list(csv.reader(open('input.csv', newline='')))\n"
+        "header, body = rows[0], rows[1:]\n"
+        "seen = set(); unique = []\n"
+        "for row in body:\n"
+        "    key = tuple(row)\n"
+        "    if key not in seen:\n"
+        "        seen.add(key); unique.append(row)\n"
+        "unique.sort(key=lambda row: row[header.index('date')])\n"
+        "buf = io.StringIO(); writer = csv.writer(buf); writer.writerow(header); writer.writerows(unique)\n"
+        "print(json.dumps({'content': buf.getvalue()}, ensure_ascii=False))\n"
+    )
     reg = ToolRegistry()
     sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
     for tool in build_file_tools(ws):
@@ -308,11 +328,15 @@ def test_run_python_direct_file_write_validates_requested_csv_sort(tmp_path):
     deps = RunnerDeps(
         llm=FakeLLMClient(
             replies=[
-                (
-                    '{"action":"call_tool","name":"runPython","input":'
-                    '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"date\\\\n2026-02-01\\\\n2026-01-01\\\\n\\")"}}'
+                json.dumps({"action": "call_tool", "name": "runPython", "input": {"code": code}}),
+                json.dumps(
+                    {
+                        "action": "call_tool",
+                        "name": "writeFile",
+                        "input": {"path": "out.csv", "content": content},
+                    }
                 ),
-                '{"action":"finish","summary":"fixed"}',
+                '{"action":"finish","summary":"out.csv saved"}',
             ]
         ),
         registry=reg,
@@ -320,127 +344,14 @@ def test_run_python_direct_file_write_validates_requested_csv_sort(tmp_path):
         log_dir=tmp_path,
     )
     runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: "y"))
-
-    result = runner.run_turn("sort by date ascending and save to out.csv")
-
-    assert result.summary == "fixed"
-    assert any("date 기준 오름차순이 아닙니다" in o for o in result.observations)
-
-
-def test_generated_tool_direct_file_write_is_validated_before_finish(tmp_path):
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "input.csv").write_text("id,date\n1,2026-01-01\n2,2026-01-02\n")
-    bad_code = (
-        "def run(input):\n"
-        "    open(input['output'], 'w').write('id,date\\n2,2026-01-02\\n1,2026-01-01\\n')\n"
-    )
-    reg = ToolRegistry()
-    for tool in build_file_tools(ws):
-        reg.register(tool)
-    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
-    deps = RunnerDeps(
-        llm=FakeLLMClient(
-            [
-                json.dumps(
-                    {
-                        "action": "create_tool",
-                        "spec": {
-                            "name": "bad-sort",
-                            "description": "bad sort",
-                            "code": bad_code,
-                            "inputSchema": {"type": "object"},
-                        },
-                    }
-                ),
-                '{"action":"call_tool","name":"bad-sort","input":{"output":"out.csv"}}',
-                '{"action":"finish","summary":"fixed"}',
-            ]
-        ),
-        registry=reg,
-        ask=lambda *a: "y",
-        log_dir=tmp_path,
-    )
-    runner = AgentRunner(
-        deps,
-        generated=GeneratedToolManager(ws / ".session", sandbox),
-        skills=SkillStore(tmp_path / "skills"),
-        policy=PolicyManager(ask=lambda q: "y"),
-    )
 
     result = runner.run_turn("input.csv duplicate rows remove and sort by date ascending and save to out.csv")
 
-    assert result.stopped_reason == "finish"
-    assert result.summary.startswith("검증 실패를 감지해")
-    assert (ws / "out.csv").read_text() == "id,date\n1,2026-01-01\n2,2026-01-02\n"
-    assert not (tmp_path / "skills" / "bad-sort").exists()
-    assert (tmp_path / "skills" / "csv-dedupe-sort" / "manifest.json").exists()
+    assert result.summary == "out.csv saved"
+    assert (ws / "out.csv").read_text() == content
 
 
-def test_run_python_direct_file_write_validates_dedupe_preserves_unique_rows(tmp_path):
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "input.csv").write_text("id,date\n1,2026-01-01\n2,2026-01-02\n1,2026-01-01\n")
-    reg = ToolRegistry()
-    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
-    for tool in build_file_tools(ws):
-        reg.register(tool)
-    reg.register(build_run_python(sandbox))
-    deps = RunnerDeps(
-        llm=FakeLLMClient(
-            replies=[
-                (
-                    '{"action":"call_tool","name":"runPython","input":'
-                    '{"code":"open(\\"out.csv\\", \\"w\\").write(\\"id,date\\\\n1,2026-01-01\\\\n\\")"}}'
-                ),
-                '{"action":"finish","summary":"fixed"}',
-            ]
-        ),
-        registry=reg,
-        ask=lambda *a: "y",
-        log_dir=tmp_path,
-    )
-    runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: "y"))
-
-    result = runner.run_turn("input.csv duplicate rows remove and save to out.csv")
-
-    assert result.summary == "fixed"
-    assert any("고유 행 내용" in o for o in result.observations)
-
-
-def test_final_csv_grouped_amount_summary_recomputes_after_dedupe(tmp_path):
-    ws = tmp_path / "ws"
-    ws.mkdir()
-    (ws / "events.csv").write_text(
-        "id,date,type,amount\n"
-        "3,2026-03-02,purchase,1200\n"
-        "1,2026-01-15,signup,0\n"
-        "2,2026-02-20,purchase,800\n"
-        "2,2026-02-20,purchase,800\n"
-        "4,2026-01-15,refund,-200\n"
-        "5,2026-04-10,purchase,500\n"
-    )
-    reg = ToolRegistry()
-    for tool in build_file_tools(ws):
-        reg.register(tool)
-    deps = RunnerDeps(
-        llm=FakeLLMClient(
-            replies=['{"action":"respond","text":"purchase: 3300","final":true}']
-        ),
-        registry=reg,
-        ask=lambda *a: "y",
-        log_dir=tmp_path,
-    )
-    runner = AgentRunner(deps)
-
-    result = runner.run_turn(
-        "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
-    )
-
-    assert result.summary == "purchase: 2500\nsignup: 0\nrefund: -200"
-
-
-def test_object_tree_numeric_filter_fallback_is_schema_generic(tmp_path):
+def test_object_tree_mutation_uses_python_tool_loop(tmp_path):
     ws = tmp_path / "ws"
     docs = tmp_path / "docs"
     ws.mkdir()
@@ -473,19 +384,61 @@ def test_object_tree_numeric_filter_fallback_is_schema_generic(tmp_path):
             }
         )
     )
-    asks = []
+    content = json.dumps(
+        {
+            "root": {
+                "id": "scene",
+                "type": "Scene",
+                "props": {},
+                "children": [
+                    {
+                        "id": "high",
+                        "type": "Actor",
+                        "name": "HighMana",
+                        "props": {"mana": 80},
+                        "children": [],
+                    }
+                ],
+            }
+        },
+        ensure_ascii=False,
+    )
+    code = (
+        "import json\n"
+        "data = json.load(open('arena.json'))\n"
+        "data['root']['children'] = [\n"
+        "    child for child in data['root']['children']\n"
+        "    if not (child['type'] == 'Actor' and child['props'].get('mana', 0) < 50)\n"
+        "]\n"
+        "print(json.dumps({'content': json.dumps(data, ensure_ascii=False), 'avg': 80}, ensure_ascii=False))\n"
+    )
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
     reg.register(build_search_docs(docs))
+    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    reg.register(build_run_python(sandbox))
     runner = AgentRunner(
         RunnerDeps(
-            llm=FakeLLMClient(replies=[]),
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"searchDocs","input":{"query":"mana","limit":3}}',
+                    json.dumps({"action": "call_tool", "name": "runPython", "input": {"code": code}}),
+                    json.dumps(
+                        {
+                            "action": "call_tool",
+                            "name": "writeFile",
+                            "input": {"path": "arena.json", "content": content},
+                        }
+                    ),
+                    '{"action":"finish","summary":"제거: LowMana\\n남은 Actor 평균 mana: 80"}',
+                ]
+            ),
             registry=reg,
             ask=lambda *a: "y",
             log_dir=tmp_path,
         ),
-        policy=PolicyManager(ask=lambda q: asks.append(q) or "y"),
+        policy=PolicyManager(ask=lambda q: "y"),
     )
 
     result = runner.run_turn(
@@ -493,13 +446,12 @@ def test_object_tree_numeric_filter_fallback_is_schema_generic(tmp_path):
     )
 
     assert result.summary == "제거: LowMana\n남은 Actor 평균 mana: 80"
-    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
     arena = json.loads(ws.joinpath("arena.json").read_text())
     assert [child["id"] for child in arena["root"]["children"]] == ["high"]
-    assert runner.deps.llm.calls == 0
+    assert runner.deps.llm.calls == 4
 
 
-def test_previous_json_filter_table_fallback_reconstructs_and_sorts(tmp_path):
+def test_previous_json_filter_table_uses_llm_tool_loop(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     ws.joinpath("players.json").write_text(
@@ -513,18 +465,41 @@ def test_previous_json_filter_table_fallback_reconstructs_and_sorts(tmp_path):
             }
         )
     )
-    asks = []
+    table = "| name | score |\n| --- | --- |\n| B | 30 |\n| C | 20 |\n"
+    code = (
+        "import json\n"
+        "players = json.load(open('players.json'))['players']\n"
+        "selected = sorted([p for p in players if p['score'] >= 15], key=lambda p: p['score'], reverse=True)\n"
+        "lines = ['| name | score |', '| --- | --- |']\n"
+        "for p in selected:\n"
+        "    lines.append(f\"| {p['name']} | {p['score']} |\")\n"
+        "print(json.dumps({'content': '\\n'.join(lines) + '\\n'}, ensure_ascii=False))\n"
+    )
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
+    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    reg.register(build_run_python(sandbox))
     runner = AgentRunner(
         RunnerDeps(
-            llm=FakeLLMClient(replies=[]),
+            llm=FakeLLMClient(
+                replies=[
+                    json.dumps({"action": "call_tool", "name": "runPython", "input": {"code": code}}),
+                    json.dumps(
+                        {
+                            "action": "call_tool",
+                            "name": "writeFile",
+                            "input": {"path": "out.md", "content": table},
+                        }
+                    ),
+                    '{"action":"finish","summary":"out.md 파일 저장이 완료되었습니다."}',
+                ]
+            ),
             registry=reg,
             ask=lambda *a: "y",
             log_dir=tmp_path,
         ),
-        policy=PolicyManager(ask=lambda q: asks.append(q) or "y"),
+        policy=PolicyManager(ask=lambda q: "y"),
     )
     runner.conv.add_user("players.json에서 score가 15 이상인 player 이름과 평균 score를 알려줘.")
     runner.conv.add_assistant("B, C의 평균 score는 25입니다.")
@@ -538,8 +513,7 @@ def test_previous_json_filter_table_fallback_reconstructs_and_sorts(tmp_path):
         "| B | 30 |\n"
         "| C | 20 |\n"
     )
-    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
-    assert runner.deps.llm.calls == 0
+    assert runner.deps.llm.calls == 3
 
 
 def test_outside_workspace_write_request_is_denied_before_tools(tmp_path):

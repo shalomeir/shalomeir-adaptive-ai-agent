@@ -16,7 +16,7 @@ from .monitoring import Exporter
 from .observability import Tracer
 from .parsing import parse_action_text
 from .policy import PolicyManager
-from .schemas import AskUser, CallTool, CreateTool, Finish, Respond, ToolSpec, UpdateTool
+from .schemas import AskUser, CallTool, CreateTool, Finish, Respond, UpdateTool
 from .skills import SkillStore
 from .tools.base import ToolResult
 from .tools.generated import GeneratedToolManager
@@ -110,15 +110,6 @@ class TurnResult:
     summary: str = ""
     observations: list[str] = field(default_factory=list)
     stopped_reason: str = "finish"
-
-
-def _is_numeric(rows: list[dict[str, str]], field: str) -> bool:
-    try:
-        for row in rows[:10]:
-            float(row[field])
-    except (KeyError, TypeError, ValueError):
-        return False
-    return True
 
 
 def _preview_text(text: str, limit: int = LLM_RESPONSE_LOG_CHARS) -> tuple[str, bool]:
@@ -252,270 +243,6 @@ class AgentRunner:
                 toolName="request_path",
             )
         return "정책상 거부됨: out_of_workspace. 작업 영역 밖 경로에는 파일을 쓸 수 없습니다."
-
-    def _initial_clarification_question(self, request: str) -> str | None:
-        """Ask directly for underspecified data-cleanup tasks before planning."""
-        lowered = request.lower()
-        has_data_term = any(term in lowered for term in ("data", "데이터", "파일"))
-        asks_cleanup = any(
-            term in lowered
-            for term in ("정리", "clean", "normalize", "정렬", "sort", "중복", "dedup")
-        )
-        has_path = bool(self._mentioned_workspace_paths(request))
-        if has_data_term and asks_cleanup and not has_path:
-            return (
-                "어떤 데이터를 어떻게 정리할까요? 파일명과 원하는 작업을 같이 알려주세요. "
-                "예: events.csv에서 중복 제거하고 date로 정렬해줘."
-            )
-        return None
-
-    def _object_tree_numeric_filter_fallback(self, request: str) -> str | None:
-        """Handle common object-tree mutations without binding to a demo file."""
-        lowered = request.lower()
-        if not (
-            ("제거" in request or "remove" in lowered or "delete" in lowered)
-            and ("평균" in request or "average" in lowered or "avg" in lowered)
-        ):
-            return None
-        json_paths = [
-            path
-            for path in self._mentioned_workspace_paths(request)
-            if Path(path).suffix.lower() == ".json"
-        ]
-        if not json_paths:
-            return None
-        condition = self._parse_numeric_condition(request)
-        if condition is None:
-            return None
-        field, threshold, op = condition
-        node_type = self._parse_requested_node_type(request)
-        if node_type is None:
-            return None
-        read_res = self.deps.registry.call("readFile", {"path": json_paths[0], "maxBytes": 1_048_576})
-        if not read_res.ok or not isinstance(read_res.output, dict):
-            return None
-        try:
-            tree = json.loads(str(read_res.output.get("content", "")))
-        except json.JSONDecodeError:
-            return None
-        root = tree.get("root") if isinstance(tree, dict) else None
-        if not isinstance(root, dict) or not isinstance(root.get("children"), list):
-            return None
-
-        docs = self.deps.registry.call("searchDocs", {"query": node_type, "limit": 3})
-        if docs.ok:
-            self.tracer.log(kind="tool_call", toolName="searchDocs")
-
-        removed: list[str] = []
-        kept_values: list[float] = []
-
-        def matches_condition(value: float) -> bool:
-            if op == "<":
-                return value < threshold
-            if op == "<=":
-                return value <= threshold
-            if op == ">":
-                return value > threshold
-            return value >= threshold
-
-        def prune(node: dict[str, Any]) -> dict[str, Any] | None:
-            props = node.get("props")
-            value = props.get(field) if isinstance(props, dict) else None
-            is_target_type = str(node.get("type", "")).lower() == node_type.lower()
-            numeric_value = float(value) if isinstance(value, (int, float)) else None
-            if is_target_type and numeric_value is not None:
-                if matches_condition(numeric_value):
-                    removed.append(str(node.get("name") or node.get("id") or node.get("type")))
-                    return None
-                kept_values.append(numeric_value)
-            children = node.get("children")
-            if isinstance(children, list):
-                node["children"] = [
-                    child
-                    for child in (prune(child) for child in children if isinstance(child, dict))
-                    if child is not None
-                ]
-            return node
-
-        pruned = prune(root)
-        if pruned is None or not kept_values:
-            return None
-        tree["root"] = pruned
-        if not self._confirm_direct_file_write(json_paths[0]):
-            return f"{json_paths[0]} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
-        content = json.dumps(tree, ensure_ascii=False, indent=2) + "\n"
-        write_res = self.deps.registry.call("writeFile", {"path": json_paths[0], "content": content})
-        if not write_res.ok:
-            return None
-        self.tracer.log(kind="tool_call", toolName="writeFile")
-        average = sum(kept_values) / len(kept_values)
-        removed_text = ", ".join(removed) if removed else "없음"
-        return f"제거: {removed_text}\n남은 {node_type} 평균 {field}: {average:g}"
-
-    def _parse_numeric_condition(self, request: str) -> tuple[str, float, str] | None:
-        pattern = re.compile(
-            r"([A-Za-z_][A-Za-z0-9_-]*)\s*(?:가|이|is|=)?\s*([0-9]+(?:\.[0-9]+)?)\s*"
-            r"(미만|이하|초과|이상|under|below|less than|at most|at least|<=|<|>=|>)",
-            flags=re.I,
-        )
-        match = pattern.search(request)
-        if match is None:
-            return None
-        field = match.group(1)
-        threshold = float(match.group(2))
-        raw_op = match.group(3).lower()
-        if raw_op in {"미만", "under", "below", "less than", "<"}:
-            op = "<"
-        elif raw_op in {"이하", "at most", "<="}:
-            op = "<="
-        elif raw_op in {"초과", ">"}:
-            op = ">"
-        else:
-            op = ">="
-        return field, threshold, op
-
-    def _parse_requested_node_type(self, request: str) -> str | None:
-        lowered = request.lower()
-        match = re.search(
-            r"\b([A-Za-z][A-Za-z0-9_-]*)(?:를|을|nodes?|node)?\s*(?:모두\s*)?"
-            r"(?:제거|remove|delete)",
-            request,
-            flags=re.I,
-        )
-        if match is not None:
-            candidate = match.group(1)
-            if candidate.lower() not in {"health", "node", "nodes", "all"}:
-                return candidate
-        type_match = re.search(r"(?:type|타입)\s*(?:이|가|=|:)?\s*([A-Za-z][A-Za-z0-9_-]*)", request)
-        if type_match is not None:
-            return type_match.group(1)
-        if "entity" in lowered:
-            return "Entity"
-        return None
-
-    def _previous_json_filter_table_fallback(self, request: str) -> str | None:
-        """Create a markdown table from a previous JSON numeric filter request."""
-        lowered = request.lower()
-        if not (
-            ("방금" in request or "previous" in lowered or "last" in lowered)
-            and ("마크다운" in request or "markdown" in lowered)
-            and ("표" in request or "table" in lowered)
-            and self._request_allows_file_write(request)
-        ):
-            return None
-        output_path = self._first_output_path(request, suffixes={".md", ".txt"})
-        if output_path is None:
-            return None
-        history = "\n".join(message.content for message in self.conv.body())
-        source_paths = [
-            path
-            for path in self._mentioned_workspace_paths(history)
-            if Path(path).suffix.lower() == ".json"
-        ]
-        if not source_paths:
-            return None
-        condition = self._parse_numeric_condition(history)
-        if condition is None:
-            return None
-        source_path = source_paths[-1]
-        read_res = self.deps.registry.call("readFile", {"path": source_path, "maxBytes": 1_048_576})
-        if not read_res.ok or not isinstance(read_res.output, dict):
-            return None
-        try:
-            data = json.loads(str(read_res.output.get("content", "")))
-        except json.JSONDecodeError:
-            return None
-        records = self._first_record_list(data)
-        if not records:
-            return None
-        field, threshold, op = condition
-        selected = [
-            row
-            for row in records
-            if isinstance(row.get(field), (int, float))
-            and self._compare_numeric(float(row[field]), threshold, op)
-        ]
-        if not selected:
-            return None
-        sort_field, reverse = self._parse_sort_request(request, fallback=field)
-        selected.sort(
-            key=lambda row: float(row.get(sort_field, 0))
-            if isinstance(row.get(sort_field), (int, float))
-            else str(row.get(sort_field, "")),
-            reverse=reverse,
-        )
-        columns = self._table_columns(selected, preferred=("name", sort_field))
-        content = self._markdown_table(selected, columns)
-        if not self._confirm_direct_file_write(output_path):
-            return f"{output_path} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
-        write_res = self.deps.registry.call("writeFile", {"path": output_path, "content": content})
-        if not write_res.ok:
-            return None
-        self.tracer.log(kind="tool_call", toolName="writeFile")
-        return f"{output_path} 파일 저장이 완료되었습니다."
-
-    def _first_output_path(self, request: str, suffixes: set[str]) -> str | None:
-        for path in self._mentioned_workspace_paths(request):
-            if Path(path).suffix.lower() in suffixes:
-                return path
-        return None
-
-    def _first_record_list(self, data: Any) -> list[dict[str, Any]]:
-        if isinstance(data, list):
-            return [item for item in data if isinstance(item, dict)]
-        if isinstance(data, dict):
-            for value in data.values():
-                if isinstance(value, list):
-                    records = [item for item in value if isinstance(item, dict)]
-                    if records:
-                        return records
-        return []
-
-    def _compare_numeric(self, value: float, threshold: float, op: str) -> bool:
-        if op == "<":
-            return value < threshold
-        if op == "<=":
-            return value <= threshold
-        if op == ">":
-            return value > threshold
-        return value >= threshold
-
-    def _parse_sort_request(self, request: str, fallback: str) -> tuple[str, bool]:
-        lowered = request.lower()
-        match = re.search(
-            r"([A-Za-z_][A-Za-z0-9_-]*)\s*(?:내림차순|descending|desc|오름차순|ascending|asc)",
-            request,
-            flags=re.I,
-        )
-        field = match.group(1) if match else fallback
-        reverse = any(term in lowered for term in ("내림차순", "descending", "desc"))
-        return field, reverse
-
-    def _table_columns(
-        self, rows: list[dict[str, Any]], *, preferred: tuple[str, ...]
-    ) -> list[str]:
-        columns: list[str] = []
-        sample = rows[0]
-        for column in preferred:
-            if column in sample and column not in columns:
-                columns.append(column)
-        if len(columns) >= 2:
-            return columns
-        for column in sample:
-            if column not in columns:
-                columns.append(column)
-            if len(columns) >= 4:
-                break
-        return columns
-
-    def _markdown_table(self, rows: list[dict[str, Any]], columns: list[str]) -> str:
-        header = "| " + " | ".join(columns) + " |"
-        divider = "| " + " | ".join("---" for _ in columns) + " |"
-        body = [
-            "| " + " | ".join(str(row.get(column, "")) for column in columns) + " |"
-            for row in rows
-        ]
-        return "\n".join([header, divider, *body]) + "\n"
 
     def _action_signature(self, action: Any) -> str | None:
         """Stable key for detecting a model that repeats the same step forever.
@@ -713,6 +440,9 @@ class AgentRunner:
                 "생성",
                 "수정",
                 "update",
+                "제거",
+                "remove",
+                "delete",
                 ".md",
                 ".csv로",
                 ".txt",
@@ -757,189 +487,6 @@ class AgentRunner:
             if path:
                 return f"{name} 실행은 이미 성공했습니다. 결과 파일: {path}"
         return f"{name} 실행은 이미 성공했습니다. 마지막 결과: {result.output}"
-
-    def _direct_file_write_feedback(self, request: str) -> tuple[bool, str] | None:
-        if not self._request_allows_file_write(request):
-            return None
-        for path in reversed(self._mentioned_workspace_paths(request)):
-            res = self.deps.registry.call("readFile", {"path": path, "maxBytes": 1_048_576})
-            if not res.ok or not isinstance(res.output, dict):
-                continue
-            if not self._confirm_direct_file_write(path):
-                return False, f"{path} 파일 쓰기 승인이 거부되어 작업을 완료하지 않았습니다."
-            content = str(res.output.get("content", ""))
-            validation = self._validate_created_file(path, content, request)
-            if validation is not None:
-                if validation.startswith("검증 실패를 감지해"):
-                    return True, validation
-                return False, validation
-            return True, f"{path} 파일 저장이 완료되었습니다."
-        return None
-
-    def _confirm_direct_file_write(self, path: str) -> bool:
-        if path in self._confirmed_direct_writes or self.policy is None:
-            return True
-        decision = self.policy.evaluate("write_file")
-        self.tracer.log(
-            kind="policy_decision",
-            policy=decision.decision,
-            policyReason=decision.reason,
-            toolName="direct_file_write",
-        )
-        if decision.decision == "DENY":
-            return False
-        if decision.decision == "ASK_USER" and not self.policy.confirm("write_file"):
-            return False
-        self._confirmed_direct_writes.add(path)
-        return True
-
-    def _validate_created_file(self, path: str, content: str, request: str) -> str | None:
-        if Path(path).suffix.lower() != ".csv":
-            return None
-        rows = list(csv.DictReader(io.StringIO(content)))
-        lowered = request.lower()
-        if "중복" in request or "duplicate" in lowered:
-            source_paths = [
-                candidate
-                for candidate in self._mentioned_workspace_paths(request)
-                if candidate != path and Path(candidate).suffix.lower() == ".csv"
-            ]
-            if source_paths:
-                source_res = self.deps.registry.call(
-                    "readFile", {"path": source_paths[0], "maxBytes": 1_048_576}
-                )
-                if source_res.ok and isinstance(source_res.output, dict):
-                    source_rows = list(
-                        csv.DictReader(io.StringIO(str(source_res.output.get("content", ""))))
-                    )
-                    expected = {tuple(row.items()) for row in source_rows}
-                    actual = {tuple(row.items()) for row in rows}
-                    if actual != expected:
-                        repair = self._repair_csv_dedupe_sort(path, source_paths[0], request)
-                        if repair is not None:
-                            return repair
-                        return (
-                            "검증 실패: 출력 CSV의 고유 행 내용이 입력 CSV의 완전 중복 제거 결과와 "
-                            "일치하지 않습니다. 행을 누락하거나 다른 기준으로 제거하지 마세요."
-                        )
-            seen: set[tuple[tuple[str, str], ...]] = set()
-            for row in rows:
-                key = tuple(row.items())
-                if key in seen:
-                    return "검증 실패: 출력 CSV에 완전히 중복된 행이 남아 있습니다. 다시 제거하세요."
-                seen.add(key)
-        wants_date_sort = "date" in lowered and any(
-            term in lowered for term in ("sort", "ascending", "오름차순", "정렬")
-        )
-        if wants_date_sort and rows and "date" in rows[0]:
-            dates = [row["date"] for row in rows]
-            if dates != sorted(dates):
-                source_paths = [
-                    candidate
-                    for candidate in self._mentioned_workspace_paths(request)
-                    if candidate != path and Path(candidate).suffix.lower() == ".csv"
-                ]
-                if source_paths:
-                    repair = self._repair_csv_dedupe_sort(path, source_paths[0], request)
-                    if repair is not None:
-                        return repair
-                return "검증 실패: 출력 CSV가 date 기준 오름차순이 아닙니다. 정렬해서 다시 저장하세요."
-        return None
-
-    def _repair_csv_dedupe_sort(self, dst: str, src: str, request: str) -> str | None:
-        lowered = request.lower()
-        wants_dedupe = "중복" in request or "duplicate" in lowered
-        wants_date_sort = "date" in lowered and any(
-            term in lowered for term in ("sort", "ascending", "오름차순", "정렬")
-        )
-        if not (wants_dedupe and wants_date_sort):
-            return None
-        source_res = self.deps.registry.call("readFile", {"path": src, "maxBytes": 1_048_576})
-        if not source_res.ok or not isinstance(source_res.output, dict):
-            return None
-        source_content = str(source_res.output.get("content", ""))
-        source_rows = list(csv.reader(io.StringIO(source_content)))
-        if not source_rows:
-            return None
-        header, body = source_rows[0], source_rows[1:]
-        if "date" not in header:
-            return None
-        seen: set[tuple[str, ...]] = set()
-        unique: list[list[str]] = []
-        for row in body:
-            key = tuple(row)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(row)
-        date_index = header.index("date")
-        unique.sort(key=lambda row: row[date_index])
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(header)
-        writer.writerows(unique)
-        write_res = self.deps.registry.call("writeFile", {"path": dst, "content": output.getvalue()})
-        if not write_res.ok:
-            return None
-        return (
-            "검증 실패를 감지해 Python 표준 라이브러리로 출력 CSV를 교정했습니다. "
-            f"{dst} 파일 저장이 완료되었습니다."
-        )
-
-    def _ensure_csv_dedupe_sort_tool(self) -> None:
-        if self.generated is None:
-            return
-        name = "csv-dedupe-sort"
-        code = (
-            "def run(input):\n"
-            "    import csv\n"
-            "    source = input.get('source') or input.get('inputPath') or input.get('path')\n"
-            "    output = input.get('output') or input.get('outputPath')\n"
-            "    if not source or not output:\n"
-            "        raise ValueError('source and output are required')\n"
-            "    with open(source, newline='', encoding='utf-8') as f:\n"
-            "        rows = list(csv.reader(f))\n"
-            "    if not rows:\n"
-            "        raise ValueError('source CSV is empty')\n"
-            "    header, body = rows[0], rows[1:]\n"
-            "    if 'date' not in header:\n"
-            "        raise ValueError('date column is required')\n"
-            "    seen = set()\n"
-            "    unique = []\n"
-            "    for row in body:\n"
-            "        key = tuple(row)\n"
-            "        if key in seen:\n"
-            "            continue\n"
-            "        seen.add(key)\n"
-            "        unique.append(row)\n"
-            "    date_index = header.index('date')\n"
-            "    unique.sort(key=lambda row: row[date_index])\n"
-            "    with open(output, 'w', newline='', encoding='utf-8') as f:\n"
-            "        writer = csv.writer(f)\n"
-            "        writer.writerow(header)\n"
-            "        writer.writerows(unique)\n"
-            "    return {'path': output, 'rows': len(unique), 'removed': len(body) - len(unique)}\n"
-        )
-        spec = ToolSpec(
-            name=name,
-            description=(
-                "Remove exact duplicate rows from a CSV file, sort by the date column, "
-                "and write the cleaned CSV to an output path."
-            ),
-            code=code,
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string"},
-                    "output": {"type": "string"},
-                },
-                "required": ["source", "output"],
-            },
-        )
-        self.deps.registry.register(self.generated.create(spec))
-        self._session_tools = [name]
-        self.ctx.carry_over_fact(f"생성한 도구: {name}")
-        self.tracer.log(kind="tool_create", toolName=name)
 
     def _plan_raw(self) -> str:
         with self.tracer.span():
@@ -1001,36 +548,11 @@ class AgentRunner:
             self.conv.add_user(request)
             self.conv.add_assistant(outside_write)
             return TurnResult(summary=outside_write)
-        previous_table = self._previous_json_filter_table_fallback(request)
-        if previous_table is not None:
-            self.conv.add_user(request)
-            self.conv.add_assistant(previous_table)
-            return TurnResult(summary=previous_table)
-        tree_filter = self._object_tree_numeric_filter_fallback(request)
-        if tree_filter is not None:
-            self.conv.add_user(request)
-            self.conv.add_assistant(tree_filter)
-            return TurnResult(summary=tree_filter)
 
         self.conv.add_user(request)
         result = TurnResult()
         self._suppressed_tool_names.clear()
         effective_request = request
-        initial_question = self._initial_clarification_question(request)
-        if initial_question is not None:
-            if self.deps.non_interactive:
-                result.summary = self._hitl_required_summary(initial_question)
-                result.stopped_reason = "hitl_required"
-                return result
-            answer = self.deps.ask(initial_question, None)
-            if answer == NON_INTERACTIVE_ASK:
-                result.summary = self._hitl_required_summary(initial_question)
-                result.stopped_reason = "hitl_required"
-                return result
-            obs = f"사용자 답변: {answer}"
-            effective_request = f"{effective_request}\n{answer}"
-            self.conv.add_observation(obs)
-            result.observations.append(obs)
         fix_failures = 0
         parse_failures = 0
         last_action_sig: str | None = None
@@ -1157,20 +679,6 @@ class AgentRunner:
                         fix_failures = 0
                         assert sig is not None
                         obs = f"도구 {action.name} 결과: {res.output}"
-                        direct_write_feedback = self._direct_file_write_feedback(effective_request)
-                        if direct_write_feedback is not None:
-                            self.conv.add_observation(obs)
-                            result.observations.append(obs)
-                            passed, message = direct_write_feedback
-                            if not passed:
-                                self.conv.add_observation(message)
-                                result.observations.append(message)
-                                continue
-                            if message.startswith("검증 실패를 감지해"):
-                                self._ensure_csv_dedupe_sort_tool()
-                            result.summary = message
-                            result.stopped_reason = "finish"
-                            break
                         self._tool_result_cache[sig] = res
                     else:
                         fix_failures += 1
@@ -1205,102 +713,7 @@ class AgentRunner:
             else:
                 self._session_tools.clear()
             self.ctx.maybe_compact(self.conv)
-        result.summary = self._polish_final_summary(effective_request, result.summary)
         return result
-
-    def _polish_final_summary(self, request: str, summary: str) -> str:
-        grouped_sum = self._csv_grouped_sum_summary(request)
-        if grouped_sum is not None:
-            return grouped_sum
-        lowered = request.lower()
-        asks_for_names = "이름" in request or "name" in lowered
-        asks_for_average = "평균" in request or "average" in lowered or "avg" in lowered
-        if not (asks_for_names and asks_for_average):
-            return summary
-        match = re.search(
-            r"High HP Monsters:\s*(\[.*?\])\s*Average HP:\s*([0-9]+(?:\.[0-9]+)?)",
-            summary,
-            flags=re.DOTALL,
-        )
-        if match is None:
-            return summary
-        try:
-            records = ast.literal_eval(match.group(1))
-        except (SyntaxError, ValueError):
-            return summary
-        if not isinstance(records, list):
-            return summary
-        names = [str(record["name"]) for record in records if isinstance(record, dict) and "name" in record]
-        if not names:
-            return summary
-        average = float(match.group(2))
-        if any("\uac00" <= char <= "\ud7a3" for char in request):
-            return f"{', '.join(names)}의 평균 HP는 {average:.2f}입니다."
-        return f"Names: {', '.join(names)}\nAverage HP: {average:.2f}"
-
-    def _csv_grouped_sum_summary(self, request: str) -> str | None:
-        lowered = request.lower()
-        if not ("합계" in request or "sum" in lowered):
-            return None
-        csv_paths = [
-            path for path in self._mentioned_workspace_paths(request) if Path(path).suffix == ".csv"
-        ]
-        if not csv_paths:
-            return None
-        res = self.deps.registry.call("readFile", {"path": csv_paths[0], "maxBytes": 1_048_576})
-        if not res.ok or not isinstance(res.output, dict):
-            return None
-        rows = list(csv.DictReader(io.StringIO(str(res.output.get("content", "")))))
-        if not rows:
-            return None
-        headers = list(rows[0].keys())
-        mentioned_headers = [header for header in headers if header.lower() in lowered]
-        group_field = next(
-            (
-                header
-                for header in mentioned_headers
-                if re.search(rf"{re.escape(header.lower())}\s*(?:별|by)", lowered)
-                or re.search(rf"(?:by|group by)\s+{re.escape(header.lower())}", lowered)
-            ),
-            "",
-        )
-        if not group_field:
-            group_field = next((header for header in mentioned_headers if not _is_numeric(rows, header)), "")
-        sum_field = next(
-            (
-                header
-                for header in mentioned_headers
-                if header != group_field
-                and _is_numeric(rows, header)
-                and (
-                    re.search(rf"{re.escape(header.lower())}\s*(?:의\s*)?(?:합계|sum)", lowered)
-                    or re.search(rf"(?:sum|합계).*{re.escape(header.lower())}", lowered)
-                )
-            ),
-            "",
-        )
-        if not sum_field:
-            sum_field = next(
-                (
-                    header
-                    for header in mentioned_headers
-                    if header != group_field and _is_numeric(rows, header)
-                ),
-                "",
-            )
-        if not sum_field or not group_field:
-            return None
-        wants_dedupe = "중복" in request or "duplicate" in lowered
-        seen: set[tuple[tuple[str, str], ...]] = set()
-        totals: dict[str, float] = {}
-        for row in rows:
-            key = tuple(row.items())
-            if wants_dedupe and key in seen:
-                continue
-            seen.add(key)
-            group = row[group_field]
-            totals[group] = totals.get(group, 0.0) + float(row[sum_field])
-        return "\n".join(f"{key}: {value:g}" for key, value in totals.items())
 
     def _finalize_incomplete(self, result: TurnResult) -> None:
         """Surface a result when the loop ends without a completion signal.
