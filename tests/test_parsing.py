@@ -60,6 +60,14 @@ def test_parse_respond_summary_alias():
     assert res.action.final is True
 
 
+def test_parse_bare_json_as_final_response():
+    res = parse_action_text('{"path":"events-clean.csv","rows":5,"removed":2}')
+    assert res.ok
+    assert res.action.action == "respond"
+    assert res.action.text == '{"path": "events-clean.csv", "rows": 5, "removed": 2}'
+    assert res.action.final is True
+
+
 def test_parse_action_fail_returns_error():
     res = parse_action_text("not json at all")
     assert not res.ok

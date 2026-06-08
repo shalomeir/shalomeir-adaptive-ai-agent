@@ -99,6 +99,19 @@ def test_llm_response_preview_is_bounded(tmp_path):
     assert first_llm_event["responseTruncated"] is True
 
 
+def test_bare_json_response_finishes_instead_of_looping(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        ['{"path":"events-clean.csv","rows":5,"removed":2}'] * 10,
+    )
+
+    result = runner.run_turn("events.csv 정리 결과 알려줘")
+
+    assert result.stopped_reason == "finish"
+    assert '"events-clean.csv"' in result.summary
+    assert runner.deps.llm.calls == 1
+
+
 def test_max_iterations_guard(tmp_path):
     # Distinct actions each turn keep advancing (no-progress guard does not fire),
     # so the run is bounded only by max_iterations.

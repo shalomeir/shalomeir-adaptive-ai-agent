@@ -79,7 +79,11 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
     """Normalize common model action aliases before strict schema validation."""
     action = value.get("action")
     if not isinstance(action, str):
-        return {"action": "respond", "text": json.dumps(value, ensure_ascii=False)}
+        return {
+            "action": "respond",
+            "text": json.dumps(value, ensure_ascii=False),
+            "final": True,
+        }
 
     if action == "respond" and "text" not in value:
         text = value.get("output", value.get("message", value.get("summary")))
