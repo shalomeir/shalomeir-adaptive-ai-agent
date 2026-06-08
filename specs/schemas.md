@@ -9,6 +9,7 @@
 | 0.1 | 2026-06-01 | 최초 작성. action 프로토콜, 내장 도구 입출력, ToolSpec, manifest, 로그 이벤트, 설정 스키마 정의 |
 | 0.2 | 2026-06-08 | CSV 중복 제거·정렬 내장 도구 `normalizeCsv` 계약 추가 |
 | 0.3 | 2026-06-08 | JSON hp 질의 내장 도구 `queryMonsterHp` 계약 추가 |
+| 0.4 | 2026-06-08 | CSV 읽기 전용 그룹 합계 내장 도구 `aggregateCsv` 계약 추가 |
 
 ## 0. 규약
 
@@ -259,7 +260,24 @@ def run(input: dict) -> dict:
       "sortBy": { "type": "string" } } } }
 ```
 
-### 3.6 queryMonsterHp
+### 3.6 aggregateCsv
+
+```json
+{ "input": { "type": "object", "required": ["src"],
+    "properties": { "src": { "type": "string" },
+      "groupBy": { "type": "string", "default": "type" },
+      "sumColumn": { "type": "string", "default": "amount" },
+      "dedupe": { "type": "boolean", "default": true } },
+    "additionalProperties": false },
+  "output": { "type": "object",
+    "required": ["src", "groupBy", "sumColumn", "dedupe", "rows", "removedDuplicates", "sums"],
+    "properties": { "src": { "type": "string" }, "groupBy": { "type": "string" },
+      "sumColumn": { "type": "string" }, "dedupe": { "type": "boolean" },
+      "rows": { "type": "integer" }, "removedDuplicates": { "type": "integer" },
+      "sums": { "type": "object", "additionalProperties": { "type": "number" } } } } }
+```
+
+### 3.7 queryMonsterHp
 
 ```json
 { "input": { "type": "object", "required": ["src"],
@@ -275,7 +293,7 @@ def run(input: dict) -> dict:
       "count": { "type": "integer" }, "averageHp": { "type": "number" } } } }
 ```
 
-### 3.7 createTool
+### 3.8 createTool
 
 입력은 2절 ToolSpec과 같다.
 
@@ -287,7 +305,7 @@ def run(input: dict) -> dict:
       "trustedStatus": { "type": "string", "enum": ["untrusted", "session", "persisted"] } } } }
 ```
 
-### 3.8 updateTool
+### 3.9 updateTool
 
 ```json
 { "input": { "type": "object", "required": ["name", "code"],
@@ -299,7 +317,7 @@ def run(input: dict) -> dict:
       "updated": { "type": "boolean" } } } }
 ```
 
-### 3.9 searchDocs
+### 3.10 searchDocs
 
 ```json
 { "input": { "type": "object", "required": ["query"],
@@ -314,7 +332,7 @@ def run(input: dict) -> dict:
         "snippet": { "type": "string" }, "score": { "type": "number" } } } } } } }
 ```
 
-### 3.10 askUser
+### 3.11 askUser
 
 ```json
 { "input": { "type": "object", "required": ["question"],

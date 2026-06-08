@@ -120,9 +120,9 @@ def parse_action_text(raw: str) -> ParseResult:
 
 내장 도구와 생성 도구를 같은 `Tool` 추상으로 다룬다. 레지스트리는 실행도 하지만, 프롬프트에는
 이름·설명만 담은 digest로 노출한다. 캐시 안정성을 위해 전체 스키마와 코드는 평소에 넣지 않는다.
-명확한 JSON hp 질의 요청은 `queryMonsterHp`, CSV 중복 제거·정렬·저장 요청은
-`normalizeCsv` 내장 도구가 처리해, 로컬 모델이 불안정한 ad hoc 검증 스크립트를 반복하지
-않게 한다.
+명확한 JSON hp 질의 요청은 `queryMonsterHp`, CSV 읽기 전용 그룹 합계는 `aggregateCsv`,
+CSV 중복 제거·정렬·저장 요청은 `normalizeCsv` 내장 도구가 처리해, 로컬 모델이 불안정한
+ad hoc 검증 스크립트를 반복하지 않게 한다.
 
 ```python
 @dataclass
@@ -186,13 +186,18 @@ for line in res.stdout.splitlines():
 ## 6. 권한 게이트
 
 부수효과가 있는 호출은 실행 전에 정책을 거친다. 판단은 모델이 아니라 런타임이 내린다.
-현재는 `writeFile`을 막는다: 작업 영역 밖 경로는 바로 거부, 안쪽 쓰기는 사용자에게 묻는다.
+현재는 `writeFile`과 저장형 CSV 내장 도구를 막는다: 작업 영역 밖 경로는 바로 거부, 안쪽
+쓰기는 사용자에게 묻는다. 동일한 부수효과 호출이 반복되면 두 번째 호출부터 무진전으로 보고
+중단해 같은 승인 질문을 계속 띄우지 않는다.
 
 ```python
 def _gate(self, name, payload):
-    if name != "writeFile":
+    if name == "writeFile":
+        path = str(payload.get("path", ""))
+    elif name == "normalizeCsv":
+        path = str(payload.get("dst", ""))
+    else:
         return True, None
-    path = str(payload.get("path", ""))
     escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
     action_id = "out_of_workspace" if escapes else "write_file"
     decision = self.policy.evaluate(action_id)

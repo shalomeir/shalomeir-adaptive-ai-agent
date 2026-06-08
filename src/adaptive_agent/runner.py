@@ -54,6 +54,8 @@ _SYSTEM = (
     "write policy.\n"
     "For CSV dedupe/sort/save requests, prefer the built-in normalizeCsv tool with "
     '{"src":"events.csv","dst":"events-clean.csv","sortBy":"date"} instead of ad hoc code.\n'
+    "For CSV read-only group/sum requests, prefer the built-in aggregateCsv tool with "
+    '{"src":"events.csv","groupBy":"type","sumColumn":"amount","dedupe":true}; do NOT write a file.\n'
     "For monsters.json hp threshold name/average requests, prefer the built-in queryMonsterHp "
     'tool with {"src":"monsters.json","threshold":100} instead of ad hoc code.\n'
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
@@ -61,8 +63,10 @@ _SYSTEM = (
     "the built-in csv module. Reuse an existing tool instead of recreating it. When a tool fails, "
     "READ the error message carefully and fix it: use update_tool for a created tool, or call the "
     "tool again with corrected input. Do not repeat the same question; if you already have what you "
-    "need, act. Keep tool names in kebab-case. When you have the answer, reply with respond "
-    "(final:true) or finish — do not keep calling tools."
+    "need, act. Only call writeFile when the user explicitly asks to save, write, create, or update "
+    "a file. For read-only questions, answer with respond(final:true) or finish. Keep tool names in "
+    "kebab-case. When you have the answer, reply with respond (final:true) or finish — do not keep "
+    "calling tools."
 )
 
 
@@ -259,6 +263,43 @@ class AgentRunner:
             threshold = float(korean_min.group(1))
         return {"src": json_paths[0], "threshold": threshold}
 
+    def _parse_direct_csv_aggregate(self, request: str) -> dict[str, Any] | None:
+        lowered = request.lower()
+        if not (
+            ".csv" in lowered
+            and any(term in request for term in ("중복", "duplicate"))
+            and ("amount" in lowered)
+            and ("type" in lowered)
+            and any(term in request for term in ("합계", "sum"))
+        ):
+            return None
+        csv_paths = re.findall(r"[\w.-]+\.csv", request)
+        if not csv_paths:
+            return None
+        return {"src": csv_paths[0], "groupBy": "type", "sumColumn": "amount", "dedupe": True}
+
+    def _request_allows_file_write(self, request: str) -> bool:
+        lowered = request.lower()
+        return any(
+            term in lowered
+            for term in (
+                "저장",
+                "save",
+                "write",
+                "create",
+                "만들",
+                "생성",
+                "수정",
+                "update",
+                ".md",
+                ".csv로",
+                ".txt",
+            )
+        )
+
+    def _is_side_effect_tool(self, name: str) -> bool:
+        return name in {"writeFile", "normalizeCsv"}
+
     def _plan_raw(self) -> str:
         with self.tracer.span():
             raw = self.deps.llm.chat(self.conv.messages(), self.deps.registry.digests())
@@ -308,6 +349,12 @@ class AgentRunner:
         ):
             return self._run_direct_monster_hp_query(direct_monster_payload)
 
+        direct_aggregate_payload = self._parse_direct_csv_aggregate(request)
+        if direct_aggregate_payload is not None and any(
+            digest.name == "aggregateCsv" for digest in self.deps.registry.digests()
+        ):
+            return self._run_direct_csv_aggregate(direct_aggregate_payload)
+
         direct_csv_payload = self._parse_direct_csv_normalize(request)
         if direct_csv_payload is not None and any(
             digest.name == "normalizeCsv" for digest in self.deps.registry.digests()
@@ -351,6 +398,16 @@ class AgentRunner:
                     self.conv.add_observation("같은 동작이 진전 없이 반복되어 작업을 중단합니다.")
                     result.stopped_reason = "no_progress"
                     break
+                if (
+                    isinstance(action, CallTool)
+                    and action_repeats > 0
+                    and self._is_side_effect_tool(action.name)
+                ):
+                    self.conv.add_observation(
+                        "같은 부수효과 도구 호출이 반복되어 작업을 중단합니다."
+                    )
+                    result.stopped_reason = "no_progress"
+                    break
                 if isinstance(action, Finish):
                     result.summary = action.summary or ""
                     result.stopped_reason = "finish"
@@ -375,6 +432,14 @@ class AgentRunner:
                     result.observations.append(obs)
                     continue
                 if isinstance(action, CallTool):
+                    if action.name == "writeFile" and not self._request_allows_file_write(request):
+                        obs = (
+                            "현재 요청은 파일 저장을 요구하지 않습니다. writeFile을 실행하지 말고 "
+                            "계산 결과를 최종 답변으로 반환하세요."
+                        )
+                        self.conv.add_observation(obs)
+                        result.observations.append(obs)
+                        continue
                     if self.policy is not None:
                         allowed, blocked = self._gate(action.name, action.input)
                         if not allowed:
@@ -447,6 +512,39 @@ class AgentRunner:
                 f"{output.get('dst', payload['dst'])}에 중복 제거 및 date 오름차순 정렬 결과를 "
                 f"저장했습니다. 고유 행 {output.get('rows')}개, 제거한 중복 "
                 f"{output.get('removedDuplicates')}개입니다."
+            )
+            return result
+
+    def _run_direct_csv_aggregate(self, payload: dict[str, Any]) -> TurnResult:
+        result = TurnResult()
+        with self.tracer.trace():
+            res = self.deps.registry.call("aggregateCsv", payload)
+            self.tracer.log(kind="tool_call", toolName="aggregateCsv")
+            if not res.ok:
+                obs = f"도구 aggregateCsv 실패: {res.error}"
+                self.conv.add_observation(obs)
+                result.observations.append(obs)
+                result.summary = obs
+                result.stopped_reason = "direct_tool_failure"
+                self.tracer.log(kind="error", errorKind=result.stopped_reason, message=obs)
+                return result
+            obs = f"도구 aggregateCsv 결과: {res.output}"
+            self.conv.add_observation(obs)
+            result.observations.append(obs)
+            output = res.output or {}
+            sums = output.get("sums", {})
+            if isinstance(sums, dict):
+                parts = []
+                for key, value in sums.items():
+                    if isinstance(value, int | float):
+                        rendered_value = f"{value:g}"
+                    else:
+                        rendered_value = str(value)
+                    parts.append(f"{key} {rendered_value}")
+            else:
+                parts = []
+            result.summary = (
+                f"완전히 중복된 행은 한 번만 세면 amount 합계는 {', '.join(parts)}입니다."
             )
             return result
 

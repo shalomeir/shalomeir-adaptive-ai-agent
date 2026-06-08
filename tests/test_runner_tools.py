@@ -174,6 +174,33 @@ def test_repeated_identical_tool_call_stops_with_no_progress(tmp_path):
     assert result.stopped_reason == "no_progress"
 
 
+def test_repeated_identical_write_file_prompts_only_once(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    asks = []
+    reg = ToolRegistry()
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    deps = RunnerDeps(
+        llm=FakeLLMClient(
+            replies=[
+                '{"action":"call_tool","name":"writeFile","input":{"path":"out.txt","content":"hello"}}'
+            ]
+            * 6
+        ),
+        registry=reg,
+        ask=lambda *a: "y",
+        log_dir=tmp_path,
+    )
+    runner = AgentRunner(deps, policy=PolicyManager(ask=lambda q: asks.append(q) or "y"))
+
+    result = runner.run_turn("write once")
+
+    assert result.stopped_reason == "no_progress"
+    assert asks == ["'write_file' 작업을 진행할까요? (y/n)"]
+    assert (ws / "out.txt").read_text() == "hello"
+
+
 def test_update_unknown_tool_is_graceful(tmp_path):
     # The model may try to update a built-in or nonexistent tool; the runner
     # must not crash, just observe and move on.

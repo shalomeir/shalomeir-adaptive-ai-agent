@@ -206,6 +206,72 @@ def build_monster_hp_query(workspace: Path | str) -> Tool:
     )
 
 
+def build_aggregate_csv(workspace: Path | str) -> Tool:
+    ws = Path(workspace)
+    ws.mkdir(parents=True, exist_ok=True)
+
+    def aggregate_csv(inp: dict[str, Any]) -> ToolResult:
+        try:
+            src = _resolve(ws, inp["src"])
+        except ValueError as e:
+            return ToolResult(ok=False, error=str(e))
+        group_by = str(inp.get("groupBy", "type"))
+        sum_column = str(inp.get("sumColumn", "amount"))
+        dedupe = bool(inp.get("dedupe", True))
+        try:
+            with src.open(newline="", encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                rows = list(reader)
+                fieldnames = reader.fieldnames or []
+        except FileNotFoundError:
+            return ToolResult(ok=False, error=f"입력 파일을 찾을 수 없습니다: {inp['src']}")
+        if group_by not in fieldnames:
+            return ToolResult(ok=False, error=f"그룹 기준 컬럼이 없습니다: {group_by}")
+        if sum_column not in fieldnames:
+            return ToolResult(ok=False, error=f"합계 컬럼이 없습니다: {sum_column}")
+
+        seen: set[tuple[str, ...]] = set()
+        unique_rows: list[dict[str, str]] = []
+        for row in rows:
+            key = tuple(row.get(name, "") for name in fieldnames)
+            if dedupe and key in seen:
+                continue
+            seen.add(key)
+            unique_rows.append(row)
+
+        sums: dict[str, int | float] = {}
+        for row in unique_rows:
+            group = row[group_by]
+            raw_value = row[sum_column]
+            value: int | float
+            try:
+                value = int(raw_value)
+            except ValueError:
+                value = float(raw_value)
+            sums[group] = sums.get(group, 0) + value
+
+        return ToolResult(
+            ok=True,
+            output={
+                "src": inp["src"],
+                "groupBy": group_by,
+                "sumColumn": sum_column,
+                "dedupe": dedupe,
+                "rows": len(unique_rows),
+                "removedDuplicates": len(rows) - len(unique_rows),
+                "sums": sums,
+            },
+        )
+
+    return Tool(
+        "aggregateCsv",
+        "CSV에서 완전 중복 행을 선택적으로 제거하고 지정 컬럼 합계를 그룹별로 계산한다",
+        "builtin",
+        {"type": "object", "required": ["src"]},
+        aggregate_csv,
+    )
+
+
 def build_run_python(sandbox: ExecutionSandbox) -> Tool:
     def run_python(inp: dict[str, Any]) -> ToolResult:
         if "code" in inp:

@@ -9,6 +9,7 @@ from adaptive_agent.runner import AgentRunner, RunnerDeps
 from adaptive_agent.sandbox import ExecutionSandbox
 from adaptive_agent.skills import SkillStore
 from adaptive_agent.tools.builtins import (
+    build_aggregate_csv,
     build_file_tools,
     build_monster_hp_query,
     build_normalize_csv,
@@ -37,6 +38,7 @@ def _runner(
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
+    reg.register(build_aggregate_csv(ws))
     reg.register(build_monster_hp_query(ws))
     reg.register(build_normalize_csv(ws))
     if docs_dir is not None:
@@ -393,6 +395,42 @@ def test_d3_failure_then_self_fix(tmp_path: Path) -> None:
     assert "'refund': -200" in blob
     # the self-fix went through update_tool, recorded as a tool_update event
     assert "tool_update" in _log_kinds(tmp_path)
+
+
+def test_d3_live_prompt_uses_direct_csv_aggregate_without_write_prompt(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path)
+    shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
+    asks: list[tuple[object, ...]] = []
+
+    reg = ToolRegistry()
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    reg.register(build_aggregate_csv(ws))
+    reg.register(build_monster_hp_query(ws))
+    reg.register(build_normalize_csv(ws))
+    sandbox = ExecutionSandbox(ws, timeout_sec=10, max_output_bytes=16384)
+    llm = FakeLLMClient(replies=[])
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=reg,
+            ask=lambda *a: asks.append(a) or "n",
+            log_dir=tmp_path / "logs",
+        ),
+        generated=GeneratedToolManager(ws / ".session", sandbox),
+        skills=SkillStore(tmp_path / "skills"),
+        policy=PolicyManager(ask=lambda q: asks.append((q,)) or "n"),
+    )
+
+    result = runner.run_turn(
+        "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
+    )
+
+    assert "purchase 2500" in result.summary
+    assert "signup 0" in result.summary
+    assert "refund -200" in result.summary
+    assert llm.calls == 0
+    assert asks == []
 
 
 # ---------- D4: ambiguous request asks first, acts only after clarification ----------
