@@ -65,10 +65,16 @@ def _confirmation_text(action_id: str) -> str:
     if action_id == "write_file":
         return "파일 쓰기가 필요합니다. 진행할까요? (y/n)"
     if action_id == "persist_tool":
-        return "방금 만든 도구를 다음 세션에서도 재사용하도록 저장할까요? (y/n)"
+        return (
+            "방금 만든 도구는 현재 세션에서만 쓸 수 있습니다. 다음 세션에서도 재사용하도록 "
+            "영구 저장할까요? (y/n)"
+        )
     if action_id.startswith("persist:"):
         name = action_id.split(":", 1)[1]
-        return f"생성한 도구 '{name}'을(를) 다음 세션에서도 재사용하도록 저장할까요? (y/n)"
+        return (
+            f"생성한 도구 '{name}'은(는) 현재 세션에서만 쓸 수 있습니다. 다음 세션에서도 "
+            "재사용하도록 영구 저장할까요? (y/n)"
+        )
     if action_id == "update_persisted_tool":
         return "저장된 도구를 수정해야 합니다. 진행할까요? (y/n)"
     if action_id == "network_access":

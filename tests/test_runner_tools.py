@@ -51,7 +51,7 @@ def test_file_task_cannot_finish_after_tool_creation_without_execution(tmp_path)
         tmp_path,
         [
             '{"action":"create_tool","spec":{"name":"csv-dedupe-sort","description":"dedupe sort",'
-            '"code":"def run(input):\\n    return {\\"path\\": input[\\"output\\"]}",'
+            '"code":"def run(input):\\n    if False:\\n        open(input[\\"input\\"]).read()\\n    return {\\"path\\": input[\\"output\\"]}",'
             '"inputSchema":{"type":"object"}}}',
             (
                 '{"action":"respond","text":"csv-dedupe-sort 도구가 생성되었습니다. 이제 '
@@ -76,7 +76,8 @@ def test_file_task_cannot_finish_after_tool_creation_without_execution(tmp_path)
     assert any("실제 실행 결과가 아직 없습니다" in o for o in result.observations)
     assert any("csv-dedupe-sort" in o for o in result.observations)
     assert asks == [
-        "생성한 도구 'csv-dedupe-sort'을(를) 다음 세션에서도 재사용하도록 저장할까요? (y/n)",
+        "생성한 도구 'csv-dedupe-sort'은(는) 현재 세션에서만 쓸 수 있습니다. 다음 세션에서도 "
+        "재사용하도록 영구 저장할까요? (y/n)",
     ]
 
 
@@ -205,6 +206,12 @@ def test_vague_data_cleanup_uses_llm_ask_user_flow(tmp_path):
         tmp_path,
         [
             '{"action":"ask_user","question":"어떤 데이터를 어떻게 정리할까요?"}',
+            (
+                '{"action":"create_tool","spec":{"name":"clarified-cleanup","description":"cleanup",'
+                '"code":"def run(input):\\n    if False:\\n        open(input.get(\\"path\\", \\"events.csv\\")).read()\\n    return {\\"ok\\": True}",'
+                '"inputSchema":{"type":"object"}}}'
+            ),
+            '{"action":"call_tool","name":"clarified-cleanup","input":{"path":"events.csv"}}',
             '{"action":"finish","summary":"continued"}',
         ],
     )
@@ -302,7 +309,73 @@ def test_run_python_workspace_file_write_is_allowed(tmp_path):
     assert result.stopped_reason == "finish"
     assert result.summary == "wrote file"
     assert (ws / "out.csv").read_text() == "a,b\n"
+    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
+
+
+def test_run_python_workspace_file_write_declined_before_execution(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    asks = []
+    reg = ToolRegistry()
+    sandbox = ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    reg.register(build_run_python(sandbox))
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"call_tool","name":"runPython","input":'
+                        '{"code":"open(\\"events-clean.csv\\", \\"w\\").write(\\"x\\")"}}'
+                    ),
+                    '{"action":"finish","summary":"stopped"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        ),
+        policy=PolicyManager(ask=lambda q: asks.append(q) or "n"),
+    )
+
+    result = runner.run_turn("events.csv를 정렬해서 events-clean.csv로 저장해줘.")
+
+    assert result.summary == "stopped"
+    assert asks == ["파일 쓰기가 필요합니다. 진행할까요? (y/n)"]
+    assert not (ws / "events-clean.csv").exists()
+
+
+def test_run_python_read_only_direct_file_write_is_rejected_without_prompt(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    asks = []
+    reg = ToolRegistry()
+    reg.register(build_run_python(ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)))
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"call_tool","name":"runPython","input":'
+                        '{"code":"open(\\"events-clean.csv\\", \\"w\\").write(\\"x\\")"}}'
+                    ),
+                    '{"action":"finish","summary":"returned answer"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        ),
+        policy=PolicyManager(ask=lambda q: asks.append(q) or "y"),
+    )
+
+    result = runner.run_turn(
+        "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
+    )
+
+    assert result.summary == "returned answer"
     assert asks == []
+    assert not (ws / "events-clean.csv").exists()
+    assert any("읽기 전용 계산" in observation for observation in result.observations)
 
 
 def test_run_python_external_import_is_blocked_by_tool(tmp_path):
@@ -359,7 +432,7 @@ def test_run_python_outside_direct_write_is_blocked_by_tool(tmp_path):
 
     assert result.summary == "used writeFile"
     assert not ws.parent.joinpath("world.md").exists()
-    assert any("workspace 밖 경로 접근" in o for o in result.observations)
+    assert any("out_of_workspace" in o for o in result.observations)
 
 
 def test_run_python_dynamic_file_write_is_blocked_by_tool(tmp_path):
@@ -695,7 +768,7 @@ def test_run_python_pathlib_outside_write_is_blocked_by_tool(tmp_path):
 
     assert result.summary == "blocked"
     assert not ws.parent.joinpath("out.md").exists()
-    assert any("workspace 밖 경로 접근" in o for o in result.observations)
+    assert any("out_of_workspace" in o for o in result.observations)
 
 
 def test_cached_run_python_result_does_not_infer_write_intent(tmp_path):
@@ -1210,6 +1283,340 @@ def test_repeated_create_tool_same_name_is_steered_to_call_tool(tmp_path):
     assert ws.joinpath("out.csv").read_text() == "id,date\n1,2026-01-01\n2,2026-01-02\n"
 
 
+def test_explicit_tool_creation_request_blocks_run_python_until_tool_is_created(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("monsters.json").write_text(
+        json.dumps(
+            {
+                "monsters": [
+                    {"name": "Slime", "hp": 40, "atk": 5},
+                    {"name": "Dragon", "hp": 300, "atk": 70},
+                    {"name": "Orc", "hp": 150, "atk": 25},
+                ]
+            }
+        )
+    )
+    create = json.dumps(
+        {
+            "action": "create_tool",
+            "spec": {
+                "name": "sort-monsters-by-atk",
+                "description": "Read monsters JSON and sort monsters by attack descending.",
+                "code": (
+                    "import json\n"
+                    "def run(input):\n"
+                    "    path = input.get('path', 'monsters.json')\n"
+                    "    data = json.load(open(path))\n"
+                    "    monsters = data['monsters'] if isinstance(data, dict) else data\n"
+                    "    return sorted(monsters, key=lambda item: item['atk'], reverse=True)\n"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    )
+    runner = build(
+        tmp_path,
+        [
+            (
+                '{"action":"call_tool","name":"runPython","input":'
+                '{"code":"print(\\"should not run\\")"}}'
+            ),
+            create,
+            (
+                '{"action":"call_tool","name":"runPython","input":'
+                '{"code":"print(\\"should not run after create\\")"}}'
+            ),
+            '{"action":"call_tool","name":"sort-monsters-by-atk","input":{"path":"monsters.json"}}',
+            '{"action":"finish","summary":"Dragon, Orc, Slime"}',
+        ],
+        ask="n",
+    )
+    runner.deps.registry.register(
+        build_run_python(ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096))
+    )
+
+    result = runner.run_turn(
+        "monsters.json 을 분석하고 공격력 쎈 순으로 나열해주는 tool 을 만들어서 분석 후 결과 알려줘."
+    )
+
+    assert result.summary == "Dragon, Orc, Slime"
+    assert any("도구 생성을 명시" in observation for observation in result.observations)
+    assert not any("should not run" in observation for observation in result.observations)
+    assert any("방금 만든 generated tool" in observation for observation in result.observations)
+    assert any("sort-monsters-by-atk" in observation for observation in result.observations)
+
+
+def test_explicit_tool_creation_request_blocks_final_answer_before_tool_creation(tmp_path):
+    create = json.dumps(
+        {
+            "action": "create_tool",
+            "spec": {
+                "name": "noop-tool",
+                "description": "Return ok.",
+                "code": "def run(input):\n    return {'ok': True}",
+                "inputSchema": {"type": "object"},
+            },
+        }
+    )
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"respond","text":"done","final":true}',
+            create,
+            '{"action":"call_tool","name":"noop-tool","input":{}}',
+            '{"action":"finish","summary":"done"}',
+        ],
+        ask="n",
+    )
+
+    result = runner.run_turn("결과를 분석하는 tool 만들어서 알려줘.")
+
+    assert result.summary == "done"
+    assert any("도구 생성을 명시" in observation for observation in result.observations)
+
+
+def test_workspace_file_analysis_blocks_run_python_until_generated_tool_runs(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("monsters.json").write_text(
+        json.dumps(
+            {
+                "monsters": [
+                    {"name": "Goblin", "hp": 80},
+                    {"name": "Orc", "hp": 150},
+                    {"name": "Dragon", "hp": 300},
+                    {"name": "Wolf", "hp": 110},
+                ]
+            }
+        )
+    )
+    create = json.dumps(
+        {
+            "action": "create_tool",
+            "spec": {
+                "name": "high-hp-average",
+                "description": "Return monster names with hp >= threshold and average hp.",
+                "code": (
+                    "import json\n"
+                    "def run(input):\n"
+                    "    data = json.load(open(input.get('path', 'monsters.json')))\n"
+                    "    threshold = input.get('threshold', 100)\n"
+                    "    selected = [m for m in data['monsters'] if m['hp'] >= threshold]\n"
+                    "    avg = sum(m['hp'] for m in selected) / len(selected)\n"
+                    "    return {'names': [m['name'] for m in selected], 'averageHp': avg}\n"
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "threshold": {"type": "number"},
+                    },
+                },
+            },
+        }
+    )
+    runner = build(
+        tmp_path,
+        [
+            (
+                '{"action":"call_tool","name":"runPython","input":'
+                '{"code":"print(\\"should not run\\")"}}'
+            ),
+            create,
+            '{"action":"call_tool","name":"high-hp-average","input":{"path":"monsters.json","threshold":100}}',
+            '{"action":"finish","summary":"Orc, Dragon, Wolf 평균 hp 186.67"}',
+        ],
+        ask="n",
+    )
+    runner.deps.registry.register(
+        build_run_python(ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096))
+    )
+
+    result = runner.run_turn(
+        "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
+    )
+
+    assert result.summary == "Orc, Dragon, Wolf 평균 hp 186.67"
+    assert any("workspace 파일을 분석/변환/집계" in o for o in result.observations)
+    assert not any("should not run" in o for o in result.observations)
+    assert any("도구 high-hp-average 결과" in o for o in result.observations)
+
+
+def test_workspace_file_analysis_blocks_inline_sample_data_for_generated_tool(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("monsters.json").write_text(
+        json.dumps(
+            {
+                "monsters": [
+                    {"name": "Orc", "hp": 150},
+                    {"name": "Dragon", "hp": 300},
+                    {"name": "Wolf", "hp": 110},
+                ]
+            }
+        )
+    )
+    bad_code = (
+        "def run(input):\n"
+        "    selected = [m for m in input['monsters'] if m['hp'] >= 100]\n"
+        "    return {'names': [m['name'] for m in selected]}\n"
+    )
+    good_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open(input.get('path', 'monsters.json')))\n"
+        "    selected = [m for m in data['monsters'] if m['hp'] >= 100]\n"
+        "    return {'names': [m['name'] for m in selected]}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "high-hp-average",
+                        "description": "Filter monsters with high hp.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "high-hp-average",
+                        "description": "Filter monsters with high hp.",
+                        "code": good_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            (
+                '{"action":"call_tool","name":"high-hp-average","input":'
+                '{"monsters":[{"name":"Monster2","hp":120}]}}'
+            ),
+            '{"action":"call_tool","name":"high-hp-average","input":{"path":"monsters.json"}}',
+            '{"action":"finish","summary":"Orc, Dragon, Wolf"}',
+        ],
+        ask="n",
+    )
+
+    result = runner.run_turn(
+        "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
+    )
+
+    assert result.summary == "Orc, Dragon, Wolf"
+    assert any("임의 샘플 데이터나 추정 데이터" in o for o in result.observations)
+    assert not any(
+        "Monster2" in o and "도구 high-hp-average 결과" in o for o in result.observations
+    )
+
+
+def test_generated_tool_file_key_error_gets_direct_file_open_hint(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("monsters.json").write_text(
+        json.dumps(
+            {
+                "monsters": [
+                    {"name": "Slime", "atk": 5},
+                    {"name": "Dragon", "atk": 70},
+                ]
+            }
+        )
+    )
+    bad_code = (
+        "def run(input):\n"
+        "    if False:\n"
+        "        open('monsters.json').read()\n"
+        "    monsters = input['monsters']\n"
+        "    return sorted(monsters, key=lambda item: item['atk'], reverse=True)\n"
+    )
+    good_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open('monsters.json'))\n"
+        "    return sorted(data['monsters'], key=lambda item: item['atk'], reverse=True)\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "sort-monsters",
+                        "description": "Sort monsters by attack.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"sort-monsters","input":{}}',
+            json.dumps({"action": "update_tool", "name": "sort-monsters", "code": good_code}),
+            '{"action":"call_tool","name":"sort-monsters","input":{}}',
+            '{"action":"finish","summary":"Dragon, Slime"}',
+        ],
+        ask="n",
+    )
+
+    result = runner.run_turn("monsters.json을 atk 내림차순으로 정렬하는 tool을 만들어 실행해줘.")
+
+    assert result.summary == "Dragon, Slime"
+    assert any("workspace 파일 내용이 자동으로 주입되지 않습니다" in o for o in result.observations)
+    assert any("도구 sort-monsters 결과" in o and "Dragon" in o for o in result.observations)
+
+
+def test_repeated_update_tool_before_execution_is_steered_to_call_tool(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("monsters.json").write_text(
+        json.dumps({"monsters": [{"name": "Dragon", "atk": 70}]})
+    )
+    create = json.dumps(
+        {
+            "action": "create_tool",
+            "spec": {
+                "name": "sort-monsters",
+                "description": "Sort monsters.",
+                "code": "def run(input):\n    return input['missing']",
+                "inputSchema": {"type": "object"},
+            },
+        }
+    )
+    fixed_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open('monsters.json'))\n"
+        "    return data['monsters']\n"
+    )
+    update = json.dumps({"action": "update_tool", "name": "sort-monsters", "code": fixed_code})
+    runner = build(
+        tmp_path,
+        [
+            create,
+            '{"action":"call_tool","name":"sort-monsters","input":{}}',
+            update,
+            update,
+            '{"action":"call_tool","name":"sort-monsters","input":{}}',
+            '{"action":"finish","summary":"Dragon"}',
+        ],
+        ask="n",
+    )
+
+    result = runner.run_turn("monsters.json을 읽는 tool을 만들어 실행해줘.")
+
+    assert result.summary == "Dragon"
+    assert any("같은 update_tool을 반복하지 말고" in o for o in result.observations)
+    assert any("도구 sort-monsters 결과" in o and "Dragon" in o for o in result.observations)
+
+
 def test_csv_output_validation_retries_bad_same_date_order(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -1331,6 +1738,96 @@ def test_object_tree_final_is_blocked_until_file_is_mutated(tmp_path):
 
     assert result.summary == "world.json 저장 검증 완료: 남은 Entity 1개, 평균 health 120."
     assert any("아직 남아 있습니다" in o for o in result.observations)
+    assert "low" not in ws.joinpath("world.json").read_text()
+
+
+def test_generated_object_tree_tool_must_update_after_validation_failure(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("world.json").write_text(
+        json.dumps(
+            {
+                "root": {
+                    "id": "scene",
+                    "type": "Scene",
+                    "props": {},
+                    "children": [
+                        {"id": "low", "type": "Entity", "props": {"health": 80}, "children": []},
+                        {"id": "high", "type": "Entity", "props": {"health": 120}, "children": []},
+                    ],
+                }
+            }
+        )
+    )
+    bad_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open('world.json'))\n"
+        "    healths = []\n"
+        "    def walk(node):\n"
+        "        if node.get('type') == 'Entity' and node.get('props', {}).get('health', 0) >= 100:\n"
+        "            healths.append(node['props']['health'])\n"
+        "        for child in node.get('children', []):\n"
+        "            walk(child)\n"
+        "    walk(data['root'])\n"
+        "    json.dump(data, open('world.json', 'w'))\n"
+        "    return {'average': sum(healths) / len(healths)}\n"
+    )
+    good_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open('world.json'))\n"
+        "    def prune(node):\n"
+        "        kept = []\n"
+        "        for child in node.get('children', []):\n"
+        "            if child.get('type') == 'Entity' and child.get('props', {}).get('health', 0) < 100:\n"
+        "                continue\n"
+        "            prune(child)\n"
+        "            kept.append(child)\n"
+        "        node['children'] = kept\n"
+        "    prune(data['root'])\n"
+        "    json.dump(data, open('world.json', 'w'))\n"
+        "    saved = json.load(open('world.json'))\n"
+        "    healths = []\n"
+        "    def walk(node):\n"
+        "        if node.get('type') == 'Entity':\n"
+        "            healths.append(node['props']['health'])\n"
+        "        for child in node.get('children', []):\n"
+        "            walk(child)\n"
+        "    walk(saved['root'])\n"
+        "    return {'average': sum(healths) / len(healths)}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "filter-entities",
+                        "description": "Filter low health entities and report average.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"filter-entities","input":{}}',
+            '{"action":"finish","summary":"average health is 120"}',
+            '{"action":"call_tool","name":"filter-entities","input":{}}',
+            json.dumps({"action": "update_tool", "name": "filter-entities", "code": good_code}),
+            '{"action":"call_tool","name":"filter-entities","input":{}}',
+        ],
+        ask="n",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn(
+        "world.json에서 health가 100 미만인 Entity를 제외하고, 남은 Entity의 평균 health를 알려줘."
+    )
+
+    assert result.summary == "world.json 저장 검증 완료: 남은 Entity 1개, 평균 health 120."
+    assert any("실행 결과가 검증에 실패했습니다" in o for o in result.observations)
     assert "low" not in ws.joinpath("world.json").read_text()
 
 

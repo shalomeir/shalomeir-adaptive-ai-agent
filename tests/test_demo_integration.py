@@ -122,22 +122,25 @@ def test_d1_json_query(tmp_path: Path) -> None:
     assert "186.67" in blob
 
 
-def test_d1_live_prompt_uses_general_python_tool_path(tmp_path: Path) -> None:
+def test_d1_live_prompt_uses_generated_tool_path(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path)
     shutil.copy(DEMORSC / "data" / "monsters.json", ws / "monsters.json")
     code = (
         "import json\n"
-        "data = json.load(open('monsters.json'))\n"
-        "records = data['monsters'] if isinstance(data, dict) else data\n"
-        "selected = [m for m in records if m.get('hp', 0) >= 100]\n"
-        "avg = round(sum(m['hp'] for m in selected) / len(selected), 2)\n"
-        "print(json.dumps({'names': [m['name'] for m in selected], 'avg': avg}, ensure_ascii=False))\n"
+        "def run(input):\n"
+        "    path = input.get('path', 'monsters.json')\n"
+        "    data = json.load(open(path))\n"
+        "    records = data['monsters'] if isinstance(data, dict) else data\n"
+        "    selected = [m for m in records if m.get('hp', 0) >= 100]\n"
+        "    avg = round(sum(m['hp'] for m in selected) / len(selected), 2)\n"
+        "    return {'names': [m['name'] for m in selected], 'avg': avg}\n"
     )
     runner = _runner(
         tmp_path,
         ws,
         [
-            _call("runPython", {"code": code}),
+            _create("high-hp-monsters", code),
+            _call("high-hp-monsters", {"path": "monsters.json"}),
             _finish("Orc, Dragon, Wolf 평균 hp 186.67"),
         ],
         ask="n",
@@ -151,7 +154,7 @@ def test_d1_live_prompt_uses_general_python_tool_path(tmp_path: Path) -> None:
     assert "Dragon" in result.summary
     assert "Wolf" in result.summary
     assert "186.67" in result.summary
-    assert runner.deps.llm.calls == 2
+    assert runner.deps.llm.calls == 3
 
 
 # ---------- D2 + D5: dedup/sort, persist, reuse ----------
@@ -463,27 +466,30 @@ def test_d3_failure_then_self_fix(tmp_path: Path) -> None:
     assert "tool_update" in _log_kinds(tmp_path)
 
 
-def test_d3_live_prompt_uses_general_python_without_write_prompt(tmp_path: Path) -> None:
+def test_d3_live_prompt_uses_generated_tool_without_write_prompt(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path)
     shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
     code = (
-        "import csv, json\n"
-        "rows = list(csv.reader(open('events.csv', newline='')))[1:]\n"
-        "seen = set(); unique = []\n"
-        "for row in rows:\n"
-        "    key = tuple(row)\n"
-        "    if key not in seen:\n"
-        "        seen.add(key); unique.append(row)\n"
-        "sums = {}\n"
-        "for row in unique:\n"
-        "    sums[row[2]] = sums.get(row[2], 0) + int(row[3])\n"
-        "print(json.dumps(sums, ensure_ascii=False))\n"
+        "import csv\n"
+        "def run(input):\n"
+        "    path = input.get('path', 'events.csv')\n"
+        "    rows = list(csv.reader(open(path, newline='')))[1:]\n"
+        "    seen = set(); unique = []\n"
+        "    for row in rows:\n"
+        "        key = tuple(row)\n"
+        "        if key not in seen:\n"
+        "            seen.add(key); unique.append(row)\n"
+        "    sums = {}\n"
+        "    for row in unique:\n"
+        "        sums[row[2]] = sums.get(row[2], 0) + int(row[3])\n"
+        "    return sums\n"
     )
     runner = _runner(
         tmp_path,
         ws,
         [
-            _call("runPython", {"code": code}),
+            _create("sum-amount-by-type", code),
+            _call("sum-amount-by-type", {"path": "events.csv"}),
             _finish("purchase: 2500\nsignup: 0\nrefund: -200"),
         ],
         ask="n",
@@ -496,7 +502,7 @@ def test_d3_live_prompt_uses_general_python_without_write_prompt(tmp_path: Path)
     assert "purchase: 2500" in result.summary
     assert "signup: 0" in result.summary
     assert "refund: -200" in result.summary
-    assert runner.deps.llm.calls == 2
+    assert runner.deps.llm.calls == 3
 
 
 # ---------- D4: ambiguous request asks first, acts only after clarification ----------

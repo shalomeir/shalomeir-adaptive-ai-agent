@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 import io
 from pathlib import Path
 import json
+import queue
 import re
+import threading
 from typing import Any, Callable, Literal
 
 from .action_validation import TurnExecutionState
@@ -58,6 +60,7 @@ GENERATED_WRITE_PATH_FIELD_NAMES = frozenset(
     }
 )
 AMBIGUOUS_WRITE_PATH_FIELD_NAMES = frozenset({"dest", "destination", "output", "target"})
+UNKNOWN_DYNAMIC_WRITE_PATH = "<dynamic path>"
 FILE_WRITE_INTENT_TERMS = (
     "as a file",
     "create",
@@ -77,7 +80,54 @@ FILE_WRITE_INTENT_TERMS = (
     "작성",
     "저장",
     "출력 파일",
+    "파일에",
     "파일로",
+)
+DATA_TOOL_TASK_TERMS = (
+    "aggregate",
+    "analysis",
+    "analyze",
+    "average",
+    "clean",
+    "convert",
+    "dedupe",
+    "duplicate",
+    "extract",
+    "filter",
+    "group",
+    "parse",
+    "sort",
+    "sum",
+    "table",
+    "transform",
+    "평균",
+    "합계",
+    "집계",
+    "분석",
+    "필터",
+    "정렬",
+    "중복",
+    "정리",
+    "변환",
+    "추출",
+    "제거",
+    "제외",
+    "삭제",
+    "수정",
+    "업데이트",
+    "표",
+    "알려",
+    "구해",
+    "나열",
+    "순으로",
+    "공격력",
+    "health",
+    "hp",
+    "atk",
+    "amount",
+    "type",
+    "date",
+    "mermaid",
 )
 
 _SYSTEM = (
@@ -113,10 +163,12 @@ _SYSTEM = (
     "To process a workspace file, OPEN IT DIRECTLY inside your code by its relative name — your code "
     "runs with the workspace as the working directory. You do NOT need to readFile first or pass "
     "file contents through input for normal file processing.\n"
-    "Prefer runPython for one-off arithmetic, parsing, sorting, aggregation, and file transformation. "
-    "Create a generated tool only when the user asks for a reusable tool or when reuse is clearly useful.\n"
-    "After a runPython failure, retry with corrected runPython code unless the user asked for a reusable "
-    "tool. Do not switch to update_tool for a built-in tool.\n"
+    "Default to tool management: for workspace file/data analysis, transformation, aggregation, or "
+    "state changes, prefer create_tool/update_tool/call_tool and reuse existing generated tools when "
+    "they exactly match. Use runPython only for tiny scalar calculations, quick diagnostics, schema "
+    "inspection, or verification where creating a managed tool would add no reusable value.\n"
+    "After a generated tool failure, use update_tool to fix that generated tool and call it again. "
+    "After a runPython failure, retry with corrected runPython only when runPython was appropriate.\n"
     "When writing Python for JSON files, inspect whether the top-level value is a dict or list. If the "
     "top-level value is a dict with one relevant list field, operate on that list field. If the "
     "top-level dict contains a root node with children, treat it as an object tree and traverse "
@@ -138,6 +190,9 @@ _SYSTEM = (
     "For file output, prefer returning the computed text/data from runPython or a created tool, then "
     "call writeFile with the final relative path and content. This lets the runtime apply its file "
     "write policy. Do not write files directly inside runPython.\n"
+    "If the user explicitly asks you to make, build, create, or generate a tool, you MUST use "
+    "create_tool first, then call_tool on that created tool. Do not answer via runPython, writeFile, "
+    "or an existing tool before creating and executing the requested generated tool.\n"
     "Prefer listed built-in tools when their descriptions match the task instead of creating ad hoc "
     "code. Read-only analysis must not call writeFile.\n"
     "Use ONLY the Python standard library (json, csv, re, math, etc.) — pandas/numpy are NOT "
@@ -186,6 +241,10 @@ class _TurnLoopState:
     action_repeats: int = 0
     completed_output_paths: set[str] = field(default_factory=set)
     used_search_docs: bool = False
+    called_changed_tools: set[str] = field(default_factory=set)
+    called_generated_tools: set[str] = field(default_factory=set)
+    validation_failed_tool_indices: dict[str, int] = field(default_factory=dict)
+    last_tool_call_index: int | None = None
 
 
 _StepAction = Literal["dispatch", "continue", "break"]
@@ -721,7 +780,8 @@ class AgentRunner:
             "entity" in lowered
             and "health" in lowered
             and any(
-                term in lowered for term in ("remove", "exclude", "delete", "제거", "제외", "삭제")
+                term in lowered
+                for term in ("remove", "exclude", "delete", "제거", "제외", "제외하", "삭제")
             )
         )
 
@@ -731,14 +791,7 @@ class AgentRunner:
         if action.name != "runPython" or not self._request_needs_object_tree_mutation(request):
             return None
         code = str(action.input.get("code", ""))
-        lowered = code.lower()
-        writes_file = (
-            "json.dump" in lowered
-            or ".write_text" in lowered
-            or re.search(r"open\([^)]*,\s*['\"][wax+]", code) is not None
-            or re.search(r"open\([^)]*,[^)]*mode\s*=\s*['\"][wax+]", code) is not None
-        )
-        if writes_file:
+        if self._code_writes_workspace_file(code):
             return None
         source_path = self._likely_source_path(request, ".json") or "the JSON file"
         threshold = self._entity_health_threshold(request)
@@ -945,10 +998,28 @@ class AgentRunner:
     ) -> str | None:
         if not error:
             return None
-        if tool_name == "runPython" and "NameError: name 'json' is not defined" in error:
+        tool = self.deps.registry.get(tool_name)
+        is_generated_tool = tool is not None and tool.origin == "generated"
+        if "NameError: name 'json' is not defined" in error:
+            if is_generated_tool:
+                return (
+                    "이 실패는 json 모듈 import 누락입니다. 같은 코드를 반복하지 말고 "
+                    "update_tool로 생성 도구 코드 맨 위에 `import json`을 추가한 뒤 다시 "
+                    "call_tool로 실행하세요."
+                )
             return (
                 "이 실패는 json 모듈 import 누락입니다. 같은 코드를 반복하지 말고 코드 맨 위에 "
                 "`import json`을 추가해 runPython을 다시 실행하세요."
+            )
+        if is_generated_tool and "KeyError" in error and "input[" in error:
+            paths = self._mentioned_workspace_paths(request)
+            path_hint = f" 요청 파일: {', '.join(paths)}." if paths else ""
+            return (
+                "생성 도구의 input dict에는 call_tool payload만 들어오며, workspace 파일 내용이 "
+                "자동으로 주입되지 않습니다. update_tool로 생성 도구가 요청 파일을 직접 열도록 "
+                "고치세요. 예: json 파일은 `import json` 후 `data = json.load(open('파일명.json'))` "
+                "또는 path 입력을 받아 `json.load(open(input['path']))`로 읽으세요."
+                f"{path_hint}"
             )
         if tool_name == "runPython" and "runPython 안에서 파일을 직접 쓰려고 했습니다" in error:
             if not self._request_mentions_file_write(request):
@@ -1035,6 +1106,253 @@ class AgentRunner:
             )
         )
 
+    def _request_requires_new_tool(self, request: str) -> bool:
+        lowered = request.lower()
+        compact = re.sub(r"\s+", "", lowered)
+        if any(term in compact for term in ("기존도구", "저장된도구", "existingtool", "savedtool")):
+            return False
+        return any(
+            term in compact
+            for term in (
+                "도구를만",
+                "도구만",
+                "도구생",
+                "tool을만",
+                "tool만",
+                "tool생",
+                "makeatool",
+                "buildatool",
+                "createatool",
+                "generateatool",
+            )
+        )
+
+    def _has_created_tool_this_turn(self, state: _TurnLoopState) -> bool:
+        return bool(state.turn_state.changed_tool_names)
+
+    def _has_called_changed_tool(self, state: _TurnLoopState) -> bool:
+        changed = set(state.turn_state.changed_tool_names or [])
+        return bool(changed & state.called_changed_tools)
+
+    def _has_called_generated_tool(self, state: _TurnLoopState) -> bool:
+        return bool(state.called_generated_tools)
+
+    def _request_prefers_managed_tool(self, request: str) -> bool:
+        if self.generated is None:
+            return False
+        paths = self._mentioned_workspace_paths(request)
+        if not paths:
+            return False
+        lowered = request.lower()
+        compact = re.sub(r"\s+", "", lowered)
+        if "runpython" in lowered or "run python" in lowered:
+            return False
+        has_data_task = any(term in lowered for term in DATA_TOOL_TASK_TERMS) or any(
+            term in compact for term in DATA_TOOL_TASK_TERMS
+        )
+        if has_data_task:
+            return True
+        if len(paths) >= 2 and not self._request_mentions_file_write(request):
+            return True
+        return False
+
+    def _managed_tool_observation(self, state: _TurnLoopState) -> str:
+        existing_generated = [
+            digest.name for digest in self.deps.registry.digests() if digest.origin == "generated"
+        ]
+        existing_hint = ""
+        if existing_generated:
+            existing_hint = (
+                " 현재 등록된 generated tool 중 요청과 정확히 맞는 것이 있으면 먼저 재사용하세요: "
+                f"{', '.join(existing_generated)}."
+            )
+        return (
+            "workspace 파일을 분석/변환/집계하는 작업은 runPython으로 바로 처리하지 않습니다. "
+            "요청에 맞는 generated tool이 이미 있으면 call_tool로 재사용하고, 없으면 create_tool로 "
+            "관리형 도구를 만든 뒤 그 도구를 call_tool로 실행하세요. runPython은 작은 진단이나 "
+            f"검증에만 사용하세요.{existing_hint}"
+        )
+
+    def _blocks_managed_tool_default(self, state: _TurnLoopState) -> bool:
+        return self._request_prefers_managed_tool(
+            state.effective_request
+        ) and not self._has_called_generated_tool(state)
+
+    def _payload_mentions_any_path(self, payload: Any, paths: list[str]) -> bool:
+        if isinstance(payload, str):
+            return payload in paths
+        if isinstance(payload, dict):
+            return any(self._payload_mentions_any_path(value, paths) for value in payload.values())
+        if isinstance(payload, list):
+            return any(self._payload_mentions_any_path(value, paths) for value in payload)
+        return False
+
+    def _payload_contains_inline_dataset(self, payload: Any) -> bool:
+        if isinstance(payload, list):
+            return True
+        if isinstance(payload, dict):
+            lowered_keys = {str(key).lower() for key in payload}
+            if len(lowered_keys & {"name", "hp", "atk", "amount", "type", "date", "id"}) >= 2:
+                return True
+            return any(self._payload_contains_inline_dataset(value) for value in payload.values())
+        return False
+
+    def _generated_tool_inline_data_observation(
+        self, state: _TurnLoopState, action: CallTool
+    ) -> str | None:
+        if not self._request_prefers_managed_tool(state.effective_request):
+            return None
+        tool = self.deps.registry.get(action.name)
+        if tool is None or tool.origin != "generated":
+            return None
+        paths = self._mentioned_workspace_paths(state.effective_request)
+        if not paths or self._payload_mentions_any_path(action.input, paths):
+            return None
+        if not self._payload_contains_inline_dataset(action.input):
+            return None
+        return (
+            "요청은 workspace 파일 기준 처리입니다. call_tool input에 임의 샘플 데이터나 추정 데이터를 "
+            "넣지 마세요. 실제 파일 경로를 넘기거나 생성 도구 코드에서 "
+            f"`open('{paths[0]}')`로 workspace 파일을 직접 읽은 뒤 다시 실행하세요."
+        )
+
+    def _generated_tool_file_read_observation(
+        self, state: _TurnLoopState, name: str, code: str
+    ) -> str | None:
+        if not self._request_prefers_managed_tool(state.effective_request):
+            return None
+        lowered = code.lower()
+        file_read_markers = (
+            "open(",
+            "json.load(",
+            "csv.reader(",
+            "read_csv(",
+            "read_json(",
+            ".read_text(",
+            ".read_bytes(",
+        )
+        if any(marker in lowered for marker in file_read_markers):
+            if not self._request_needs_object_tree_mutation(state.effective_request):
+                return None
+            if self._code_writes_workspace_file(code):
+                return None
+            paths = self._mentioned_workspace_paths(state.effective_request)
+            source = paths[0] if paths else "요청 파일"
+            return (
+                f"생성 도구 {name}은(는) 상태 변경 작업용인데 코드가 {source}를 다시 저장하지 않습니다. "
+                "평균 계산만 하는 도구를 만들지 말고, 조건에 맞지 않는 node를 children에서 제거한 뒤 "
+                f"`json.dump(data, open('{source}', 'w'))` 또는 동등한 파일 쓰기로 저장하고, "
+                "저장된 파일을 다시 읽어 결과를 계산하도록 create_tool/update_tool을 다시 작성하세요. "
+                "코드는 다음 구조를 그대로 따르세요: "
+                "`import json; def run(input): data=json.load(open('"
+                f"{source}"
+                "')); def prune(node): node['children']=[child for child in node.get('children', []) "
+                "if not (child.get('type')=='Entity' and child.get('props', {}).get('health', 0) < 100)]; "
+                "[prune(child) for child in node.get('children', [])]; prune(data['root']); "
+                "json.dump(data, open('"
+                f"{source}"
+                "', 'w')); saved=json.load(open('"
+                f"{source}"
+                "')); ... saved에서 Entity health 평균 계산 후 return`."
+            )
+        paths = self._mentioned_workspace_paths(state.effective_request)
+        source = paths[0] if paths else "요청 파일"
+        return (
+            f"생성 도구 {name}은(는) workspace 파일 처리용인데 코드가 실제 파일을 읽지 않습니다. "
+            "call_tool input으로 파일 내용을 주입받는 도구를 만들지 말고, 도구 코드 안에서 "
+            f"`open('{source}')`, `json.load(open(path))`, `csv.reader(open(path))`처럼 "
+            "workspace 파일을 직접 읽도록 create_tool/update_tool을 다시 작성하세요."
+        )
+
+    def _code_writes_workspace_file(self, code: str) -> bool:
+        lowered = code.lower()
+        return (
+            "json.dump" in lowered
+            or ".write_text" in lowered
+            or ".write_bytes" in lowered
+            or re.search(r"open\([^)]*,\s*['\"][wax+]", code) is not None
+            or re.search(r"open\([^)]*,[^)]*mode\s*=\s*['\"][wax+]", code) is not None
+        )
+
+    def _explicit_tool_creation_observation(self) -> str:
+        return (
+            "사용자가 도구 생성을 명시했습니다. runPython이나 기존 도구로 바로 처리하지 말고 "
+            "create_tool로 이 요청 전용 생성 도구를 만든 뒤, 그 생성 도구를 call_tool로 실행하세요."
+        )
+
+    def _explicit_tool_call_observation(self, state: _TurnLoopState) -> str:
+        names = ", ".join(state.turn_state.changed_tool_names or [])
+        suffix = f" 생성/수정한 도구: {names}." if names else ""
+        return (
+            "사용자가 도구 생성을 명시했으므로 방금 만든 generated tool을 반드시 call_tool로 "
+            f"실행해야 합니다. runPython, writeFile, 기존 도구로 우회하지 마세요.{suffix}"
+        )
+
+    def _updated_tool_needs_execution(self, state: _TurnLoopState, name: str) -> bool:
+        if name not in (state.turn_state.changed_tool_names or []):
+            return False
+        last_change = state.turn_state.last_generated_tool_change
+        if last_change is None:
+            return False
+        return state.last_tool_call_index is None or state.last_tool_call_index < last_change
+
+    def _updated_tool_call_observation(self, name: str, request: str) -> str:
+        paths = self._mentioned_workspace_paths(request)
+        input_hint = ""
+        if paths:
+            first_path = paths[0]
+            input_hint = (
+                f" 요청 파일이 필요하면 call_tool input에 path를 넘기거나 도구 내부에서 "
+                f"`open('{first_path}')`로 직접 여세요."
+            )
+        return (
+            f"도구 {name}은(는) 이미 생성/수정했습니다. 같은 update_tool을 반복하지 말고 "
+            f"먼저 call_tool로 실행해 실제 오류 또는 결과를 확인하세요.{input_hint}"
+        )
+
+    def _tool_needs_update_after_validation_failure(self, state: _TurnLoopState, name: str) -> bool:
+        failure_index = state.validation_failed_tool_indices.get(name)
+        if failure_index is None:
+            return False
+        last_change = state.turn_state.last_generated_tool_change
+        return last_change is None or last_change <= failure_index
+
+    def _validation_failed_tool_update_observation(
+        self, state: _TurnLoopState, name: str | None = None
+    ) -> str | None:
+        failed_names = [
+            tool_name
+            for tool_name in state.validation_failed_tool_indices
+            if name is None or tool_name == name
+        ]
+        failed_names = [
+            tool_name
+            for tool_name in failed_names
+            if self._tool_needs_update_after_validation_failure(state, tool_name)
+        ]
+        if not failed_names:
+            return None
+        paths = self._mentioned_workspace_paths(state.effective_request)
+        path_hint = f" 요청 파일: {', '.join(paths)}." if paths else ""
+        return (
+            f"생성 도구 {', '.join(failed_names)}의 실행 결과가 검증에 실패했습니다. "
+            "같은 도구를 그대로 다시 call_tool 하거나 finish 하지 말고 update_tool로 코드를 수정하세요. "
+            "상태 변경 요청이면 평균 계산만 하지 말고 파일을 실제로 다시 저장한 뒤, 저장된 파일을 "
+            f"재읽어 결과를 계산해야 합니다.{path_hint}"
+        )
+
+    def _blocks_explicit_tool_creation(self, state: _TurnLoopState) -> bool:
+        return self._request_requires_new_tool(
+            state.effective_request
+        ) and not self._has_created_tool_this_turn(state)
+
+    def _blocks_explicit_tool_execution(self, state: _TurnLoopState) -> bool:
+        return (
+            self._request_requires_new_tool(state.effective_request)
+            and self._has_created_tool_this_turn(state)
+            and not self._has_called_changed_tool(state)
+        )
+
     def _generated_tool_write_path_fields(
         self, name: str, payload: dict[str, Any]
     ) -> list[tuple[str, str]]:
@@ -1109,6 +1427,20 @@ class AgentRunner:
             self._confirmed_write_paths.add(path)
         return True, None
 
+    def _gate_file_write_intent(self, name: str) -> tuple[bool, str | None]:
+        if self.policy is None:
+            return True, None
+        decision = self.policy.evaluate("write_file")
+        self.tracer.log(
+            kind="policy_decision",
+            policy=decision.decision,
+            policyReason=decision.reason,
+            toolName=name,
+        )
+        if decision.decision == "ASK_USER" and not self.policy.confirm("write_file"):
+            return False, "사용자가 작업을 거부했습니다."
+        return True, None
+
     def _gate_generated_file_write_path(self, name: str, path: str) -> tuple[bool, str | None]:
         """Generated tools may use workspace files as scratch/output, but never escape."""
         if not self._path_escapes_workspace(path):
@@ -1180,11 +1512,121 @@ class AgentRunner:
             )
         self.tracer.log(kind="tool_call", **fields)
 
+    def _run_python_direct_write_paths(self, action: CallTool) -> list[str]:
+        if action.name != "runPython" or "code" not in action.input:
+            return []
+        try:
+            tree = ast.parse(str(action.input.get("code", "")))
+        except SyntaxError:
+            return []
+        paths: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            path = self._open_write_path(node) or self._pathlib_write_path(node)
+            if path is not None and path not in paths:
+                paths.append(path)
+        return paths
+
+    def _open_write_path(self, node: ast.Call) -> str | None:
+        if not isinstance(node.func, ast.Name) or node.func.id != "open":
+            return None
+        if not node.args:
+            return None
+        mode = "r"
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            mode_value = node.args[1].value
+            if isinstance(mode_value, str):
+                mode = mode_value
+        for keyword in node.keywords:
+            if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                mode_value = keyword.value.value
+                if isinstance(mode_value, str):
+                    mode = mode_value
+        if not any(flag in mode for flag in ("w", "a", "x", "+")):
+            return None
+        path_arg = node.args[0]
+        if isinstance(path_arg, ast.Constant) and isinstance(path_arg.value, str):
+            return path_arg.value
+        return UNKNOWN_DYNAMIC_WRITE_PATH
+
+    def _pathlib_write_path(self, node: ast.Call) -> str | None:
+        if not isinstance(node.func, ast.Attribute):
+            return None
+        if node.func.attr not in {
+            "write_text",
+            "write_bytes",
+            "touch",
+            "mkdir",
+            "unlink",
+            "rename",
+        }:
+            return None
+        value = node.func.value
+        if isinstance(value, ast.Call):
+            return self._path_constructor_arg(value)
+        return UNKNOWN_DYNAMIC_WRITE_PATH
+
+    def _path_constructor_arg(self, node: ast.Call) -> str:
+        if not node.args:
+            return UNKNOWN_DYNAMIC_WRITE_PATH
+        if isinstance(node.func, ast.Name) and node.func.id == "Path":
+            return self._path_arg_label(node.args[0])
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "Path"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "pathlib"
+        ):
+            return self._path_arg_label(node.args[0])
+        return UNKNOWN_DYNAMIC_WRITE_PATH
+
+    def _path_arg_label(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        return UNKNOWN_DYNAMIC_WRITE_PATH
+
+    def _gate_run_python_direct_writes(
+        self, request: str, action: CallTool
+    ) -> tuple[bool, str | None]:
+        paths = self._run_python_direct_write_paths(action)
+        if not paths:
+            return True, None
+        for path in paths:
+            if path != UNKNOWN_DYNAMIC_WRITE_PATH and self._path_escapes_workspace(path):
+                return self._gate_file_write_path(action.name, path)
+        if not (
+            self._request_mentions_file_write(request)
+            or self._request_needs_object_tree_mutation(request)
+        ):
+            return (
+                False,
+                "현재 요청은 저장/수정 요청이 아닌 읽기 전용 계산입니다. runPython에서 파일을 "
+                "직접 쓰지 말고 입력 파일을 읽어 최종 계산 결과만 stdout으로 출력하세요.",
+            )
+        for path in paths:
+            if path == UNKNOWN_DYNAMIC_WRITE_PATH:
+                allowed, blocked = self._gate_file_write_intent(action.name)
+            else:
+                allowed, blocked = self._gate_file_write_path(action.name, path)
+            if not allowed:
+                return allowed, blocked
+        return True, None
+
     def _plan_raw(self) -> str:
         with self.tracer.span():
             digests = self.deps.registry.digests()
             self.tracer.log(kind="llm_call_start", model=getattr(self.deps.llm, "model", None))
-            raw = self.deps.llm.chat(self.conv.messages(), digests)
+            try:
+                raw = self._chat_with_deadline(digests)
+            except Exception as exc:
+                self.tracer.log(
+                    kind="error",
+                    errorKind="llm_call_failed",
+                    message=f"{type(exc).__name__}: {exc}",
+                    model=getattr(self.deps.llm, "model", None),
+                )
+                raise
             preview, truncated = _preview_text(raw)
             self.tracer.log(
                 kind="llm_call",
@@ -1194,6 +1636,32 @@ class AgentRunner:
                 responseTruncated=truncated,
             )
             return raw
+
+    def _chat_with_deadline(self, digests: list[Any]) -> str:
+        timeout = getattr(self.deps.llm, "timeout", None)
+        if timeout is None:
+            return self.deps.llm.chat(self.conv.messages(), digests)
+        timeout_sec = float(timeout)
+        result_queue: queue.Queue[tuple[str, str | Exception]] = queue.Queue(maxsize=1)
+        messages = self.conv.messages()
+
+        def call_llm() -> None:
+            try:
+                result_queue.put(("ok", self.deps.llm.chat(messages, digests)))
+            except Exception as exc:
+                result_queue.put(("error", exc))
+
+        thread = threading.Thread(target=call_llm, daemon=True)
+        thread.start()
+        thread.join(timeout_sec)
+        if thread.is_alive():
+            raise TimeoutError(f"LLM 호출이 {timeout_sec:g}초 안에 응답하지 않았습니다.")
+        status, value = result_queue.get_nowait()
+        if status == "error":
+            assert isinstance(value, Exception)
+            raise value
+        assert isinstance(value, str)
+        return value
 
     def _gate(self, name: str, payload: dict[str, Any]) -> tuple[bool, str | None]:
         """Consult the policy before a side-effecting tool call.
@@ -1220,7 +1688,12 @@ class AgentRunner:
                 return state.result
 
             for _ in range(self.deps.max_iterations):
-                raw = self._plan_raw()
+                try:
+                    raw = self._plan_raw()
+                except Exception as exc:
+                    state.result.summary = self._llm_error_summary(exc)
+                    state.result.stopped_reason = "llm_error"
+                    break
                 parsed = parse_action_text(raw)
                 if not parsed.ok or parsed.action is None:
                     step = self._handle_parse_failure(state, parsed.error)
@@ -1247,6 +1720,14 @@ class AgentRunner:
 
             self._finish_turn(state.result)
         return state.result
+
+    def _llm_error_summary(self, exc: Exception) -> str:
+        if isinstance(exc, TimeoutError):
+            return (
+                "모델 응답이 제한 시간 안에 돌아오지 않아 중단했습니다. "
+                "다시 시도하거나 AGENT_LLM_TIMEOUT_SEC 값을 조정하세요."
+            )
+        return f"모델 호출 실패로 중단했습니다: {type(exc).__name__}: {exc}"
 
     def _start_turn(self, request: str) -> _TurnLoopState:
         self.tracer.log(kind="turn_start")
@@ -1291,6 +1772,7 @@ class AgentRunner:
             isinstance(action, CallTool)
             and sig is not None
             and sig in self._tool_result_cache
+            and not self._tool_needs_update_after_validation_failure(state, action.name)
             and state.action_repeats > self.deps.max_fix_retries
         ):
             cached = self._tool_result_cache[sig]
@@ -1302,6 +1784,7 @@ class AgentRunner:
             isinstance(action, CallTool)
             and sig is not None
             and sig in self._tool_result_cache
+            and not self._tool_needs_update_after_validation_failure(state, action.name)
             and state.action_repeats > 0
         ):
             cached = self._tool_result_cache[sig]
@@ -1345,11 +1828,23 @@ class AgentRunner:
         return state.turn_state.terminal_block_observation()
 
     def _handle_finish_action(self, state: _TurnLoopState, action: Finish) -> _StepAction:
+        if self._blocks_explicit_tool_creation(state):
+            self._append_observation(state, self._explicit_tool_creation_observation())
+            return "continue"
+        if self._blocks_explicit_tool_execution(state):
+            self._append_observation(state, self._explicit_tool_call_observation(state))
+            return "continue"
+        if validation_failed := self._validation_failed_tool_update_observation(state):
+            self._append_observation(state, validation_failed)
+            return "continue"
         if validation := self._terminal_validation_observation(state):
             self._append_observation(state, validation)
             return "continue"
         if terminal_block := self._terminal_block(state):
             self._append_observation(state, terminal_block)
+            return "continue"
+        if self._blocks_managed_tool_default(state):
+            self._append_observation(state, self._managed_tool_observation(state))
             return "continue"
         state.result.summary = action.summary or ""
         state.result.stopped_reason = "finish"
@@ -1358,6 +1853,15 @@ class AgentRunner:
     def _handle_respond_action(self, state: _TurnLoopState, action: Respond) -> _StepAction:
         respond_is_final = action.final is not False
         if respond_is_final:
+            if self._blocks_explicit_tool_creation(state):
+                self._append_observation(state, self._explicit_tool_creation_observation())
+                return "continue"
+            if self._blocks_explicit_tool_execution(state):
+                self._append_observation(state, self._explicit_tool_call_observation(state))
+                return "continue"
+            if validation_failed := self._validation_failed_tool_update_observation(state):
+                self._append_observation(state, validation_failed)
+                return "continue"
             repeated_request = self._repeated_actionable_request_observation(
                 action.text, state.effective_request
             )
@@ -1369,6 +1873,9 @@ class AgentRunner:
                 return "continue"
             if terminal_block := self._terminal_block(state):
                 self._append_observation(state, terminal_block)
+                return "continue"
+            if self._blocks_managed_tool_default(state):
+                self._append_observation(state, self._managed_tool_observation(state))
                 return "continue"
 
         self.conv.add_assistant(action.text)
@@ -1407,6 +1914,44 @@ class AgentRunner:
     def _handle_call_tool_action(
         self, state: _TurnLoopState, action: CallTool, sig: str | None
     ) -> _StepAction:
+        if self._blocks_explicit_tool_creation(state) and action.name not in {
+            "readFile",
+            "listFiles",
+            "searchDocs",
+            "askUser",
+        }:
+            self._append_observation(state, self._explicit_tool_creation_observation())
+            return "continue"
+
+        if self._blocks_explicit_tool_execution(state) and action.name not in {
+            *(state.turn_state.changed_tool_names or []),
+            "readFile",
+            "listFiles",
+            "searchDocs",
+            "askUser",
+        }:
+            self._append_observation(state, self._explicit_tool_call_observation(state))
+            return "continue"
+
+        if (
+            action.name == "runPython"
+            and self._blocks_managed_tool_default(state)
+            and not self._request_requires_new_tool(state.effective_request)
+        ):
+            self._append_observation(state, self._managed_tool_observation(state))
+            return "continue"
+
+        if validation_failed := self._validation_failed_tool_update_observation(state, action.name):
+            self._append_observation(state, validation_failed)
+            return "continue"
+
+        inline_data_block = self._generated_tool_inline_data_observation(state, action)
+        if inline_data_block is not None:
+            state.turn_state.record_tool_call(action.name, False)
+            state.last_tool_call_index = state.turn_state.action_index
+            self._append_observation(state, inline_data_block)
+            return "continue"
+
         generated_write_fields = self._generated_tool_write_path_fields(action.name, action.input)
         for _, path in generated_write_fields:
             allowed, blocked = self._gate_generated_file_write_path(action.name, path)
@@ -1431,6 +1976,13 @@ class AgentRunner:
                 "계산 결과를 최종 답변으로 반환하세요.",
             )
             return "continue"
+
+        if action.name == "runPython":
+            allowed, blocked = self._gate_run_python_direct_writes(state.effective_request, action)
+            if not allowed:
+                assert blocked is not None
+                self._append_observation(state, blocked)
+                return "continue"
 
         if (
             action.name != "searchDocs"
@@ -1492,6 +2044,17 @@ class AgentRunner:
                 observation = f"{observation}\n{recovery_hint}"
 
         state.turn_state.record_tool_call(action.name, res.ok)
+        state.last_tool_call_index = state.turn_state.action_index
+        called_tool = self.deps.registry.get(action.name)
+        if (
+            res.ok
+            and called_tool is not None
+            and called_tool.origin == "generated"
+            and action.name in (state.turn_state.changed_tool_names or [])
+        ):
+            state.called_changed_tools.add(action.name)
+        if res.ok and called_tool is not None and called_tool.origin == "generated":
+            state.called_generated_tools.add(action.name)
         self._append_observation(state, observation)
         if not res.ok and state.fix_failures > self.deps.max_fix_retries:
             self._append_observation(state, "연속 실패가 한계를 넘었습니다. 작업을 중단합니다.")
@@ -1520,9 +2083,24 @@ class AgentRunner:
                     state.result.summary = message
                     state.result.stopped_reason = "finish"
                     return "break"
+                if called_tool is not None and called_tool.origin == "generated":
+                    state.validation_failed_tool_indices[action.name] = (
+                        state.turn_state.action_index
+                    )
+                    update_hint = self._validation_failed_tool_update_observation(
+                        state, action.name
+                    )
+                    if update_hint is not None:
+                        self._append_observation(state, update_hint)
         return "continue"
 
     def _handle_create_tool_action(self, state: _TurnLoopState, action: CreateTool) -> _StepAction:
+        file_read_block = self._generated_tool_file_read_observation(
+            state, action.spec.name, action.spec.code
+        )
+        if file_read_block is not None:
+            self._append_observation(state, file_read_block)
+            return "continue"
         if (
             state.turn_state.changed_tool_names is not None
             and action.spec.name in state.turn_state.changed_tool_names
@@ -1538,13 +2116,27 @@ class AgentRunner:
             action, state.effective_request
         )
         state.turn_state.record_tool_change(action.spec.name)
+        state.validation_failed_tool_indices.pop(action.spec.name, None)
         self._append_observation(state, observation)
         return "continue"
 
     def _handle_update_tool_action(self, state: _TurnLoopState, action: UpdateTool) -> _StepAction:
+        file_read_block = self._generated_tool_file_read_observation(
+            state, action.name, action.code
+        )
+        if file_read_block is not None:
+            self._append_observation(state, file_read_block)
+            return "continue"
+        if self._updated_tool_needs_execution(state, action.name):
+            self._append_observation(
+                state,
+                self._updated_tool_call_observation(action.name, state.effective_request),
+            )
+            return "continue"
         self._tool_result_cache.clear()
         observation = self._handle_update(action)
         state.turn_state.record_tool_change(action.name)
+        state.validation_failed_tool_indices.pop(action.name, None)
         self._append_observation(state, observation)
         return "continue"
 

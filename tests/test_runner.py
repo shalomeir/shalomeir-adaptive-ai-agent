@@ -1,3 +1,5 @@
+import time
+
 from adaptive_agent.runner import NON_INTERACTIVE_ASK, AgentRunner, RunnerDeps, _SYSTEM
 from adaptive_agent.llm import FakeLLMClient
 from adaptive_agent.schemas import Message, ToolDigest
@@ -46,6 +48,17 @@ class RecordingLLM:
         return self.reply
 
 
+class HangingLLM:
+    def __init__(self) -> None:
+        self.timeout = 0.05
+        self.calls = 0
+
+    def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str:
+        self.calls += 1
+        time.sleep(1)
+        return '{"action":"finish","summary":"too late"}'
+
+
 def test_respond_then_finish(tmp_path):
     runner = build_runner(
         tmp_path,
@@ -56,6 +69,29 @@ def test_respond_then_finish(tmp_path):
     )
     result = runner.run_turn("start task")
     assert "done" in result.summary
+
+
+def test_llm_call_timeout_returns_user_visible_result(tmp_path):
+    llm = HangingLLM()
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=ToolRegistry(),
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+            max_iterations=3,
+        )
+    )
+
+    started = time.monotonic()
+    result = runner.run_turn("멈추지 말고 끝내줘")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert result.stopped_reason == "llm_error"
+    assert "모델 응답이 제한 시간 안에 돌아오지 않아" in result.summary
+    assert llm.calls == 1
+    assert any(event.get("errorKind") == "llm_call_failed" for event in read_log_events(runner))
 
 
 def test_respond_without_final_finishes_immediately(tmp_path):

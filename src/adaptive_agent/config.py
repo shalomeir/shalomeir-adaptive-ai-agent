@@ -15,7 +15,7 @@ class AgentConfig(BaseModel):
     max_iterations: int = Field(default=20, ge=1)
     max_fix_retries: int = Field(default=3, ge=0)
     tool_timeout_sec: float = Field(default=20, gt=0)
-    llm_timeout_sec: float = Field(default=180, gt=0)
+    llm_timeout_sec: float = Field(default=60, gt=0)
     max_output_bytes: int = Field(default=65536, ge=1)
     compaction_token_threshold: int = Field(default=12000, ge=1)
     workspace_dir: str = "./workspace"

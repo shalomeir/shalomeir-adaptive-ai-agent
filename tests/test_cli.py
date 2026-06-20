@@ -46,6 +46,12 @@ def test_chat_renders_clarification_as_dialogue(monkeypatch, tmp_path):
         monkeypatch,
         [
             '{"action":"ask_user","question":"어떤 데이터를 어떻게 정리할까요?"}',
+            (
+                '{"action":"create_tool","spec":{"name":"clarified-cleanup","description":"cleanup",'
+                '"code":"def run(input):\\n    if False:\\n        open(input.get(\\"path\\", \\"events.csv\\")).read()\\n    return {\\"ok\\": True}",'
+                '"inputSchema":{"type":"object"}}}'
+            ),
+            '{"action":"call_tool","name":"clarified-cleanup","input":{"path":"events.csv"}}',
             '{"action":"finish","summary":"알겠습니다."}',
         ],
     )
@@ -172,6 +178,7 @@ def test_chat_exit_at_policy_confirmation_does_not_hide_completed_summary(monkey
                 '"code":"def run(input):\\n    return {\\"ok\\": True}",'
                 '"inputSchema":{"type":"object"}}}'
             ),
+            '{"action":"call_tool","name":"noop","input":{}}',
             '{"action":"finish","summary":"완료했습니다."}',
         ],
     )
@@ -179,10 +186,8 @@ def test_chat_exit_at_policy_confirmation_does_not_hide_completed_summary(monkey
     result = CliRunner().invoke(app, ["chat"], input="도구 만들어줘\nexit\n")
 
     assert result.exit_code == 0
-    assert (
-        "agent: 생성한 도구 'noop'을(를) 다음 세션에서도 재사용하도록 저장할까요? (y/n)"
-        in result.stdout
-    )
+    assert "agent: 생성한 도구 'noop'은(는) 현재 세션에서만 쓸 수 있습니다." in result.stdout
+    assert "재사용하도록 영구 저장할까요? (y/n)" in result.stdout
     assert "agent: 완료했습니다." in result.stdout
 
 
