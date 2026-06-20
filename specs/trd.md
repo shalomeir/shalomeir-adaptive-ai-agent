@@ -27,7 +27,8 @@
 ## 3. 언어와 런타임
 
 - 언어: Python 3.11 이상.
-- 동시성: 표준 `asyncio`.
+- 동시성: 핵심 루프는 동기 순차 실행이다. LLM timeout 감시와 CLI loading 표시는 표준
+  `threading`을 사용한다.
 - 패키징: `pyproject.toml` 기반. 개발 환경은 `uv`로 잡는 것을 권장한다.
 
 ## 4. 의존성 정책
@@ -49,7 +50,8 @@
 | typer | CLI 프레임 | 타입 힌트 기반으로 명령과 인자를 간결하게 정의. 대안 argparse는 보일러플레이트가 많다 |
 | rich | 사람이 읽는 진행 출력 | 패널, 테이블, 스트리밍 로그, progress. CLI 가독성의 핵심 |
 | pydantic v2 | 데이터 모델과 검증 | action, 도구 manifest, 설정, 로그 이벤트를 모델로 정의하고 검증. JSON schema도 여기서 뽑는다 |
-| httpx | LLM HTTP 호출 | OpenAI 호환 엔드포인트를 직접 호출한다. async 지원. 특정 벤더 SDK에 묶이지 않아 provider 비종속과 순수 구현 목표에 맞는다 |
+| httpx | LLM HTTP 호출 | OpenAI 호환 엔드포인트를 동기 `POST`로 직접 호출한다. 특정 벤더 SDK에 묶이지 않아 provider 비종속과 순수 구현 목표에 맞는다 |
+| python-dotenv | `.env` 로딩 | CLI 진입점에서 로컬 `.env`를 읽어 환경 변수 기반 설정을 쉽게 시작할 수 있게 한다 |
 
 표준 라이브러리로 처리하는 부분: `subprocess`, `json`, `pathlib`, `logging`, `dataclasses` 보조.
 
@@ -59,39 +61,42 @@
 
 | 라이브러리 | extra | 용도 |
 | --- | --- | --- |
-| mcp | `mcp` | 도구를 MCP 프로토콜로 노출하거나 외부 MCP 서버의 도구를 가져와 쓴다. 7절 참고 |
+| mcp | `mcp` | 향후 MCP 도구 연동을 위한 선택 의존성. 현재 MVP 핵심 경로에는 연결하지 않는다 |
 | langfuse | `monitoring` | 외부 관측 익스포터. trace, span, generation, score로 내보낸다 |
 | structlog | 기본 포함 검토 | 구조화 로그를 JSONL로 남긴다. 표준 logging + 커스텀 JSON formatter로 대체 가능 |
-| pydantic-settings, python-dotenv | 기본 포함 검토 | 환경 변수와 `.env` 기반 설정. pydantic 생태계라 모델과 일관 |
+| pydantic-settings | 기본 포함 검토 | 현재는 `os.environ`과 pydantic 모델로 충분하다. 설정이 복잡해질 때 검토한다 |
 
 ### 5.3 개발 (dev)
 
 | 라이브러리 | 용도 |
 | --- | --- |
-| pytest, pytest-asyncio | 단위·통합 테스트, async 테스트 |
+| pytest, pytest-asyncio | 단위·통합 테스트. 현재 핵심 테스트는 동기 경로 중심이며, async 플러그인은 개발 의존성으로 남아 있다 |
 | ruff | 린트와 포맷 |
 | mypy 또는 pyright | 정적 타입 검사 |
 
-## 6. 비동기 방침
+## 6. 실행 방침
 
-`asyncio`를 쓰는 이유는 분명한 곳에 한정한다.
+핵심 제어 루프는 순차적으로 읽히는 동기 코드로 둔다.
 
-- LLM 호출은 네트워크 IO다. 비동기로 두면 출력 스트리밍과 비차단 처리가 자연스럽다.
-- 관측 익스포터를 비차단으로 돌려 핵심 경로를 막지 않게 한다.
-- 향후 작업 목록 위임이나 병렬 도구 실행을 얹을 여지를 남긴다.
+- LLM 호출은 `httpx.post`를 사용하고, runner는 별도 thread에서 호출을 감시해 설정된 timeout을 넘으면 중단한다.
+- 생성 도구와 `runPython`은 `subprocess.run`으로 실행하고 timeout, cwd, 환경 변수 allowlist, 출력 제한을 적용한다.
+- 관측 익스포터 실패는 삼켜 핵심 경로를 막지 않는다.
+- 향후 스트리밍 출력, 병렬 도구 실행, 작업 목록 위임이 필요해지면 그때 `asyncio` 도입을 재검토한다.
 
-제어 루프 자체는 순차적으로 읽히게 둔다. 비동기를 남용해 흐름을 흐리지 않는다. subprocess 실행은 `asyncio.create_subprocess_exec`로 감싸 timeout과 함께 다룬다.
+비동기를 미리 깔지 않는 이유는 runner의 action dispatch와 실패 복구 흐름을 코드에서 바로 읽히게 하기 위해서다.
 
 ## 7. MCP 통합
 
-MCP는 도구를 주고받는 프로토콜로만 쓴다. 제어 루프를 대신하지 않는다. 핵심 루프는 MCP 없이도 완결한다.
+MCP는 도구를 주고받는 프로토콜로만 쓴다. 제어 루프를 대신하지 않는다. 현재 구현의 핵심
+루프는 MCP 없이 완결하며, `mcp` extra는 향후 확장용으로만 둔다.
 
 두 방향을 둔다.
 
 - 도구 제공자로서: 내장 도구와 저장된 skill을 MCP 서버로 노출해, 외부 클라이언트가 이 에이전트의 도구를 쓸 수 있게 한다.
 - 도구 소비자로서: 외부 MCP 서버를 마운트해 그 서버의 도구를 레지스트리에 추가 도구로 등록한다.
 
-레지스트리는 도구의 출처(내장, 생성, MCP)를 구분하되, 제어 루프에는 동일한 도구 인터페이스로 보이게 한다. MCP는 선택 extra로 두며, MVP에서는 소비자 방향 한 개 시나리오만 검증하고 제공자 방향은 stretch로 둔다.
+레지스트리는 도구의 출처(내장, 생성, MCP)를 구분할 수 있는 필드를 갖지만, 현재 테스트된
+경로는 내장 도구와 생성 도구다. MCP 소비자/제공자 연결은 stretch로 둔다.
 
 ## 8. 데이터 모델 (pydantic 적용 지점)
 
@@ -149,7 +154,7 @@ MCP는 도구를 주고받는 프로토콜로만 쓴다. 제어 루프를 대신
 
 ## 14. 의존성 요약
 
-- 필수: typer, rich, pydantic, httpx
-- 선택: mcp(`mcp`), langfuse(`monitoring`), structlog, pydantic-settings, python-dotenv
+- 필수: typer, rich, pydantic, httpx, python-dotenv
+- 선택: mcp(`mcp`), langfuse(`monitoring`), structlog, pydantic-settings
 - 개발: pytest, pytest-asyncio, ruff, mypy 또는 pyright
-- 표준 라이브러리 중심: asyncio, subprocess, resource, json, pathlib, logging
+- 표준 라이브러리 중심: subprocess, threading, json, pathlib, dataclasses

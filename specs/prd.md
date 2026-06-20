@@ -1,7 +1,7 @@
 # PRD — Adaptive Tool-Building CLI Agent
 
 작성일: 2026-06-01
-상태: 설계 확정, 구현 착수 전
+상태: 구현 완료 후 지속 관리
 
 ## 1. 개요
 
@@ -38,7 +38,8 @@
 ### 기능 요구사항
 
 - F1. 에이전트가 문제를 분석해 필요한 도구를 직접 생성하고 실행한다.
-- F2. 내장 도구를 갖춘다. 파일 읽기·쓰기·목록, 제한된 Python 실행, 도구 생성·수정, 문서·스키마 조회, 사용자 질문.
+- F2. 내장 도구를 갖춘다. 파일 읽기·쓰기·목록, 제한된 Python 실행, 문서·스키마 조회, 사용자 질문.
+  도구 생성·수정은 내장 도구 호출이 아니라 `create_tool`/`update_tool` action으로 처리한다.
 - F3. 실행 실패 시 오류를 분석해 도구 코드를 고치고 다시 실행한다.
 - F4. 대화 컨텍스트를 유지하고, 길어지면 핵심을 보존하며 요약으로 접는다.
 - F5. 모호한 요청에는 실행 전에 사용자에게 추가 정보를 묻는다.
@@ -52,7 +53,8 @@
 - N2. 무한 루프와 비용 폭주를 막는다. 최대 반복과 재시도 상한.
 - N3. provider 비종속 LLM 접근. 키 없이 돌릴 수 있는 로컬 경로를 1순위로 안내.
 - N4. 약한 모델과 로컬 모델에서도 견디는 출력 파싱.
-- N5. 입력의 앞부분을 안정적으로 유지해 캐시 적중을 높인다.
+- N5. 입력의 앞부분을 가능한 한 안정적으로 유지한다. 현재 구현은 도구 전체 코드 대신 compact
+  digest만 넣지만, generated tool inventory가 바뀌면 system message도 바뀔 수 있다.
 - N6. 공개 산출물 어디에도 작업 배경이나 출처를 드러내지 않는다.
 
 ## 5. 제약사항
@@ -96,13 +98,12 @@
 남기는 필드(예):
 
 - trace id, span id, parent span id
-- 이벤트 종류: llm_call, tool_call, tool_create, tool_update, verify, ask_user, policy_decision
-- 타임스탬프와 소요 시간
-- LLM 호출이면 model, 입력·출력 토큰 수, 캐시 적중 여부, action 종류, 파싱 성공 여부와 재시도 횟수
+- 이벤트 종류: turn_start, llm_call_start, llm_call, tool_call, tool_create, tool_update, policy_decision, error
+- 타임스탬프와 trace/span id
+- LLM 호출이면 model, 응답 preview, action 종류, 파싱 성공 여부
 - 도구 실행이면 도구 이름, 성공 여부, 입력 preview, 출력 또는 오류 preview, 전체 글자 수, 잘림 여부
 - 권한 결정이면 ALLOW, DENY, ASK_USER 중 무엇이었는지와 사유
-- 검증이면 통과 여부와 실패 사유
-- 자가수정이면 몇 번째 수정 시도인지
+- 검증 결과와 자가수정 힌트는 별도 verify 이벤트가 아니라 observation과 tool/error 로그로 남긴다.
 - 오류면 종류와 메시지 요약
 
 민감 정보와 비밀 값은 로그에 남기지 않는다. 큰 출력은 잘라 저장한다.
@@ -134,7 +135,8 @@
 1. provider 비종속 LLM 클라이언트. 로컬 OpenAI 호환과 호스팅을 환경 변수로 교체.
 2. 직접 구현한 제어 루프와 종료 조건, 반복 상한.
 3. JSON action 프로토콜. repair, schema 검증, 재요청.
-4. 내장 도구: 파일 읽기·쓰기·목록, 제한된 Python 실행, 도구 생성·수정, 문서·스키마 조회, 사용자 질문.
+4. 내장 도구: 파일 읽기·쓰기·목록, 제한된 Python 실행, 문서·스키마 조회, 사용자 질문.
+   도구 생성·수정은 `create_tool`/`update_tool` action으로 처리.
 5. 격리 실행 sandbox: subprocess, timeout, 경로 제한, 네트워크 차단, 출력 제한.
 6. 자가수정 폐루프.
 7. 권한 게이트와 모호성 질문.

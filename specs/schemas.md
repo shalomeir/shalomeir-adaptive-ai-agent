@@ -7,7 +7,7 @@
 | 버전 | 날짜 | 변경 내용 |
 | --- | --- | --- |
 | 0.1 | 2026-06-01 | 최초 작성. action 프로토콜, 내장 도구 입출력, ToolSpec, manifest, 로그 이벤트, 설정 스키마 정의 |
-| 0.2 | 2026-06-08 | 전용 데이터 데모 내장 도구 계약 제거. 일반 `runPython`/생성 도구 경로 유지 |
+| 0.2 | 2026-06-08 | 전용 데이터 데모용 도구 제거. 일반 `runPython`/생성 도구 경로 유지 | API Model 지원 다변화
 
 ## 0. 규약
 
@@ -32,10 +32,6 @@
     "action": {
       "type": "string",
       "enum": ["respond", "ask_user", "call_tool", "create_tool", "update_tool", "finish"]
-    },
-    "thought": {
-      "type": "string",
-      "description": "선택. 다음 행동을 고른 짧은 근거. 로그용이며 사용자 출력에는 쓰지 않을 수 있다."
     }
   },
   "oneOf": [
@@ -124,7 +120,7 @@
 class Respond(BaseModel):
     action: Literal["respond"]
     text: str
-    final: bool = False
+    final: bool | None = None
 
 class AskUser(BaseModel):
     action: Literal["ask_user"]
@@ -159,7 +155,8 @@ AgentAction = Annotated[
 
 ## 2. ToolSpec (공유 도구 정의)
 
-도구 생성은 `create_tool` action으로도, `createTool` 내장 도구 호출로도 표현된다. 둘은 같은 ToolSpec을 쓴다.
+도구 생성은 `create_tool` action으로 표현한다. `ToolSpec`은 생성 도구의 이름, 설명, 코드,
+entrypoint, 입출력 스키마를 담는 공유 계약이다.
 
 ```json
 {
@@ -235,8 +232,7 @@ def run(input: dict) -> dict:
 { "input": { "type": "object",
     "properties": { "code": { "type": "string" }, "file": { "type": "string" },
       "args": { "type": "array", "items": { "type": "string" } },
-      "stdin": { "type": "string" },
-      "timeoutSec": { "type": "number", "minimum": 0.1, "default": 20 } },
+      "stdin": { "type": "string" } },
     "oneOf": [ { "required": ["code"] }, { "required": ["file"] } ],
     "additionalProperties": false },
   "output": { "type": "object", "required": ["stdout", "stderr", "exitCode", "timedOut", "truncated"],
@@ -245,31 +241,7 @@ def run(input: dict) -> dict:
       "truncated": { "type": "boolean" } } } }
 ```
 
-### 3.5 createTool
-
-입력은 2절 ToolSpec과 같다.
-
-```json
-{ "input": { "$ref": "ToolSpec" },
-  "output": { "type": "object", "required": ["name", "path", "registered"],
-    "properties": { "name": { "type": "string" }, "path": { "type": "string" },
-      "registered": { "type": "boolean" },
-      "trustedStatus": { "type": "string", "enum": ["untrusted", "session", "persisted"] } } } }
-```
-
-### 3.6 updateTool
-
-```json
-{ "input": { "type": "object", "required": ["name", "code"],
-    "properties": { "name": { "type": "string" }, "code": { "type": "string" },
-      "reason": { "type": "string" } },
-    "additionalProperties": false },
-  "output": { "type": "object", "required": ["name", "version", "updated"],
-    "properties": { "name": { "type": "string" }, "version": { "type": "integer" },
-      "updated": { "type": "boolean" } } } }
-```
-
-### 3.7 searchDocs
+### 3.5 searchDocs
 
 ```json
 { "input": { "type": "object", "required": ["query"],
@@ -284,7 +256,7 @@ def run(input: dict) -> dict:
         "snippet": { "type": "string" }, "score": { "type": "number" } } } } } } }
 ```
 
-### 3.8 askUser
+### 3.6 askUser
 
 ```json
 { "input": { "type": "object", "required": ["question"],
@@ -350,8 +322,8 @@ JSONL 한 줄이 한 이벤트다.
     "spanId": { "type": "string" },
     "parentSpanId": { "type": ["string", "null"] },
     "kind": { "type": "string",
-      "enum": ["llm_call", "tool_call", "tool_create", "tool_update",
-               "verify", "ask_user", "policy_decision", "error"] },
+      "enum": ["turn_start", "llm_call_start", "llm_call", "tool_call", "tool_create",
+               "tool_update", "policy_decision", "error"] },
     "durationMs": { "type": ["number", "null"] },
     "model": { "type": ["string", "null"] },
     "inputTokens": { "type": ["integer", "null"] },
@@ -424,6 +396,7 @@ JSONL 한 줄이 한 이벤트다.
     "maxIterations": { "type": "integer", "minimum": 1, "default": 20 },
     "maxFixRetries": { "type": "integer", "minimum": 0, "default": 3 },
     "toolTimeoutSec": { "type": "number", "minimum": 0.1, "default": 20 },
+    "llmTimeoutSec": { "type": "number", "minimum": 0.1, "default": 60 },
     "maxOutputBytes": { "type": "integer", "minimum": 1, "default": 65536 },
     "compactionTokenThreshold": { "type": "integer", "minimum": 1, "default": 12000 },
     "workspaceDir": { "type": "string", "default": "./workspace" },
