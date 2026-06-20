@@ -14,9 +14,28 @@ class LLMClient(Protocol):
     def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str: ...
 
 
+def _schema_field_hint(schema: dict[str, object] | None) -> str:
+    if not schema or schema.get("type") != "object":
+        return ""
+    properties = schema.get("properties")
+    property_names = list(properties.keys()) if isinstance(properties, dict) else []
+    required = schema.get("required")
+    required_names = [str(item) for item in required] if isinstance(required, list) else []
+    if property_names and required_names:
+        return f" input fields: {', '.join(property_names)}; required: {', '.join(required_names)}"
+    if property_names:
+        return f" input fields: {', '.join(property_names)}"
+    if required_names:
+        return f" required input fields: {', '.join(required_names)}"
+    return ""
+
+
 def _render_tool_inventory(digests: list[ToolDigest]) -> str:
     # Build a compact tool inventory so the model knows what is available.
-    lines = [f"- {d.name} ({d.origin}): {d.description}" for d in digests]
+    lines = [
+        f"- {d.name} ({d.origin}): {d.description}{_schema_field_hint(d.input_schema)}"
+        for d in digests
+    ]
     return "사용 가능한 도구:\n" + "\n".join(lines)
 
 

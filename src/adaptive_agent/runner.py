@@ -56,6 +56,7 @@ _SYSTEM = (
     '- {"action":"update_tool","name":"<tool>","code":"def run(input):\\n    return ..."} — fix a failed tool\n'
     '- {"action":"finish","summary":"..."} — stop when the task is done\n'
     'To use a tool you MUST use call_tool — never put a tool name in the "action" field. '
+    "When the tool inventory lists input fields, call that tool with exactly those field names. "
     'Workspace file paths are RELATIVE (for example, "data.json" or "report.csv"); do not use '
     'absolute paths or "..". Use readFile only to inspect a small file before deciding what to do.\n'
     'There are TWO ways to run Python. Both are invoked with call_tool — "runPython" and any tool '

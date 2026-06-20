@@ -24,7 +24,7 @@ action 스키마와 도구 입출력 스키마는 `schemas.md`를 따른다.
 사용자 요청
    │
    ▼
-[컨텍스트 조립]  system 규칙 + ToolDigest 목록 + 압축된 과거 + 최근 메시지
+[컨텍스트 조립]  system 규칙 + ToolDigest 목록(이름·설명·compact input field hint) + 압축된 과거 + 최근 메시지
    │
    ▼
 ┌───────────────────────── 루프 (최대 maxIterations) ─────────────────────────┐
@@ -238,7 +238,9 @@ create_tool(spec)
 
 생성 도구는 빈 입력 스모크 실행으로 게이트하지 않고 즉시 등록한다. 입력이 필요하거나 파일을 읽는 도구는 빈 입력 스모크에서 무조건 실패하기 때문이다. 대신 실제 호출에서 난 오류가 observation으로 되먹여져 update_tool을 유도한다(4.1·7절). `GeneratedToolManager.smoke_test`는 선택적 진단으로 남는다.
 
-영속 저장 형태는 `schemas.md`의 ToolManifest를 따른다. 다음 세션 시작 시 manifest와 description만 읽어 ToolDigest로 등록하고, 코드와 전체 스키마는 호출 시점에 지연 로딩한다.
+영속 저장 형태는 `schemas.md`의 ToolManifest를 따른다. 다음 세션 시작 시 manifest에서 이름,
+description, inputSchema를 읽어 ToolDigest로 등록한다. 프롬프트에는 compact input field hint만
+렌더링하고, 코드는 호출 시점에 런타임에서 사용한다.
 
 ### 6.1 update_tool 워크플로 (7절 상세)
 

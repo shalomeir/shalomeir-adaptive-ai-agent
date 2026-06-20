@@ -23,4 +23,9 @@ class Tool:
     output_schema: dict[str, Any] | None = None
 
     def digest(self) -> ToolDigest:
-        return ToolDigest(name=self.name, description=self.description, origin=self.origin)
+        return ToolDigest(
+            name=self.name,
+            description=self.description,
+            origin=self.origin,
+            inputSchema=self.input_schema,
+        )

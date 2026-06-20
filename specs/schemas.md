@@ -330,7 +330,8 @@ def run(input: dict) -> dict:
 { "title": "ToolDigest", "type": "object",
   "required": ["name", "description", "origin"],
   "properties": { "name": { "type": "string" }, "description": { "type": "string" },
-    "origin": { "type": "string", "enum": ["builtin", "generated", "mcp"] } } }
+    "origin": { "type": "string", "enum": ["builtin", "generated", "mcp"] },
+    "inputSchema": { "type": ["object", "null"], "description": "선택. 프롬프트에는 compact field hint로 렌더링한다." } } }
 ```
 
 ## 5. 로그 이벤트
@@ -449,4 +450,6 @@ JSONL 한 줄이 한 이벤트다.
   "additionalProperties": false }
 ```
 
-도구는 평소 ToolDigest 목록으로만 프롬프트에 노출한다. 특정 도구의 전체 inputSchema와 코드는 그 도구를 호출하거나 수정하기로 한 시점에만 컨텍스트에 싣는다.
+도구는 평소 ToolDigest 목록으로만 프롬프트에 노출한다. ToolDigest에는 이름, 설명, 출처와
+compact input field hint를 만들 수 있는 inputSchema만 포함한다. 특정 도구의 전체 코드는 그
+도구를 호출하거나 수정하기로 한 시점에만 런타임에서 사용한다.

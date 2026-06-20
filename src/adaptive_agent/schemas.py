@@ -105,6 +105,7 @@ class ToolDigest(BaseModel):
     name: str
     description: str
     origin: Literal["builtin", "generated", "mcp"]
+    input_schema: dict[str, Any] | None = Field(default=None, alias="inputSchema")
 
 
 class Message(BaseModel):

@@ -125,7 +125,8 @@ def parse_action_text(raw: str) -> ParseResult:
 ## 4. 도구 모델
 
 내장 도구와 생성 도구를 같은 `Tool` 추상으로 다룬다. 레지스트리는 실행도 하지만, 프롬프트에는
-이름·설명만 담은 digest로 노출한다. 캐시 안정성을 위해 전체 스키마와 코드는 평소에 넣지 않는다.
+이름·설명과 compact input field hint만 담은 digest로 노출한다. 캐시 안정성을 위해 전체 코드와
+큰 스키마 본문은 평소에 넣지 않는다.
 동일한 성공 tool call은 캐시해 같은 입력의 재실행과 반복 권한 확인을 피한다. 모델이 같은
 호출을 계속 반복하면 캐시된 결과를 최종 답변으로 접는다.
 
@@ -223,7 +224,7 @@ def _gate(self, name, payload):
 
 ```python
 if self.skills is not None and self.generated is not None:
-    for digest in self.skills.load_digests():        # 이름·설명만
+    for digest in self.skills.load_digests():        # 이름·설명·입력 필드 hint
         spec = self.skills.load_spec(digest.name)    # 코드 본문
         self.deps.registry.register(self.generated.create(spec))
 ```

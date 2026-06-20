@@ -68,3 +68,34 @@ def test_call_validates_required_fields_before_handler():
     assert not res.ok
     assert "필수 필드" in (res.error or "")
     assert "content" in (res.error or "")
+
+
+def test_generated_tool_properties_are_required_when_required_is_omitted():
+    called = False
+
+    def handler(inp):
+        nonlocal called
+        called = True
+        return ToolResult(ok=True, output="should not run")
+
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="csv-dedupe-sort",
+            description="dedupe sort",
+            origin="generated",
+            input_schema={
+                "type": "object",
+                "properties": {"source": {"type": "string"}, "output": {"type": "string"}},
+            },
+            handler=handler,
+        )
+    )
+
+    res = reg.call("csv-dedupe-sort", {"inputPath": "events.csv", "outputPath": "out.csv"})
+
+    assert not res.ok
+    assert called is False
+    assert "source" in (res.error or "")
+    assert "output" in (res.error or "")
+    assert "inputPath" not in (res.error or "")

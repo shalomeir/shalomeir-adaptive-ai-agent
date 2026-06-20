@@ -68,7 +68,21 @@ def test_http_client_merges_protocol_and_tools_into_one_system_message(monkeypat
             Message(role="user", content="task"),
             Message(role="tool", content="도구 결과"),
         ],
-        digests=[ToolDigest(name="runPython", origin="builtin", description="Run Python")],
+        digests=[
+            ToolDigest(
+                name="csv-dedupe-sort",
+                origin="generated",
+                description="dedupe",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string"},
+                        "output": {"type": "string"},
+                    },
+                    "required": ["source", "output"],
+                },
+            )
+        ],
     )
 
     messages = payloads[0]["messages"]
@@ -76,7 +90,9 @@ def test_http_client_merges_protocol_and_tools_into_one_system_message(monkeypat
     assert len(system_messages) == 1
     assert system_messages[0]["content"].startswith("STRICT OUTPUT CONTRACT")
     assert "사용 가능한 도구" in system_messages[0]["content"]
-    assert "runPython" in system_messages[0]["content"]
+    assert "csv-dedupe-sort" in system_messages[0]["content"]
+    assert "input fields: source, output" in system_messages[0]["content"]
+    assert "required: source, output" in system_messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "task"}
     assert messages[2] == {"role": "user", "content": "도구 결과"}
 

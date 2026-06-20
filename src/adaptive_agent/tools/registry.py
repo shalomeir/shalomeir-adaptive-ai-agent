@@ -67,9 +67,21 @@ class ToolRegistry:
         schema = tool.input_schema
         if schema.get("type") == "object" and not isinstance(payload, dict):
             return f"{tool.name} input은 object여야 합니다."
+        properties = schema.get("properties")
+        property_names = list(properties) if isinstance(properties, dict) else []
         required = schema.get("required", [])
+        if tool.origin == "generated" and not required and property_names:
+            required = property_names
         if isinstance(required, list):
             missing = [field for field in required if field not in payload]
             if missing:
-                return f"{tool.name} input에 필수 필드가 없습니다: {', '.join(missing)}"
+                return (
+                    f"{tool.name} input에 필수 필드가 없습니다: {', '.join(missing)}. "
+                    f"사용할 입력 필드: {', '.join(property_names or required)}"
+                )
+        if property_names and not any(field in payload for field in property_names):
+            return (
+                f"{tool.name} input 필드가 스키마와 맞지 않습니다. "
+                f"사용할 입력 필드: {', '.join(property_names)}"
+            )
         return None
