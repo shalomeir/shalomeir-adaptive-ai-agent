@@ -51,10 +51,7 @@ def _direct_write_path(tree: ast.AST) -> str | None:
 def _open_write_path(node: ast.Call) -> str | None:
     if not isinstance(node.func, ast.Name) or node.func.id != "open":
         return None
-    if not node.args or not isinstance(node.args[0], ast.Constant):
-        return None
-    path = node.args[0].value
-    if not isinstance(path, str):
+    if not node.args:
         return None
     mode = "r"
     if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
@@ -66,7 +63,12 @@ def _open_write_path(node: ast.Call) -> str | None:
             mode_value = keyword.value.value
             if isinstance(mode_value, str):
                 mode = mode_value
-    return path if any(flag in mode for flag in ("w", "a", "x", "+")) else None
+    if not any(flag in mode for flag in ("w", "a", "x", "+")):
+        return None
+    path_arg = node.args[0]
+    if isinstance(path_arg, ast.Constant) and isinstance(path_arg.value, str):
+        return path_arg.value
+    return "<dynamic path>"
 
 
 def _pathlib_write_path(node: ast.Call) -> str | None:
@@ -81,21 +83,24 @@ def _pathlib_write_path(node: ast.Call) -> str | None:
 
 
 def _path_constructor_arg(node: ast.Call) -> str | None:
-    if not node.args or not isinstance(node.args[0], ast.Constant):
-        return None
-    path = node.args[0].value
-    if not isinstance(path, str):
+    if not node.args:
         return None
     if isinstance(node.func, ast.Name) and node.func.id == "Path":
-        return path
+        return _path_arg_label(node.args[0])
     if (
         isinstance(node.func, ast.Attribute)
         and node.func.attr == "Path"
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "pathlib"
     ):
-        return path
+        return _path_arg_label(node.args[0])
     return None
+
+
+def _path_arg_label(node: ast.AST) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return "<dynamic path>"
 
 
 def _guard_run_python_code(code: str) -> str | None:
@@ -110,14 +115,42 @@ def _guard_run_python_code(code: str) -> str | None:
             f"외부 모듈을 import하지 마세요: {', '.join(blocked_imports)}. "
             "별도 패키지 없이 문자열과 표준 라이브러리로 처리하세요."
         )
-    direct_write = _direct_write_path(tree)
-    if direct_write is not None:
-        return (
-            f"runPython 안에서 파일을 직접 쓰려고 했습니다: {direct_write}. "
-            "파일 내용은 stdout으로 출력하거나 결과 content로 만들고, 저장은 writeFile "
-            "도구의 작업 영역 상대 경로로 처리하세요."
-        )
     return None
+
+
+_RUN_PYTHON_PATH_GUARD = r"""
+import builtins as __adaptive_agent_builtins
+import os as __adaptive_agent_os
+from pathlib import Path as __AdaptiveAgentPath
+
+__adaptive_agent_workspace = __AdaptiveAgentPath.cwd().resolve()
+__adaptive_agent_original_open = __adaptive_agent_builtins.open
+__adaptive_agent_original_path_open = __AdaptiveAgentPath.open
+
+
+def __adaptive_agent_check_path(path):
+    if not isinstance(path, (str, bytes, __adaptive_agent_os.PathLike)):
+        return path
+    raw_path = __AdaptiveAgentPath(path)
+    target = raw_path.resolve() if raw_path.is_absolute() else (__adaptive_agent_workspace / raw_path).resolve()
+    if target != __adaptive_agent_workspace and __adaptive_agent_workspace not in target.parents:
+        raise PermissionError("workspace 밖 경로 접근은 허용되지 않습니다")
+    return path
+
+
+def __adaptive_agent_guarded_open(file, *args, **kwargs):
+    __adaptive_agent_check_path(file)
+    return __adaptive_agent_original_open(file, *args, **kwargs)
+
+
+def __adaptive_agent_guarded_path_open(self, *args, **kwargs):
+    __adaptive_agent_check_path(self)
+    return __adaptive_agent_original_path_open(self, *args, **kwargs)
+
+
+__adaptive_agent_builtins.open = __adaptive_agent_guarded_open
+__AdaptiveAgentPath.open = __adaptive_agent_guarded_path_open
+"""
 
 
 def build_file_tools(workspace: Path | str) -> list[Tool]:
@@ -198,6 +231,7 @@ def build_run_python(sandbox: ExecutionSandbox) -> Tool:
             guard_error = _guard_run_python_code(code)
             if guard_error is not None:
                 return ToolResult(ok=False, error=guard_error)
+            code = f"{_RUN_PYTHON_PATH_GUARD}\n{code}"
             if "def run(" in code and "__adaptive_agent_result" not in code:
                 code += (
                     "\n\nif __name__ == '__main__':\n"

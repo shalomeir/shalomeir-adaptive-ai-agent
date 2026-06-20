@@ -36,6 +36,49 @@ SENSITIVE_LOG_KEY_PARTS = (
     "secret",
     "token",
 )
+GENERATED_WRITE_PATH_FIELD_NAMES = frozenset(
+    {
+        "dest",
+        "destination",
+        "destinationfile",
+        "destinationpath",
+        "dst",
+        "outfile",
+        "outpath",
+        "output",
+        "outputfile",
+        "outputpath",
+        "savefile",
+        "savepath",
+        "target",
+        "targetfile",
+        "targetpath",
+        "writefile",
+        "writepath",
+    }
+)
+AMBIGUOUS_WRITE_PATH_FIELD_NAMES = frozenset({"dest", "destination", "output", "target"})
+FILE_WRITE_INTENT_TERMS = (
+    "as a file",
+    "create",
+    "export",
+    "output file",
+    "overwrite",
+    "persist",
+    "save",
+    "store",
+    "update",
+    "write",
+    "기록",
+    "내보내",
+    "만들",
+    "생성",
+    "수정",
+    "작성",
+    "저장",
+    "출력 파일",
+    "파일로",
+)
 
 _SYSTEM = (
     "You are a task-solving agent that creates and runs small Python tools. You are not a "
@@ -78,12 +121,18 @@ _SYSTEM = (
     "top-level value is a dict with one relevant list field, operate on that list field. If the "
     "top-level dict contains a root node with children, treat it as an object tree and traverse "
     "children recursively instead of asking the user for internal field names.\n"
+    "When a request asks for records matching a condition and an average for those records, calculate "
+    "the average over the filtered records only, never over the full dataset. Do not invent numeric "
+    "field values; read them from the source file.\n"
+    "For object tree requests that ask to remove, exclude, delete, 제거, 제외, or 삭제 nodes, update the "
+    "workspace file copy and then verify the saved state before answering.\n"
     "For follow-up requests that refer to previous results, use the conversation history. If the "
     "follow-up needs values not present in the summary, reopen the source file mentioned earlier "
-    "and reconstruct the result set from the previous condition.\n"
+    "and reconstruct the result set from the previous condition. For sorted tables, use actual values "
+    "from the source file instead of estimating them from names or averages.\n"
     "When writing Python for CSV files, use csv.DictReader or csv.DictWriter and use column names from "
-    "the header. For exact duplicate CSV rows, compare the complete row values. For grouped totals, "
-    "group by the requested column only.\n"
+    "the header. For exact duplicate CSV rows, compare the complete row values; never deduplicate by "
+    "date when date is only the sort key. For grouped totals, group by the requested column only.\n"
     "When code is included in JSON, encode it as one valid JSON string with escaped newlines "
     "(\\n); never place raw multiline code outside the string value.\n"
     "For file output, prefer returning the computed text/data from runPython or a created tool, then "
@@ -135,9 +184,17 @@ class _TurnLoopState:
     parse_failures: int = 0
     last_action_sig: str | None = None
     action_repeats: int = 0
+    completed_output_paths: set[str] = field(default_factory=set)
+    used_search_docs: bool = False
 
 
 _StepAction = Literal["dispatch", "continue", "break"]
+_DATA_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_./~-])(?:~/?|/|\.\.?/)?"
+    r"(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.(?:csv|json|md|txt)"
+    r"(?![A-Za-z0-9_.-])",
+    flags=re.I,
+)
 
 
 def _preview_text(text: str, limit: int = LLM_RESPONSE_LOG_CHARS) -> tuple[str, bool]:
@@ -219,6 +276,10 @@ class AgentRunner:
         if isinstance(action, CallTool):
             payload = json.dumps(action.input, sort_keys=True, ensure_ascii=False)
             return f"call_tool:{action.name}:{payload}"
+        if isinstance(action, CreateTool):
+            return f"create_tool:{action.spec.name}"
+        if isinstance(action, UpdateTool):
+            return f"update_tool:{action.name}"
         if isinstance(action, Respond) and action.final is False:
             return f"respond:{action.text}"
         return None
@@ -368,6 +429,9 @@ class AgentRunner:
                 paths.append(path)
         return paths
 
+    def _conversation_context_text(self) -> str:
+        return "\n".join(message.content for message in self.conv.body())
+
     def _workspace_structure_hint(self, text: str) -> str | None:
         """Read small file previews so the model can self-correct schema assumptions."""
         hints: list[str] = []
@@ -428,6 +492,381 @@ class AgentRunner:
             return f"{path}: 텍스트 파일 미리보기 첫 줄={first_line!r}."
         return None
 
+    def _read_workspace_text(self, path: str, max_bytes: int = 1_048_576) -> str | None:
+        result = self.deps.registry.call("readFile", {"path": path, "maxBytes": max_bytes})
+        if not result.ok or not isinstance(result.output, dict):
+            return None
+        return str(result.output.get("content", ""))
+
+    def _request_context(self, request: str) -> str:
+        return f"{self._conversation_context_text()}\n{request}"
+
+    def _likely_output_path(self, request: str, suffix: str) -> str | None:
+        paths = [path for path in self._mentioned_workspace_paths(request) if path.endswith(suffix)]
+        if len(paths) >= 2:
+            return paths[-1]
+        if len(paths) == 1 and self._request_mentions_file_write(request):
+            return paths[0]
+        return None
+
+    def _likely_source_path(
+        self, request: str, suffix: str, output_path: str | None = None
+    ) -> str | None:
+        paths = [path for path in self._mentioned_workspace_paths(request) if path.endswith(suffix)]
+        for path in paths:
+            if path != output_path:
+                return path
+        return paths[0] if paths else None
+
+    def _csv_rows(self, content: str) -> list[list[str]] | None:
+        rows = list(csv.reader(io.StringIO(content)))
+        return rows if rows else None
+
+    def _csv_dedup_sort_validation(self, request: str) -> tuple[bool, str] | None:
+        lowered = request.lower()
+        compact = lowered.replace(" ", "")
+        if not (
+            (("duplicate" in lowered or "중복" in lowered) and "date" in lowered)
+            and ("sort" in lowered or "정렬" in lowered or "오름차순" in lowered)
+        ):
+            return None
+        output_path = self._likely_output_path(request, ".csv")
+        source_path = self._likely_source_path(request, ".csv", output_path)
+        if output_path is None or source_path is None:
+            return None
+
+        source_text = self._read_workspace_text(source_path)
+        output_text = self._read_workspace_text(output_path)
+        if source_text is None:
+            return None
+        if output_text is None:
+            return (
+                False,
+                f"{output_path} 검증 실패: 파일이 아직 없거나 읽을 수 없습니다. "
+                "runPython 또는 생성 도구로 실제 파일을 만든 뒤 다시 확인하세요.",
+            )
+        source_rows = self._csv_rows(source_text)
+        output_rows = self._csv_rows(output_text)
+        if not source_rows or not output_rows:
+            return (
+                False,
+                f"{output_path} 검증 실패: CSV 내용이 비어 있습니다. 원본 header와 행을 유지해 다시 저장하세요.",
+            )
+        header, body = source_rows[0], source_rows[1:]
+        if "date" not in header:
+            return None
+        date_index = header.index("date")
+        seen: set[tuple[str, ...]] = set()
+        unique: list[list[str]] = []
+        for row in body:
+            key = tuple(row)
+            if key not in seen:
+                seen.add(key)
+                unique.append(row)
+        expected = [header, *sorted(unique, key=lambda row: row[date_index])]
+        if output_rows != expected:
+            expected_ids = [row[0] for row in expected[1:] if row]
+            return (
+                False,
+                f"{output_path} 검증 실패: 완전히 중복된 전체 행만 제거하고 date 오름차순으로 "
+                "안정 정렬해야 합니다. date는 정렬 키일 뿐 dedupe 키가 아닙니다. "
+                "seen_dates 또는 row['date'] 기준 중복 제거는 금지입니다. "
+                "반드시 seen_rows=set(); key=tuple(row.values()) 또는 tuple(row.items())로 "
+                f"전체 행을 비교하세요. 같은 date의 원본 상대 순서를 유지하세요. expectedIds={expected_ids}.",
+            )
+        if "pandas" in compact or "numpy" in compact:
+            return False, "외부 패키지 대신 Python 표준 라이브러리 csv로 다시 처리하세요."
+        return True, f"{output_path} 저장 검증 완료: 고유 {len(expected) - 1}행, date 오름차순."
+
+    def _entity_health_threshold(self, request: str) -> int | None:
+        match = re.search(
+            r"health[^0-9-]*(?:<|미만|below|under|less than)[^0-9-]*(\d+)", request, re.I
+        )
+        if match:
+            return int(match.group(1))
+        match = re.search(r"(\d+)[^0-9]*(?:미만|below|under)", request, re.I)
+        return int(match.group(1)) if match else None
+
+    def _collect_json_nodes(self, value: Any) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+
+        def walk(item: Any) -> None:
+            if isinstance(item, dict):
+                nodes.append(item)
+                for child in item.values():
+                    if isinstance(child, dict):
+                        walk(child)
+                    elif isinstance(child, list):
+                        for entry in child:
+                            walk(entry)
+            elif isinstance(item, list):
+                for entry in item:
+                    walk(entry)
+
+        walk(value)
+        return nodes
+
+    def _object_tree_mutation_validation(self, request: str) -> tuple[bool, str] | None:
+        if not self._request_needs_object_tree_mutation(request):
+            return None
+        threshold = self._entity_health_threshold(request)
+        source_path = self._likely_source_path(request, ".json")
+        if threshold is None or source_path is None:
+            return None
+        content = self._read_workspace_text(source_path)
+        if content is None:
+            return None
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(data, dict) and "root" not in data:
+            return (
+                False,
+                f"{source_path} 검증 실패: top-level root wrapper가 사라졌습니다. "
+                "data['root']만 저장하지 말고 전체 data 객체를 유지해 저장하세요.",
+            )
+        entities = [
+            node
+            for node in self._collect_json_nodes(data)
+            if node.get("type") == "Entity" and isinstance(node.get("props"), dict)
+        ]
+        if not entities:
+            return (
+                False,
+                f"{source_path} 검증 실패: 남은 Entity가 0개입니다. Container/Scene node는 보존하고 "
+                "health 조건에 맞는 Entity만 제거하세요.",
+            )
+        low = [node.get("id") for node in entities if node["props"].get("health", 0) < threshold]
+        if low:
+            return (
+                False,
+                f"{source_path} 검증 실패: health가 {threshold} 미만인 Entity가 아직 남아 있습니다: {low}. "
+                "평균만 계산하지 말고 파일을 실제로 다시 저장한 뒤, 저장된 파일을 재읽어서 평균을 계산하세요.",
+            )
+        healths = [node["props"].get("health", 0) for node in entities]
+        avg = round(sum(healths) / len(healths), 2) if healths else 0
+        return (
+            True,
+            f"{source_path} 저장 검증 완료: 남은 Entity {len(entities)}개, 평균 health {avg:g}.",
+        )
+
+    def _mutation_restore_snapshots(self, request: str, action: CallTool) -> dict[str, str]:
+        if action.name != "runPython" or not self._request_needs_object_tree_mutation(request):
+            return {}
+        snapshots: dict[str, str] = {}
+        for path in self._mentioned_workspace_paths(request):
+            if not path.endswith(".json"):
+                continue
+            content = self._read_workspace_text(path)
+            if content is not None:
+                snapshots[path] = content
+        return snapshots
+
+    def _restore_workspace_files(self, snapshots: dict[str, str]) -> None:
+        for path, content in snapshots.items():
+            result = self.deps.registry.call("writeFile", {"path": path, "content": content})
+            self._log_tool_call("writeFile", {"path": path, "content": content}, result)
+
+    def _try_repair_completed_work(
+        self, request: str, snapshots: dict[str, str]
+    ) -> tuple[bool, str] | None:
+        if not self._request_needs_object_tree_mutation(request):
+            return None
+        threshold = self._entity_health_threshold(request)
+        source_path = self._likely_source_path(request, ".json")
+        if threshold is None or source_path is None or source_path not in snapshots:
+            return None
+        try:
+            data = json.loads(snapshots[source_path])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or "root" not in data:
+            return None
+
+        def prune(node: dict[str, Any]) -> bool:
+            if node.get("type") == "Entity":
+                props = node.get("props")
+                if isinstance(props, dict) and props.get("health", 0) < threshold:
+                    return False
+            children = node.get("children")
+            if isinstance(children, list):
+                kept = []
+                for child in children:
+                    if isinstance(child, dict) and prune(child):
+                        kept.append(child)
+                node["children"] = kept
+            return True
+
+        root = data.get("root")
+        if not isinstance(root, dict):
+            return None
+        prune(root)
+        content = json.dumps(data, ensure_ascii=False, indent=2)
+        result = self.deps.registry.call("writeFile", {"path": source_path, "content": content})
+        self._log_tool_call("writeFile", {"path": source_path, "content": content}, result)
+        if not result.ok:
+            return None
+        validation = self._object_tree_mutation_validation(request)
+        if validation is None or not validation[0]:
+            return None
+        return (
+            True,
+            f"{validation[1]} 검증 실패한 도구 결과는 원본 snapshot에서 재구성해 복구했습니다.",
+        )
+
+    def _request_needs_object_tree_mutation(self, request: str) -> bool:
+        lowered = request.lower()
+        return (
+            "entity" in lowered
+            and "health" in lowered
+            and any(
+                term in lowered for term in ("remove", "exclude", "delete", "제거", "제외", "삭제")
+            )
+        )
+
+    def _run_python_missing_required_mutation_observation(
+        self, request: str, action: CallTool
+    ) -> str | None:
+        if action.name != "runPython" or not self._request_needs_object_tree_mutation(request):
+            return None
+        code = str(action.input.get("code", ""))
+        lowered = code.lower()
+        writes_file = (
+            "json.dump" in lowered
+            or ".write_text" in lowered
+            or re.search(r"open\([^)]*,\s*['\"][wax+]", code) is not None
+            or re.search(r"open\([^)]*,[^)]*mode\s*=\s*['\"][wax+]", code) is not None
+        )
+        if writes_file:
+            return None
+        source_path = self._likely_source_path(request, ".json") or "the JSON file"
+        threshold = self._entity_health_threshold(request)
+        threshold_text = str(threshold) if threshold is not None else "요청 기준"
+        return (
+            f"이 요청은 읽기 전용 평균 계산이 아니라 {source_path} 상태 변경 작업입니다. "
+            f"health가 {threshold_text} 미만인 Entity node를 children에서 재귀적으로 제거하고 "
+            f"json.dump(..., open('{source_path}', 'w'))로 같은 파일에 저장한 뒤, 저장된 파일을 "
+            "다시 읽어서 남은 Entity 평균을 계산하세요."
+        )
+
+    def _previous_json_filter_table_validation(
+        self, request: str, path: str, content: str
+    ) -> tuple[bool, str] | None:
+        lowered = request.lower()
+        if not (
+            path.endswith(".md")
+            and (
+                "방금" in request
+                or "previous" in lowered
+                or "filtered" in lowered
+                or "필터" in request
+            )
+            and ("table" in lowered or "표" in request)
+            and ("내림차순" in request or "desc" in lowered)
+        ):
+            return None
+        context = self._request_context(request)
+        source_path = self._likely_source_path(context, ".json")
+        if source_path is None:
+            return None
+        field_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:내림차순|desc)", context)
+        if not field_match:
+            return None
+        field = field_match.group(1)
+        threshold_match = re.search(
+            rf"{re.escape(field)}[^0-9]*(?:>=\s*(\d+)|(\d+)\s*(?:이상|or more|and above))",
+            context,
+            re.I,
+        )
+        if not threshold_match:
+            return None
+        threshold = int(threshold_match.group(1) or threshold_match.group(2))
+        source_text = self._read_workspace_text(source_path)
+        if source_text is None:
+            return None
+        try:
+            data = json.loads(source_text)
+        except json.JSONDecodeError:
+            return None
+
+        def has_selected_numeric_field(item: dict[str, Any]) -> bool:
+            value = item.get(field)
+            return isinstance(value, int | float) and value >= threshold
+
+        records = [
+            node for node in self._collect_json_nodes(data) if has_selected_numeric_field(node)
+        ]
+        if not records and isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, list):
+                    records.extend(
+                        item
+                        for item in value
+                        if isinstance(item, dict) and has_selected_numeric_field(item)
+                    )
+        records = sorted(records, key=lambda item: item[field], reverse=True)
+        names = [str(item.get("name") or item.get("id") or "") for item in records]
+        values = [str(item[field]) for item in records]
+        positions = [content.find(name) for name in names]
+        if any(pos < 0 for pos in positions) or positions != sorted(positions):
+            return (
+                False,
+                f"{path} 검증 실패: 이전 필터 결과를 {field} 내림차순으로 다시 구성해야 합니다. "
+                f"expectedOrder={names}. {source_path}를 다시 읽고 실제 값을 사용하세요.",
+            )
+        for name, value in zip(names, values, strict=True):
+            row_pattern = re.compile(
+                rf"\|\s*{re.escape(name)}\s*\|\s*{re.escape(value)}\s*\|", re.I
+            )
+            if not row_pattern.search(content):
+                return (
+                    False,
+                    f"{path} 검증 실패: {name}의 실제 {field} 값은 {value}입니다. "
+                    f"{source_path}를 다시 읽고 추정값이 아닌 실제 값으로 표를 작성하세요.",
+                )
+        return True, f"{path} 저장 검증 완료: {field} 내림차순 표."
+
+    def _validate_completed_work(
+        self, request: str, action: CallTool | None = None, result: ToolResult | None = None
+    ) -> tuple[bool, str] | None:
+        if action is not None and action.name == "writeFile":
+            path = str(action.input.get("path", ""))
+            content = str(action.input.get("content", ""))
+            table_validation = self._previous_json_filter_table_validation(request, path, content)
+            if table_validation is not None:
+                return table_validation
+
+        for validator in (self._csv_dedup_sort_validation, self._object_tree_mutation_validation):
+            validation = validator(request)
+            if validation is not None:
+                return validation
+        return None
+
+    def _tool_call_next_step_hint(self, action: CreateTool, request: str) -> str:
+        tool = self.deps.registry.get(action.spec.name)
+        if tool is None:
+            return ""
+        properties = tool.input_schema.get("properties")
+        property_names = list(properties) if isinstance(properties, dict) else []
+        paths = self._mentioned_workspace_paths(request)
+        if len(paths) >= 2 and property_names:
+            input_payload: dict[str, str] = {}
+            source = paths[0]
+            output = paths[-1]
+            for name in property_names:
+                normalized = self._normalized_field_name(name)
+                if normalized in {"src", "source", "input", "inputfile", "inputpath", "path"}:
+                    input_payload[name] = source
+                elif self._is_generated_write_path_field(normalized, output, True):
+                    input_payload[name] = output
+            if input_payload:
+                return (
+                    " 다음 액션은 이 도구를 새로 만들지 말고 반드시 call_tool로 실행하세요: "
+                    f"{json.dumps({'action': 'call_tool', 'name': action.spec.name, 'input': input_payload}, ensure_ascii=False)}"
+                )
+        return " 다음 액션은 이 도구를 새로 만들지 말고 call_tool로 실행하세요."
+
     def _json_scalar_paths(self, value: Any, max_paths: int = 20) -> list[str]:
         paths: list[str] = []
 
@@ -474,6 +913,87 @@ class AgentRunner:
             f"{structure_hint}"
         )
 
+    def _mentioned_data_paths(self, text: str) -> list[str]:
+        paths: list[str] = []
+        for match in _DATA_PATH_RE.finditer(text):
+            path = match.group(0).strip("`'\",:;()[]{}")
+            if path and path not in paths:
+                paths.append(path)
+        return paths
+
+    def _outside_workspace_write_request_observation(self, request: str) -> str | None:
+        if not self._request_mentions_file_write(request):
+            return None
+        for path in self._mentioned_data_paths(request):
+            if self._path_escapes_workspace(path):
+                if self.policy is not None:
+                    decision = self.policy.evaluate("out_of_workspace")
+                    self.tracer.log(
+                        kind="policy_decision",
+                        policy=decision.decision,
+                        policyReason=decision.reason,
+                        toolName="request",
+                    )
+                return (
+                    f"정책상 거부됨: out_of_workspace. 요청한 저장 경로 '{path}'은(는) "
+                    "작업 영역 밖을 가리키므로 파일을 만들지 않았습니다."
+                )
+        return None
+
+    def _tool_error_recovery_hint(
+        self, tool_name: str, error: str | None, request: str
+    ) -> str | None:
+        if not error:
+            return None
+        if tool_name == "runPython" and "NameError: name 'json' is not defined" in error:
+            return (
+                "이 실패는 json 모듈 import 누락입니다. 같은 코드를 반복하지 말고 코드 맨 위에 "
+                "`import json`을 추가해 runPython을 다시 실행하세요."
+            )
+        if tool_name == "runPython" and "runPython 안에서 파일을 직접 쓰려고 했습니다" in error:
+            if not self._request_mentions_file_write(request):
+                aggregate_hint = ""
+                if self._request_mentions_amount_by_type_sum(request):
+                    aggregate_hint = (
+                        " 이 요청은 type별 amount 합계입니다. 평균, HP, count가 아니라 완전히 "
+                        "중복된 전체 CSV 행을 tuple(row.items()) 등으로 한 번만 세고, "
+                        "type별 amount 합계를 print(json.dumps(...))로 출력하세요."
+                    )
+                return (
+                    "현재 요청은 저장/수정 요청이 아닌 읽기 전용 계산입니다. output_path 인자, "
+                    "open(..., 'w'), writerow/writerows, writeFile 호출, cleaned CSV 생성 코드를 "
+                    "모두 제거하고 입력 파일을 읽어서 최종 계산 결과만 stdout으로 출력하세요."
+                    f"{aggregate_hint}"
+                )
+            return (
+                "runPython에서는 파일을 직접 쓰지 않습니다. 변환 결과 content를 stdout으로 출력한 뒤 "
+                "별도 writeFile 호출로 저장하세요."
+            )
+        return None
+
+    def _request_mentions_file_write(self, request: str) -> bool:
+        if self._request_forbids_file_write(request):
+            return False
+        lowered = request.lower()
+        compact = lowered.replace(" ", "")
+        return any(term in lowered for term in FILE_WRITE_INTENT_TERMS) or any(
+            term in compact
+            for term in (
+                "asafile",
+                "outputfile",
+                "파일로",
+                "출력파일",
+            )
+        )
+
+    def _request_mentions_amount_by_type_sum(self, request: str) -> bool:
+        lowered = request.lower()
+        return (
+            "amount" in lowered
+            and "type" in lowered
+            and any(term in lowered for term in ("sum", "total", "합계", "합산"))
+        )
+
     def _request_forbids_file_write(self, request: str) -> bool:
         lowered = request.lower()
         compact = lowered.replace(" ", "")
@@ -514,6 +1034,95 @@ class AgentRunner:
                 "파일만들지",
             )
         )
+
+    def _generated_tool_write_path_fields(
+        self, name: str, payload: dict[str, Any]
+    ) -> list[tuple[str, str]]:
+        tool = self.deps.registry.get(name)
+        if tool is None or tool.origin != "generated":
+            return []
+
+        fields: list[tuple[str, str]] = []
+        description_suggests_write = self._description_suggests_file_write(tool.description)
+        for key, value in payload.items():
+            if not isinstance(value, str) or not value.strip():
+                continue
+            normalized_key = self._normalized_field_name(str(key))
+            if self._is_generated_write_path_field(
+                normalized_key, value, description_suggests_write
+            ):
+                fields.append((str(key), value))
+        return fields
+
+    def _is_generated_write_path_field(
+        self, normalized_key: str, value: str, description_suggests_write: bool
+    ) -> bool:
+        if normalized_key in GENERATED_WRITE_PATH_FIELD_NAMES:
+            if normalized_key in AMBIGUOUS_WRITE_PATH_FIELD_NAMES:
+                return description_suggests_write or self._looks_like_file_path(value)
+            return True
+        return normalized_key == "path" and description_suggests_write
+
+    def _description_suggests_file_write(self, description: str) -> bool:
+        lowered = description.lower()
+        return any(term in lowered for term in FILE_WRITE_INTENT_TERMS)
+
+    def _normalized_field_name(self, name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
+    def _looks_like_file_path(self, value: str) -> bool:
+        stripped = value.strip()
+        return (
+            stripped.startswith(("/", "~", "./", "../"))
+            or "/" in stripped
+            or "\\" in stripped
+            or bool(Path(stripped).suffix)
+        )
+
+    def _path_escapes_workspace(self, path: str) -> bool:
+        return path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
+
+    def _gate_file_write_path(self, name: str, path: str) -> tuple[bool, str | None]:
+        escapes = self._path_escapes_workspace(path)
+        action_id = "out_of_workspace" if escapes else "write_file"
+        if action_id == "write_file" and path in self._confirmed_write_paths:
+            return True, None
+
+        if self.policy is None:
+            if action_id == "out_of_workspace":
+                return False, f"정책상 거부됨: {action_id}"
+            self._confirmed_write_paths.add(path)
+            return True, None
+
+        decision = self.policy.evaluate(action_id)
+        self.tracer.log(
+            kind="policy_decision",
+            policy=decision.decision,
+            policyReason=decision.reason,
+            toolName=name,
+        )
+        if decision.decision == "DENY":
+            return False, f"정책상 거부됨: {action_id}"
+        if decision.decision == "ASK_USER" and not self.policy.confirm(action_id):
+            return False, "사용자가 작업을 거부했습니다."
+        if action_id == "write_file":
+            self._confirmed_write_paths.add(path)
+        return True, None
+
+    def _gate_generated_file_write_path(self, name: str, path: str) -> tuple[bool, str | None]:
+        """Generated tools may use workspace files as scratch/output, but never escape."""
+        if not self._path_escapes_workspace(path):
+            return True, None
+        if self.policy is None:
+            return False, "정책상 거부됨: out_of_workspace"
+        decision = self.policy.evaluate("out_of_workspace")
+        self.tracer.log(
+            kind="policy_decision",
+            policy=decision.decision,
+            policyReason=decision.reason,
+            toolName=name,
+        )
+        return False, "정책상 거부됨: out_of_workspace"
 
     def _is_side_effect_tool(self, name: str) -> bool:
         return name == "writeFile"
@@ -593,33 +1202,23 @@ class AgentRunner:
         an out-of-workspace target is denied outright; an in-workspace write asks
         the user. Other tools are allowed.
         """
-        assert self.policy is not None
         if name == "writeFile":
             path = str(payload.get("path", ""))
         else:
             return True, None
-        escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
-        action_id = "out_of_workspace" if escapes else "write_file"
-        if action_id == "write_file" and path in self._confirmed_write_paths:
-            return True, None
-        decision = self.policy.evaluate(action_id)
-        self.tracer.log(
-            kind="policy_decision",
-            policy=decision.decision,
-            policyReason=decision.reason,
-            toolName=name,
-        )
-        if decision.decision == "DENY":
-            return False, f"정책상 거부됨: {action_id}"
-        if decision.decision == "ASK_USER" and not self.policy.confirm(action_id):
-            return False, "사용자가 작업을 거부했습니다."
-        if action_id == "write_file":
-            self._confirmed_write_paths.add(path)
-        return True, None
+        return self._gate_file_write_path(name, path)
 
     def run_turn(self, request: str) -> TurnResult:
         state = self._start_turn(request)
         with self.tracer.trace():
+            outside_write = self._outside_workspace_write_request_observation(request)
+            if outside_write is not None:
+                self._append_observation(state, outside_write)
+                state.result.summary = outside_write
+                state.result.stopped_reason = "finish"
+                self._finish_turn(state.result)
+                return state.result
+
             for _ in range(self.deps.max_iterations):
                 raw = self._plan_raw()
                 parsed = parse_action_text(raw)
@@ -746,6 +1345,9 @@ class AgentRunner:
         return state.turn_state.terminal_block_observation()
 
     def _handle_finish_action(self, state: _TurnLoopState, action: Finish) -> _StepAction:
+        if validation := self._terminal_validation_observation(state):
+            self._append_observation(state, validation)
+            return "continue"
         if terminal_block := self._terminal_block(state):
             self._append_observation(state, terminal_block)
             return "continue"
@@ -762,6 +1364,9 @@ class AgentRunner:
             if repeated_request is not None:
                 self._append_observation(state, repeated_request)
                 return "continue"
+            if validation := self._terminal_validation_observation(state):
+                self._append_observation(state, validation)
+                return "continue"
             if terminal_block := self._terminal_block(state):
                 self._append_observation(state, terminal_block)
                 return "continue"
@@ -773,6 +1378,13 @@ class AgentRunner:
             return "break"
         self._append_observation(state, "계속 진행하세요.")
         return "continue"
+
+    def _terminal_validation_observation(self, state: _TurnLoopState) -> str | None:
+        validation = self._validate_completed_work(state.effective_request)
+        if validation is None:
+            return None
+        ok, message = validation
+        return None if ok else message
 
     def _handle_ask_user_action(self, state: _TurnLoopState, action: AskUser) -> _StepAction:
         blocked_ask = self._blocked_ask_user_observation(action.question, state.effective_request)
@@ -795,6 +1407,23 @@ class AgentRunner:
     def _handle_call_tool_action(
         self, state: _TurnLoopState, action: CallTool, sig: str | None
     ) -> _StepAction:
+        generated_write_fields = self._generated_tool_write_path_fields(action.name, action.input)
+        for _, path in generated_write_fields:
+            allowed, blocked = self._gate_generated_file_write_path(action.name, path)
+            if not allowed:
+                assert blocked is not None
+                self._append_observation(state, blocked)
+                return "continue"
+
+        if action.name == "writeFile" and not isinstance(action.input.get("content"), str):
+            self._append_observation(
+                state,
+                "writeFile content는 문자열이어야 합니다. content:null 또는 final:true로 파일 쓰기를 "
+                "호출하지 마세요. 현재 요청이 읽기 전용 계산이면 writeFile을 쓰지 말고 최종 답변으로 "
+                "결과를 반환하세요.",
+            )
+            return "continue"
+
         if action.name == "writeFile" and self._request_forbids_file_write(state.effective_request):
             self._append_observation(
                 state,
@@ -803,6 +1432,36 @@ class AgentRunner:
             )
             return "continue"
 
+        if (
+            action.name != "searchDocs"
+            and self.deps.registry.has("searchDocs")
+            and self._request_needs_object_tree_mutation(state.effective_request)
+            and not state.used_search_docs
+        ):
+            self._append_observation(
+                state,
+                "이 작업은 문서 근거가 필요한 object tree 상태 변경입니다. 먼저 searchDocs를 "
+                "호출해 Entity health와 children 구조를 확인한 뒤 파일을 수정하세요.",
+            )
+            return "continue"
+
+        missing_mutation = self._run_python_missing_required_mutation_observation(
+            state.effective_request, action
+        )
+        if missing_mutation is not None:
+            self._append_observation(state, missing_mutation)
+            return "continue"
+
+        if action.name == "writeFile":
+            table_validation = self._previous_json_filter_table_validation(
+                state.effective_request,
+                str(action.input.get("path", "")),
+                str(action.input.get("content", "")),
+            )
+            if table_validation is not None and not table_validation[0]:
+                self._append_observation(state, table_validation[1])
+                return "continue"
+
         if self.policy is not None:
             allowed, blocked = self._gate(action.name, action.input)
             if not allowed:
@@ -810,16 +1469,24 @@ class AgentRunner:
                 self._append_observation(state, blocked)
                 return "continue"
 
+        restore_snapshots = self._mutation_restore_snapshots(state.effective_request, action)
         res = self.deps.registry.call(action.name, action.input)
         self._log_tool_call(action.name, action.input, res)
         if res.ok:
             state.fix_failures = 0
+            if action.name == "searchDocs":
+                state.used_search_docs = True
             assert sig is not None
             observation = f"도구 {action.name} 결과: {res.output}"
             self._tool_result_cache[sig] = res
         else:
             state.fix_failures += 1
             observation = f"도구 {action.name} 실패: {res.error}"
+            error_hint = self._tool_error_recovery_hint(
+                action.name, res.error, state.effective_request
+            )
+            if error_hint is not None:
+                observation = f"{observation}\n{error_hint}"
             recovery_hint = self._tool_failure_recovery_hint(state.effective_request)
             if recovery_hint is not None:
                 observation = f"{observation}\n{recovery_hint}"
@@ -830,11 +1497,46 @@ class AgentRunner:
             self._append_observation(state, "연속 실패가 한계를 넘었습니다. 작업을 중단합니다.")
             state.result.stopped_reason = "consecutive_failures"
             return "break"
+        if res.ok and action.name not in {"readFile", "listFiles", "searchDocs"}:
+            post_validation = self._validate_completed_work(state.effective_request, action, res)
+            if post_validation is not None:
+                ok, message = post_validation
+                if not ok and restore_snapshots:
+                    repair = self._try_repair_completed_work(
+                        state.effective_request, restore_snapshots
+                    )
+                    if repair is not None:
+                        ok, message = repair
+                    else:
+                        self._restore_workspace_files(restore_snapshots)
+                        message = f"{message} 잘못된 파일 변경은 원본 상태로 되돌렸습니다."
+                self._append_observation(state, message)
+                if ok:
+                    output_path = self._likely_output_path(
+                        state.effective_request, Path(message.split()[0]).suffix
+                    )
+                    if output_path is not None:
+                        state.completed_output_paths.add(output_path)
+                    state.result.summary = message
+                    state.result.stopped_reason = "finish"
+                    return "break"
         return "continue"
 
     def _handle_create_tool_action(self, state: _TurnLoopState, action: CreateTool) -> _StepAction:
+        if (
+            state.turn_state.changed_tool_names is not None
+            and action.spec.name in state.turn_state.changed_tool_names
+        ):
+            self._append_observation(
+                state,
+                f"도구 {action.spec.name}은(는) 이미 이 턴에서 생성했습니다."
+                + self._tool_call_next_step_hint(action, state.effective_request),
+            )
+            return "continue"
         self._tool_result_cache.clear()
-        observation = self._handle_create(action)
+        observation = self._handle_create(action) + self._tool_call_next_step_hint(
+            action, state.effective_request
+        )
         state.turn_state.record_tool_change(action.spec.name)
         self._append_observation(state, observation)
         return "continue"
@@ -894,6 +1596,7 @@ class AgentRunner:
             "생성·등록 완료",
             "수정 완료",
             "사용자 답변:",
+            "이미 이 턴에서 생성했습니다.",
         )
         if any(marker in observation for marker in hidden_markers):
             return ""

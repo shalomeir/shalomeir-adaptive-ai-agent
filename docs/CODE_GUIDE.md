@@ -192,14 +192,13 @@ for line in res.stdout.splitlines():
 ## 6. 권한 게이트
 
 부수효과가 있는 호출은 실행 전에 정책을 거친다. 판단은 모델이 아니라 런타임이 내린다.
-현재는 `writeFile`을 막는다: 작업 영역 밖 경로는 바로 거부, 안쪽 쓰기는 사용자에게 묻는다.
-동일한 성공 tool call은 캐시를 재사용해 같은 승인 질문을 계속 띄우지 않는다.
+`writeFile`은 파일 쓰기 정책을 거친다. 작업 영역 밖 경로는 바로 거부하고, 안쪽 쓰기는 사용자에게
+묻는다. 파일 출력 경로를 받는 생성 도구는 작업 영역 밖 경로만 실행 전 거부하고, 작업 영역 내부
+상대 경로는 임시/출력 파일로 사용할 수 있게 둔다. 동일한 성공 tool call은 캐시를 재사용해 같은
+승인 질문을 계속 띄우지 않는다.
 
 ```python
-def _gate(self, name, payload):
-    if name != "writeFile":
-        return True, None
-    path = str(payload.get("path", ""))
+def _gate_file_write_path(self, name, path):
     escapes = path.startswith("/") or path.startswith("~") or ".." in Path(path).parts
     action_id = "out_of_workspace" if escapes else "write_file"
     decision = self.policy.evaluate(action_id)
@@ -209,6 +208,17 @@ def _gate(self, name, payload):
         return False, "사용자가 작업을 거부했습니다."
     return True, None
 ```
+
+생성 도구는 `output`, `dst`, `destination`, `target` 같은 출력 경로 필드를 payload에 담고 있으면
+경로 이탈 후보로 본다. 해당 값이 절대 경로, `~`, 또는 `..`를 포함하면 모델 판단과 무관하게
+거부한다.
+
+파일 변환처럼 결과 상태가 중요한 요청은 도구 성공만으로 끝내지 않고 작업 영역 파일을 다시 읽어
+가벼운 검증을 한다. CSV 중복 제거·date 정렬은 전체 행 기준 dedupe와 stable date sort를 확인하고,
+object tree 제거 요청은 저장된 JSON에 제거 대상이 남아 있는지 확인한다. 이전 필터 결과를 markdown
+표로 저장하는 후속 요청은 이전 JSON 소스를 다시 읽어 실제 값과 정렬 순서를 검증한다. 검증 실패는
+observation으로 되먹이고, 검증 성공은 약한 모델이 final을 반복하지 않도록 완료 summary로 접을 수
+있다.
 
 `PolicyManager`는 `_DENY`, `_ASK` 집합으로 행동을 분류한다. 작업 영역 밖 접근은 `_DENY`에
 있어 사용자 승인으로도 우회되지 않는다.

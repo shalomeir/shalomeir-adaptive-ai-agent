@@ -203,7 +203,7 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
         ask="y",
         skills_dir=skills_dir,
     )
-    runner_a.run_turn("dedup and sort events.csv")
+    runner_a.run_turn("dedup and sort events.csv and save to out1.csv")
     rows1 = _data_rows(out1)
     assert len(rows1) == 5
     dates1 = [r[1] for r in rows1]
@@ -218,7 +218,7 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
         tmp_path / "b",
         ws_b,
         [
-            _call("normalize-csv", {"src": str(ws_b / "events2.csv"), "dst": str(out2)}),
+            _call("normalize-csv", {"src": "events2.csv", "dst": "out2.csv"}),
             _finish(),
         ],
         ask="y",
@@ -226,7 +226,7 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
     )
     # reused tool is registered from the persisted skill at init
     assert any(d.name == "normalize-csv" for d in runner_b.deps.registry.digests())
-    runner_b.run_turn("dedup and sort events2.csv")
+    runner_b.run_turn("dedup and sort events2.csv and save to out2.csv")
     rows2 = _data_rows(out2)
     assert len(rows2) == 3
     assert [r[0] for r in rows2] == ["a", "b", "c"]
@@ -273,7 +273,7 @@ def test_d2_live_prompt_uses_general_python_then_write_file(tmp_path: Path) -> N
     )
 
     assert "events-clean.csv" in result.summary
-    assert runner.deps.llm.calls == 3
+    assert runner.deps.llm.calls == 2
     rows = _data_rows(ws / "events-clean.csv")
     assert len(rows) == 5
     assert [row[1] for row in rows] == sorted(row[1] for row in rows)
@@ -354,6 +354,25 @@ def test_d7_out_of_workspace_denied(tmp_path: Path) -> None:
     )
     result = runner.run_turn("save outside workspace")
     assert any("거부" in o for o in result.observations)
+    assert not (ws.parent / "events-sorted.csv").exists()
+
+
+def test_d7_run_python_dynamic_out_of_workspace_write_denied(tmp_path: Path) -> None:
+    ws = _make_ws(tmp_path)
+    shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
+    runner = _runner(
+        tmp_path,
+        ws,
+        [
+            _finish("should not call llm"),
+        ],
+        ask="y",
+    )
+
+    result = runner.run_turn("events.csv를 정렬해서 ../events-sorted.csv에 저장해줘.")
+
+    assert "정책상 거부됨: out_of_workspace" in result.summary
+    assert runner.deps.llm.calls == 0
     assert not (ws.parent / "events-sorted.csv").exists()
 
 
@@ -497,18 +516,14 @@ def test_d4_ambiguous_then_clarified(tmp_path: Path) -> None:
             _call("normalize-csv", {"src": "events.csv", "dst": "out.csv"}),
             _finish(),
         ],
-        ask="events.csv를 중복 제거하고 date로 정렬",
+        ask="events.csv를 중복 제거하고 date로 정렬해서 out.csv로 저장",
     )
+    runner.policy = PolicyManager(ask=lambda q: "y")
 
-    # turn 1 must not build a tool or write any file
+    # The vague turn asks first; once the user supplies concrete clarification,
+    # the same turn can proceed and produce the D2-style result.
     runner.run_turn("데이터 좀 정리해줘")
-    kinds_after_turn1 = _log_kinds(tmp_path)
-    assert "tool_create" not in kinds_after_turn1
-    assert not out.exists()
     assert any(event.get("actionType") == "ask_user" for event in _log_events(tmp_path))
-
-    # turn 2 produces the same result as D2
-    runner.run_turn("events.csv에서 중복 행 제거하고 date로 정렬해줘")
     rows = _data_rows(out)
     assert len(rows) == 5
     dates = [r[1] for r in rows]
