@@ -139,6 +139,7 @@ adaptive-agent chat
 ```bash
 adaptive-agent version        # 버전 출력
 adaptive-agent chat           # 대화형 세션 시작
+adaptive-agent chat --no-loading   # 처리 중 loading 표시 없이 시작
 adaptive-agent chat --docs-dir demorsc/docs   # 근거 조회용 문서 폴더 지정(기본값)
 
 # 작업 한 건을 비대화형으로 실행(스크립트·CI·반복 테스트용)
@@ -155,6 +156,8 @@ adaptive-agent run "..." --max-iterations 30   # 반복 상한 override
 대화형 `chat` 세션 동작은 이렇다.
 
 - `you:` 프롬프트에 자연어로 요청을 적는다.
+- 요청을 받은 뒤 처리 중에는 `agent: loading.`, `loading..`, `loading...`을 순환 표시한다.
+  이 표시는 답변이나 사용자 확인 prompt 전에 지워지고, `--no-loading`으로 끌 수 있다.
 - 인사, 모델명 질문, 짧은 잡담은 도구 계획 없이 바로 답한다.
 - 요청이 모호하면 에이전트가 되묻는다. 답을 입력하면 이어 진행한다.
 - 파일 쓰기, 도구 저장처럼 부수효과가 있는 단계에서 `(y/n)`을 묻는다. `y`로 승인, `n`으로 거절.

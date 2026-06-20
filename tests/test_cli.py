@@ -1,3 +1,6 @@
+from io import StringIO
+
+from rich.console import Console
 from typer.testing import CliRunner
 
 from adaptive_agent import cli
@@ -52,6 +55,77 @@ def test_chat_renders_clarification_as_dialogue(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert "agent: 어떤 데이터를 어떻게 정리할까요?" in result.stdout
     assert "agent: 알겠습니다." in result.stdout
+
+
+def test_chat_skips_loading_in_non_terminal_capture(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_llm(monkeypatch, ['{"action":"finish","summary":"completed"}'])
+
+    result = CliRunner().invoke(app, ["chat"], input="do something\nexit\n")
+
+    assert result.exit_code == 0
+    assert "agent: completed" in result.stdout
+    assert "loading" not in result.stdout
+
+
+def test_loading_indicator_clears_before_result_for_terminal(monkeypatch):
+    class FakeRunner:
+        def run_turn(self, request):
+            return "done"
+
+    stream = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=stream, force_terminal=True))
+    monkeypatch.setattr(cli, "LOADING_INTERVAL_SEC", 10)
+
+    result = cli._run_turn_with_loading(FakeRunner(), "go")
+
+    assert result == "done"
+    output = stream.getvalue()
+    assert f"agent: {cli.LOADING_STYLE_START}loading.{cli.LOADING_STYLE_END}" in output
+    assert output.endswith("\r\x1b[K")
+
+
+def test_loading_indicator_stops_before_interactive_prompt(monkeypatch):
+    class PromptingRunner:
+        def run_turn(self, request):
+            cli._stop_active_loading()
+            return "done"
+
+    stream = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=stream, force_terminal=True))
+    monkeypatch.setattr(cli, "LOADING_INTERVAL_SEC", 10)
+
+    result = cli._run_turn_with_loading(PromptingRunner(), "go")
+
+    assert result == "done"
+    output = stream.getvalue()
+    assert output.count(f"agent: {cli.LOADING_STYLE_START}loading.{cli.LOADING_STYLE_END}") == 1
+    assert output.endswith("\r\x1b[K")
+
+
+def test_loading_can_be_disabled_for_terminal(monkeypatch):
+    class FakeRunner:
+        def run_turn(self, request):
+            return "done"
+
+    stream = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=stream, force_terminal=True))
+
+    result = cli._run_turn_with_loading(FakeRunner(), "go", enabled=False)
+
+    assert result == "done"
+    assert stream.getvalue() == ""
+
+
+def test_run_command_does_not_print_loading(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _patch_llm(monkeypatch, ['{"action":"finish","summary":"completed"}'])
+
+    result = CliRunner().invoke(app, ["run", "do something"])
+
+    assert result.exit_code == 0
+    assert "completed" in result.stdout
+    assert "loading..." not in result.stdout
 
 
 def test_chat_exit_during_clarification_ends_session(monkeypatch, tmp_path):

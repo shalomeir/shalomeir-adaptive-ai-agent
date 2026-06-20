@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import threading
 from typing import Callable
 
 import typer
@@ -28,6 +29,11 @@ from .tools.registry import ToolRegistry
 
 app = typer.Typer(add_completion=False)
 console = Console()
+LOADING_FRAMES = ("loading.", "loading..", "loading...", "loading..")
+LOADING_INTERVAL_SEC = 0.35
+LOADING_STYLE_START = "\033[33m"
+LOADING_STYLE_END = "\033[0m"
+_active_loading_stop: Callable[[], None] | None = None
 
 
 @app.command()
@@ -38,6 +44,7 @@ def version() -> None:
 
 def _ask(question: str, choices: list[str] | None = None) -> str:
     """Render an agent clarification as dialogue instead of a raw prompt."""
+    _stop_active_loading()
     console.print(f"[green]agent[/green]: {question}")
     answer = Prompt.ask("[cyan]you[/cyan]", choices=choices)
     if answer.strip().lower() in {"exit", "quit"}:
@@ -47,8 +54,78 @@ def _ask(question: str, choices: list[str] | None = None) -> str:
 
 def _confirm(question: str) -> str:
     """Render policy confirmations separately from open-ended chat."""
+    _stop_active_loading()
     console.print(f"[green]agent[/green]: {question}")
     return Prompt.ask("[cyan]you[/cyan]", default="n")
+
+
+def _stop_active_loading() -> None:
+    if _active_loading_stop is not None:
+        _active_loading_stop()
+
+
+class _LoadingIndicator:
+    """Small terminal-only one-line loading indicator."""
+
+    def __init__(self, target_console: Console) -> None:
+        self.console = target_console
+        self.done = threading.Event()
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+        self.active = False
+
+    def start(self) -> None:
+        if not self.console.is_terminal:
+            return
+        self.active = True
+        self._render(LOADING_FRAMES[0])
+        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.done.set()
+        if self.thread is not None and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=LOADING_INTERVAL_SEC + 0.1)
+        with self.lock:
+            if not self.active:
+                return
+            self.console.file.write("\r\033[K")
+            self.console.file.flush()
+            self.active = False
+
+    def _animate(self) -> None:
+        index = 0
+        while not self.done.wait(LOADING_INTERVAL_SEC):
+            index = (index + 1) % len(LOADING_FRAMES)
+            self._render(LOADING_FRAMES[index])
+
+    def _render(self, frame: str) -> None:
+        with self.lock:
+            if not self.active:
+                return
+            self.console.file.write(
+                f"\r\033[Kagent: {LOADING_STYLE_START}{frame}{LOADING_STYLE_END}"
+            )
+            self.console.file.flush()
+
+
+def _run_turn_with_loading(runner: AgentRunner, request: str, *, enabled: bool = True):
+    """Run one interactive turn with a transient terminal loading indicator."""
+    if not enabled or not console.is_terminal:
+        return runner.run_turn(request)
+
+    indicator = _LoadingIndicator(console)
+    stop_loading = indicator.stop
+    global _active_loading_stop
+    previous_stop = _active_loading_stop
+    indicator.start()
+    _active_loading_stop = stop_loading
+    try:
+        return runner.run_turn(request)
+    finally:
+        stop_loading()
+        if _active_loading_stop is stop_loading:
+            _active_loading_stop = previous_stop
 
 
 def _assemble_runner(
@@ -95,7 +172,10 @@ def _assemble_runner(
 
 
 @app.command()
-def chat(docs_dir: str = "demorsc/docs") -> None:
+def chat(
+    docs_dir: str = "demorsc/docs",
+    loading: bool = typer.Option(True, "--loading/--no-loading", help="처리 중 loading 표시"),
+) -> None:
     """대화형 에이전트 세션을 시작한다."""
     load_dotenv()  # read provider settings from a local .env if present
     cfg = AgentConfig.load()
@@ -111,7 +191,7 @@ def chat(docs_dir: str = "demorsc/docs") -> None:
         if request.strip().lower() in {"exit", "quit"}:
             break
         try:
-            result = runner.run_turn(request)
+            result = _run_turn_with_loading(runner, request, enabled=loading)
         except (EOFError, KeyboardInterrupt):
             break
         console.print(f"[green]agent[/green]: {result.summary or '작업을 마쳤습니다.'}")
