@@ -98,7 +98,7 @@
 - 이벤트 종류: llm_call, tool_call, tool_create, tool_update, verify, ask_user, policy_decision
 - 타임스탬프와 소요 시간
 - LLM 호출이면 model, 입력·출력 토큰 수, 캐시 적중 여부, action 종류, 파싱 성공 여부와 재시도 횟수
-- 도구 실행이면 도구 이름, 종료 코드, timeout 여부, 출력 크기, 잘림 여부
+- 도구 실행이면 도구 이름, 성공 여부, 입력 preview, 출력 또는 오류 preview, 전체 글자 수, 잘림 여부
 - 권한 결정이면 ALLOW, DENY, ASK_USER 중 무엇이었는지와 사유
 - 검증이면 통과 여부와 실패 사유
 - 자가수정이면 몇 번째 수정 시도인지

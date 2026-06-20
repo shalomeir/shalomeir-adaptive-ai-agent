@@ -270,7 +270,11 @@ except Exception:
 `Tracer`는 생성될 때 `sessionId`를 만들고 `logs/session-*.jsonl` 파일 하나에 그 세션의
 이벤트를 기록한다. `runner.py`는 LLM 호출 직후 `llm_call` 이벤트에 응답 원문 preview,
 전체 글자 수, 잘림 여부를 기록한다. preview는 로컬 진단용이며 무한정 커지지 않도록
-4000자로 제한한다.
+4000자로 제한한다. LLM이 `call_tool` 액션을 고른 시점에는 `llm_call` 이벤트에 도구 이름과
+입력 preview를 남긴다. 실제 도구 실행 뒤에는 `tool_call` 이벤트에 도구 이름, 성공 여부,
+입력 preview, 출력 또는 오류 preview를 같은 방식으로 남겨, LLM이 아닌 런타임 도구의 입출력도
+로그만으로 추적할 수 있게 한다. preview 직렬화 전에는 `apiKey`, `token`, `password` 같은
+민감 필드명을 마스킹한다.
 
 ## 10. 따라 읽는 순서
 

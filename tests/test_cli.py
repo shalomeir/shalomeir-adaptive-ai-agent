@@ -105,7 +105,10 @@ def test_chat_exit_at_policy_confirmation_does_not_hide_completed_summary(monkey
     result = CliRunner().invoke(app, ["chat"], input="도구 만들어줘\nexit\n")
 
     assert result.exit_code == 0
-    assert "agent: 생성한 도구 'noop'을(를) 다음 세션에서도 재사용하도록 저장할까요? (y/n)" in result.stdout
+    assert (
+        "agent: 생성한 도구 'noop'을(를) 다음 세션에서도 재사용하도록 저장할까요? (y/n)"
+        in result.stdout
+    )
     assert "agent: 완료했습니다." in result.stdout
 
 

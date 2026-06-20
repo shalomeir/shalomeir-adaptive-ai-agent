@@ -86,6 +86,116 @@ def test_call_tool_observation(tmp_path):
     assert any("x" in o for o in result.observations)
 
 
+def test_tool_call_logs_input_and_output(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"call_tool","name":"echo","input":{"x":1}}',
+            '{"action":"finish","summary":"ok"}',
+        ],
+    )
+
+    runner.run_turn("use echo")
+
+    events = read_log_events(runner)
+    tool_event = next(event for event in events if event["kind"] == "tool_call")
+    assert tool_event["toolName"] == "echo"
+    assert tool_event["toolOk"] is True
+    assert tool_event["toolInput"] == '{"x": 1}'
+    assert tool_event["toolInputChars"] == len('{"x": 1}')
+    assert tool_event["toolInputTruncated"] is False
+    assert tool_event["toolOutput"] == '{"x": 1}'
+    assert tool_event["toolOutputChars"] == len('{"x": 1}')
+    assert tool_event["toolOutputTruncated"] is False
+
+
+def test_call_tool_action_log_includes_tool_name_and_input(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"call_tool","name":"echo","input":{"x":1}}',
+            '{"action":"finish","summary":"ok"}',
+        ],
+    )
+
+    runner.run_turn("use echo")
+
+    events = read_log_events(runner)
+    action_event = next(
+        event
+        for event in events
+        if event["kind"] == "llm_call" and event.get("actionType") == "call_tool"
+    )
+    assert action_event["toolName"] == "echo"
+    assert action_event["toolInput"] == '{"x": 1}'
+    assert action_event["toolInputChars"] == len('{"x": 1}')
+    assert action_event["toolInputTruncated"] is False
+    assert "toolOutput" not in action_event
+
+
+def test_tool_call_logs_input_and_error(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "boom",
+            "boom",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=False, error=f"bad input: {inp['x']}"),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"boom","input":{"x":2}}',
+                    '{"action":"finish","summary":"handled"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    runner.run_turn("use boom")
+
+    events = read_log_events(runner)
+    tool_event = next(event for event in events if event["kind"] == "tool_call")
+    assert tool_event["toolName"] == "boom"
+    assert tool_event["toolOk"] is False
+    assert tool_event["toolInput"] == '{"x": 2}'
+    assert tool_event["toolError"] == "bad input: 2"
+    assert tool_event["toolErrorChars"] == len("bad input: 2")
+    assert tool_event["toolErrorTruncated"] is False
+    assert "toolOutput" not in tool_event
+
+
+def test_tool_call_log_redacts_secret_shaped_fields(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            (
+                '{"action":"call_tool","name":"echo","input":'
+                '{"apiKey":"sk-secret","nested":{"token":"tok-secret","safe":"ok"}}}'
+            ),
+            '{"action":"finish","summary":"ok"}',
+        ],
+    )
+
+    runner.run_turn("use echo")
+
+    events = read_log_events(runner)
+    tool_event = next(event for event in events if event["kind"] == "tool_call")
+    assert "sk-secret" not in tool_event["toolInput"]
+    assert "tok-secret" not in tool_event["toolInput"]
+    assert "sk-secret" not in tool_event["toolOutput"]
+    assert "tok-secret" not in tool_event["toolOutput"]
+    assert '"apiKey": "[REDACTED]"' in tool_event["toolInput"]
+    assert '"token": "[REDACTED]"' in tool_event["toolOutput"]
+    assert '"safe": "ok"' in tool_event["toolOutput"]
+
+
 def test_bad_json_then_recovers(tmp_path):
     runner = build_runner(
         tmp_path,

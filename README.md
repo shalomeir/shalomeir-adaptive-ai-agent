@@ -177,6 +177,12 @@ ls -t logs/session-*.jsonl | head -1
 cat "$(ls -t logs/session-*.jsonl | head -1)" | python -m json.tool   # 또는 jq
 ```
 
+`tool_call` 이벤트에는 실행한 도구 이름, 성공 여부, 입력 preview, 출력 또는 오류 preview가 함께
+남는다. 큰 값은 4000자로 잘리고 전체 글자 수와 잘림 여부가 같이 기록된다. `apiKey`,
+`token`, `password` 같은 민감 필드명은 로그에 쓰기 전에 마스킹된다.
+LLM이 `call_tool`을 선택한 시점의 `llm_call` 이벤트에도 도구 이름과 입력 preview가 남고,
+실제 실행 결과는 이어지는 `tool_call` 이벤트에서 확인한다.
+
 저장된 도구를 확인하려면 skill 폴더를 본다.
 
 ```bash

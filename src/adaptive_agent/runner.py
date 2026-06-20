@@ -25,6 +25,17 @@ from .tools.registry import ToolRegistry
 
 NON_INTERACTIVE_ASK = "__adaptive_agent_non_interactive_ask_unavailable__"
 LLM_RESPONSE_LOG_CHARS = 4000
+TOOL_PAYLOAD_LOG_CHARS = 4000
+REDACTED_LOG_VALUE = "[REDACTED]"
+SENSITIVE_LOG_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 _SYSTEM = (
     "You are a task-solving agent that creates and runs small Python tools. You are not a "
@@ -133,6 +144,38 @@ def _preview_text(text: str, limit: int = LLM_RESPONSE_LOG_CHARS) -> tuple[str, 
     if len(text) <= limit:
         return text, False
     return text[:limit], True
+
+
+def _redact_for_log(value: Any) -> Any:
+    """Mask common secret-shaped fields before writing diagnostic payloads."""
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            key_text = str(key).replace("-", "_").lower()
+            if any(part in key_text for part in SENSITIVE_LOG_KEY_PARTS):
+                redacted[key] = REDACTED_LOG_VALUE
+            else:
+                redacted[key] = _redact_for_log(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_for_log(item) for item in value)
+    return value
+
+
+def _preview_value(value: Any, limit: int = TOOL_PAYLOAD_LOG_CHARS) -> tuple[str, int, bool]:
+    """Serialize and bound structured tool payloads for JSONL diagnostics."""
+    value = _redact_for_log(value)
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            text = repr(value)
+    preview, truncated = _preview_text(text, limit)
+    return preview, len(text), truncated
 
 
 class AgentRunner:
@@ -484,6 +527,49 @@ class AgentRunner:
     def _cached_tool_observation(self, name: str, result: ToolResult) -> str:
         return f"도구 {name} 캐시 결과: {result.output}"
 
+    def _log_parsed_action(self, action: Any) -> None:
+        fields: dict[str, Any] = {"actionType": action.action, "parseOk": True}
+        if isinstance(action, CallTool):
+            tool_input, input_chars, input_truncated = _preview_value(action.input)
+            fields.update(
+                {
+                    "toolName": action.name,
+                    "toolInput": tool_input,
+                    "toolInputChars": input_chars,
+                    "toolInputTruncated": input_truncated,
+                }
+            )
+        self.tracer.log(kind="llm_call", **fields)
+
+    def _log_tool_call(self, name: str, payload: dict[str, Any], result: ToolResult) -> None:
+        tool_input, input_chars, input_truncated = _preview_value(payload)
+        fields: dict[str, Any] = {
+            "toolName": name,
+            "toolOk": result.ok,
+            "toolInput": tool_input,
+            "toolInputChars": input_chars,
+            "toolInputTruncated": input_truncated,
+        }
+        if result.ok:
+            tool_output, output_chars, output_truncated = _preview_value(result.output)
+            fields.update(
+                {
+                    "toolOutput": tool_output,
+                    "toolOutputChars": output_chars,
+                    "toolOutputTruncated": output_truncated,
+                }
+            )
+        else:
+            tool_error, error_chars, error_truncated = _preview_value(result.error or "")
+            fields.update(
+                {
+                    "toolError": tool_error,
+                    "toolErrorChars": error_chars,
+                    "toolErrorTruncated": error_truncated,
+                }
+            )
+        self.tracer.log(kind="tool_call", **fields)
+
     def _plan_raw(self) -> str:
         with self.tracer.span():
             digests = self.deps.registry.digests()
@@ -545,7 +631,7 @@ class AgentRunner:
                 state.parse_failures = 0
                 action = parsed.action
                 state.turn_state.advance()
-                self.tracer.log(kind="llm_call", actionType=action.action, parseOk=True)
+                self._log_parsed_action(action)
 
                 sig, step = self._apply_loop_guards(state, action)
                 if step == "break":
@@ -724,7 +810,7 @@ class AgentRunner:
                 return "continue"
 
         res = self.deps.registry.call(action.name, action.input)
-        self.tracer.log(kind="tool_call", toolName=action.name)
+        self._log_tool_call(action.name, action.input, res)
         if res.ok:
             state.fix_failures = 0
             assert sig is not None

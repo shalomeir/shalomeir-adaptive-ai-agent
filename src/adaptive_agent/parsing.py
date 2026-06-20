@@ -11,7 +11,7 @@ _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _CANONICAL_ACTIONS = {"respond", "ask_user", "call_tool", "create_tool", "update_tool", "finish"}
 _DIRECT_TOOL_ACTIONS = {"readFile", "writeFile", "listFiles", "runPython", "searchDocs", "askUser"}
 _ACTION_CONTRACT = (
-    '반드시 action 필드를 포함하세요. 최종 답변은 '
+    "반드시 action 필드를 포함하세요. 최종 답변은 "
     '{"action":"respond","text":"...","final":true} 또는 '
     '{"action":"finish","summary":"..."} 형식이어야 합니다. '
     '도구 결과 JSON을 {"path":...}처럼 그대로 최상위 응답으로 반환하지 마세요.'
@@ -74,7 +74,9 @@ def _quote_triple_quoted_fields(text: str) -> str:
 
 def json_repair(raw: str) -> dict[str, Any]:
     """Best-effort JSON extraction: strip fences, extract object, fix trailing commas."""
-    candidate = _remove_trailing_commas(_quote_triple_quoted_fields(_extract_object(_strip_fence(raw))))
+    candidate = _remove_trailing_commas(
+        _quote_triple_quoted_fields(_extract_object(_strip_fence(raw)))
+    )
     value = json.loads(candidate)
     if not isinstance(value, dict):
         raise ValueError("top-level JSON value must be an object")

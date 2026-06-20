@@ -42,7 +42,10 @@ class ToolRegistry:
     def prepare_call(self, name: str, payload: dict[str, Any]) -> tuple[Tool | None, str | None]:
         tool = self._resolve(name)
         if tool is None:
-            return None, f"'{name}' 도구가 없습니다. 도구 목록을 다시 보거나 create_tool로 만드세요."
+            return (
+                None,
+                f"'{name}' 도구가 없습니다. 도구 목록을 다시 보거나 create_tool로 만드세요.",
+            )
         error = self._validate_payload(tool, payload)
         if error is not None:
             return tool, error
