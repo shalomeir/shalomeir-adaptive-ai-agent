@@ -5,6 +5,8 @@
 다시 돌린다. 사용자가 승인한 도구는 저장해 다음 세션에서 재사용한다. 제어 루프는 외부 에이전트
 프레임워크 없이 직접 구현했다.
 
+![adaptive-agent chat 실행 예시](docs/agent-cli-capture.png)
+
 - 설계 문서: `specs/`
 - 코드 읽기 가이드: `docs/CODE_GUIDE.md`
 - 구현 과정 요약: `docs/IMPLEMENTATION.md`
@@ -27,30 +29,43 @@ adaptive-agent version   # 0.1.1 이 찍히면 설치 성공
 
 ## 직접 대화하며 시연하기
 
-기본 실행 방식은 키 없이 로컬 [Ollama](https://ollama.com)의 `qwen2.5-coder:7b` 모델을
-사용하는 것이다. OpenAI API, Claude API, Vercel AI Gateway, OpenRouter API 키를 쓰는
-방식도 지원한다.
+권장 실행 방식은 OpenAI 호환 API를 쓰는 것이다. 예를 들어 OpenAI의 `gpt-5.4-mini`,
+Claude API, Vercel AI Gateway, OpenRouter를 사용할 수 있다. 로컬에서 키 없이 실험하고 싶을 때는
+[Ollama](https://ollama.com)의 `qwen2.5-coder:7b` 같은 모델을 보조 옵션으로 쓴다.
 
 ### 1) Model 설정
 
-#### a. 로컬 Ollama 기본 설정
+#### a. API key 설정
+
+```bash
+cp .env.example .env
+```
+
+OpenAI API를 쓰려면 `.env`의 OpenAI 블록을 주석 해제하고 본인 키를 넣는다.
+
+```bash
+AGENT_PROVIDER=openai
+AGENT_BASE_URL=https://api.openai.com/v1
+AGENT_MODEL=gpt-5.4-mini
+AGENT_API_KEY=sk-your-key-here
+```
+
+Claude API, Vercel AI Gateway, OpenRouter를 쓰고 싶다면 `.env` 하단의 해당 provider 블록을
+같은 방식으로 수정한다. OpenAI, Claude, Vercel AI Gateway, OpenRouter 블록 중 하나에서
+"uncomment the four lines below" 안내가 붙은 네 줄을 주석 해제하고, `AGENT_API_KEY`와
+`AGENT_MODEL`을 본인 계정에 맞게 바꾼다.
+
+#### b. 로컬 Ollama 보조 설정
+
+로컬 모델로만 실험하려면 `.env.example`의 기본값을 그대로 쓰고 Ollama 모델을 받는다.
 
 ```bash
 cp .env.example .env
 ollama pull qwen2.5-coder:7b
 ```
 
-기본값 그대로 쓴다면 사실상 설정은 여기서 끝난다. `.env.example`을 복사한 `.env`에는 이미
-Ollama의 OpenAI 호환 엔드포인트와 `qwen2.5-coder:7b` 모델명이 들어 있다.
-
+`.env.example`에는 Ollama의 OpenAI 호환 엔드포인트와 `qwen2.5-coder:7b` 모델명이 들어 있다.
 다른 Ollama 로컬 모델을 쓰고 싶다면 `.env`의 `AGENT_MODEL`만 바꾼다.
-
-#### b. API key 설정
-
-OpenAI API, Claude API, Vercel AI Gateway, OpenRouter를 쓰고 싶다면 `.env` 하단의 해당
-provider 블록을 수정한다. OpenAI, Claude, Vercel AI Gateway, OpenRouter 블록 중 하나에서
-"uncomment the four lines below" 안내가 붙은 네 줄을 주석 해제하고, `AGENT_API_KEY`와
-`AGENT_MODEL`을 본인 계정에 맞게 바꾼다.
 
 ### 2) 작업 영역에 데모 데이터 넣기
 
@@ -210,15 +225,18 @@ ruff format --check .
 
 ## 설정
 
-복사해서 시작할 `.env.example`이 있다. 기본값은 로컬 Ollama이며, OpenAI 호환 Chat
-Completions 엔드포인트라면 `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY` 조합으로 바꿔
-쓸 수 있다. Vercel AI Gateway는 `https://ai-gateway.vercel.sh/v1`, OpenRouter는
-`https://openrouter.ai/api/v1` base URL을 사용한다. `AGENT_PROVIDER=anthropic`이면 같은
-설정값으로 Anthropic native Messages API를 호출한다. Anthropic의 Opus 4.8 모델 ID는
-`claude-opus-4-8`처럼 hyphen 표기를 쓴다. Anthropic native 호출은 Opus 계열의 sampling
-파라미터 제한을 피하기 위해 `temperature`를 처음부터 보내지 않는다.
+복사해서 시작할 `.env.example`이 있다. 권장 설정은 OpenAI 호환 Chat Completions API에
+`AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY`를 지정하는 방식이다. OpenAI는
+`https://api.openai.com/v1` base URL과 `gpt-5.4-mini` 같은 모델명을 사용한다. Vercel AI Gateway는
+`https://ai-gateway.vercel.sh/v1`, OpenRouter는 `https://openrouter.ai/api/v1` base URL을 사용한다.
+`AGENT_PROVIDER=anthropic`이면 같은 설정값으로 Anthropic native Messages API를 호출한다.
+Anthropic의 Opus 4.8 모델 ID는 `claude-opus-4-8`처럼 hyphen 표기를 쓴다. Anthropic native 호출은
+Opus 계열의 sampling 파라미터 제한을 피하기 위해 `temperature`를 처음부터 보내지 않는다.
 
-| 변수 | 기본값 | 의미 |
+로컬 보조 옵션으로 Ollama를 쓸 수 있다. 저장소의 코드 기본값과 `.env.example`의 초기값은 키 없이
+바로 실험하기 쉽도록 Ollama `qwen2.5-coder:7b`를 가리킨다.
+
+| 변수 | 코드 기본값 | 의미 |
 | --- | --- | --- |
 | `AGENT_PROVIDER` | `openai-compatible` | provider 표식. 실제 호출 방식은 base URL과 model 조합이 정한다 |
 | `AGENT_BASE_URL` | `http://localhost:11434/v1` | chat completions 엔드포인트 |
