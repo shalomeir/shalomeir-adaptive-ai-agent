@@ -30,6 +30,75 @@ def build(tmp_path, replies, ask="y"):
     )
 
 
+class RecordingLLM:
+    def __init__(self, reply='{"action":"finish","summary":"done"}'):
+        self.reply = reply
+        self.messages = []
+
+    def chat(self, messages, digests):
+        self.messages = messages
+        return self.reply
+
+
+def test_system_prompt_names_configured_workspace_root(tmp_path):
+    runner = build(tmp_path, ['{"action":"finish","summary":"ok"}'])
+    system = runner.conv.messages()[0].content
+
+    assert "Current configured workspace root:" in system
+    assert str((tmp_path / "ws").resolve()) in system
+    assert "filename without a directory" in system
+    assert "workspace-relative" in system
+
+
+def test_runtime_state_includes_workspace_root_and_path_assumption(tmp_path):
+    ws = tmp_path / "ws"
+    llm = RecordingLLM()
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=ToolRegistry(),
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        ),
+        generated=GeneratedToolManager(
+            ws / ".session", ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+        ),
+    )
+
+    runner.run_turn("events.csv에서 date를 확인해줘")
+
+    runtime_state = llm.messages[-1]
+    assert runtime_state.role == "tool"
+    assert '"workspaceRoot": ' in runtime_state.content
+    assert str(ws.resolve()) in runtime_state.content
+    assert "Bare filenames and relative paths" in runtime_state.content
+
+
+def test_field_names_do_not_force_managed_tool_without_task_intent(tmp_path):
+    runner = build(tmp_path, ['{"action":"finish","summary":"ok"}'])
+
+    assert not runner._request_prefers_managed_tool("events.csv의 date 값을 알려줘")
+    assert not runner._request_prefers_managed_tool("monsters.json의 hp를 알려줘")
+    assert not runner._request_prefers_managed_tool("world.json의 health를 보여줘")
+
+
+def test_file_data_operations_still_prefer_managed_tool(tmp_path):
+    runner = build(tmp_path, ['{"action":"finish","summary":"ok"}'])
+
+    assert runner._request_prefers_managed_tool("events.csv를 date로 정렬해줘")
+    assert runner._request_prefers_managed_tool("events.csv에서 amount 합계를 구해줘")
+    assert runner._request_prefers_managed_tool("monsters.json에서 hp 평균을 알려줘")
+
+
+def test_create_and_update_words_need_file_context_for_write_intent(tmp_path):
+    runner = build(tmp_path, ['{"action":"finish","summary":"ok"}'])
+
+    assert not runner._request_mentions_file_write("create a tool for parsing JSON")
+    assert not runner._request_mentions_file_write("도구를 만들어줘")
+    assert runner._request_mentions_file_write("events.csv를 업데이트해줘")
+    assert runner._request_mentions_file_write("결과를 output.csv 파일로 만들어줘")
+
+
 def test_create_tool_registers_and_calls(tmp_path):
     runner = build(
         tmp_path,
@@ -95,8 +164,10 @@ def test_file_task_cannot_finish_after_tool_creation_without_execution(tmp_path)
         "events-clean.csv로 저장해줘."
     )
 
-    assert result.summary == "events-clean.csv 저장 완료"
-    assert any("실제 실행 결과가 아직 없습니다" in o for o in result.observations)
+    assert result.stopped_reason == "cached_result"
+    assert "도구 csv-dedupe-sort 결과 파일: events-clean.csv" in result.summary
+    assert "events-clean.csv 저장 검증 완료" in result.summary
+    assert any("최종 답변이 실행 결과가 아니라" in o for o in result.observations)
     assert any(
         "events-clean.csv 저장 검증 완료: CSV header=['id', 'date'], rows=0." in o
         for o in result.observations
@@ -106,6 +177,77 @@ def test_file_task_cannot_finish_after_tool_creation_without_execution(tmp_path)
         "생성한 도구 'csv-dedupe-sort'은(는) 현재 세션에서만 쓸 수 있습니다. 다음 세션에서도 "
         "재사용하도록 영구 저장할까요? (y/n)",
     ]
+
+
+def test_validated_generated_file_result_stops_before_later_actions(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("events.csv").write_text(
+        "id,date,label\n"
+        "b,2026-05-01,beta\n"
+        "a,2026-04-15,alpha\n"
+        "b,2026-05-01,beta\n"
+    )
+    code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    source = input['source']\n"
+        "    output = input['output']\n"
+        "    with open(source, newline='') as handle:\n"
+        "        rows = list(csv.DictReader(handle))\n"
+        "        fields = rows[0].keys() if rows else []\n"
+        "    seen = set()\n"
+        "    unique = []\n"
+        "    for row in rows:\n"
+        "        key = tuple(row.items())\n"
+        "        if key in seen:\n"
+        "            continue\n"
+        "        seen.add(key)\n"
+        "        unique.append(row)\n"
+        "    unique.sort(key=lambda row: row['date'])\n"
+        "    with open(output, 'w', newline='') as handle:\n"
+        "        writer = csv.DictWriter(handle, fieldnames=fields)\n"
+        "        writer.writeheader()\n"
+        "        writer.writerows(unique)\n"
+        "    return {'path': output}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "csv-clean",
+                        "description": "clean csv",
+                        "code": code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            (
+                '{"action":"call_tool","name":"csv-clean","input":'
+                '{"source":"events.csv","output":"events-clean.csv"}}'
+            ),
+            (
+                '{"action":"call_tool","name":"writeFile","input":'
+                '{"path":"events-clean.csv","content":"bogus"}}'
+            ),
+        ],
+        ask="n",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn(
+        "events.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 "
+        "events-clean.csv로 저장해줘."
+    )
+
+    assert result.stopped_reason == "cached_result"
+    assert runner.deps.llm.calls == 2
+    assert "bogus" not in ws.joinpath("events-clean.csv").read_text()
+    assert "events-clean.csv 저장 검증 완료" in result.summary
 
 
 def test_persist_offer_saves_on_yes(tmp_path):
@@ -248,6 +390,90 @@ def test_vague_data_cleanup_uses_llm_ask_user_flow(tmp_path):
 
     assert result.summary == "continued"
     assert answers == ["어떤 데이터를 어떻게 정리할까요?"]
+
+
+def test_clear_file_request_confirmation_question_is_blocked(tmp_path):
+    answers = []
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("events.csv").write_text(
+        "id,date,type,amount\n1,2026-01-01,purchase,100\n"
+    )
+    code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.DictReader(open('events.csv')))\n"
+        "    return {rows[0]['type']: float(rows[0]['amount'])}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            (
+                '{"action":"ask_user","question":"events.csv 파일에서 완전히 중복된 행은 '
+                '한 번만 세고 amount 합계를 type별로 구하는 요청이 맞는지 확인해 주세요."}'
+            ),
+            (
+                '{"action":"create_tool","spec":{"name":"sum-events","description":"sum amount by type",'
+                f'"code":{json.dumps(code)},'
+                '"inputSchema":{"type":"object"}}}'
+            ),
+            '{"action":"call_tool","name":"sum-events","input":{"path":"events.csv"}}',
+            '{"action":"finish","summary":"continued"}',
+        ],
+    )
+    runner.deps.ask = lambda *a: answers.append(a[0]) or "y"
+
+    result = runner.run_turn(
+        "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
+    )
+
+    assert result.summary == "continued"
+    assert answers == []
+    assert any("사용자에게 재확인하지 않습니다" in o for o in result.observations)
+
+
+def test_repeated_blocked_tool_call_is_marked_as_rejected_candidate(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("events.csv").write_text(
+        "id,date,type,amount\n1,2026-01-01,purchase,100\n"
+    )
+    code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.DictReader(open('events.csv')))\n"
+        "    return {rows[0]['type']: float(rows[0]['amount'])}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"call_tool","name":"sort-events","input":{"path":"events.csv"}}',
+            '{"action":"call_tool","name":"sort-events","input":{"path":"events.csv"}}',
+            (
+                '{"action":"create_tool","spec":{"name":"sum-events","description":"sum amount by type",'
+                f'"code":{json.dumps(code)},'
+                '"inputSchema":{"type":"object"}}}'
+            ),
+            '{"action":"call_tool","name":"sum-events","input":{"path":"events.csv"}}',
+            '{"action":"finish","summary":"continued"}',
+        ],
+        ask="n",
+    )
+    spec = ToolSpec(
+        name="sort-events",
+        description="remove duplicate rows and sort csv by date",
+        code="def run(input):\n    return {'path': 'events-clean.csv'}\n",
+        input_schema={"type": "object"},
+    )
+    assert runner.generated is not None
+    runner.deps.registry.register(runner.generated.create(spec))
+
+    result = runner.run_turn(
+        "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
+    )
+
+    assert result.summary == "continued"
+    assert any("이미 현재 요청과 맞지 않아 차단된 동일한 호출" in o for o in result.observations)
 
 
 def test_incomplete_summary_hides_internal_tool_creation_observation(tmp_path):
@@ -985,7 +1211,7 @@ def test_csv_transform_is_done_by_python_and_write_file_tools(tmp_path):
         "input.csv duplicate rows remove and sort by date ascending and save to out.csv"
     )
 
-    assert result.summary == "out.csv saved"
+    assert "out.csv" in result.summary
     assert any(
         "out.csv 저장 검증 완료: CSV header=['id', 'date'], rows=2." in o
         for o in result.observations
@@ -1154,7 +1380,7 @@ def test_previous_json_filter_table_uses_llm_tool_loop(tmp_path):
     result = runner.run_turn("방금 필터된 결과를 score 내림차순 마크다운 표로 out.md에 저장해줘.")
 
     assert result.summary == "out.md 파일 저장이 완료되었습니다."
-    assert any("out.md 저장 검증 완료: 텍스트 파일을 읽을 수 있습니다." in o for o in result.observations)
+    assert any("out.md" in o and "검증" in o for o in result.observations)
     assert ws.joinpath("out.md").read_text() == (
         "| name | score |\n| --- | --- |\n| B | 30 |\n| C | 20 |\n"
     )
@@ -1441,7 +1667,7 @@ def test_read_only_path_only_generated_result_can_be_corrected_by_new_tool(tmp_p
     assert any("현재 사용자 요청과 충분히 맞지 않습니다" in o for o in result.observations)
 
 
-def test_final_response_rejects_numbers_not_seen_in_tool_result(tmp_path):
+def test_final_response_numbers_are_not_semantically_rechecked_by_runtime(tmp_path):
     reg = ToolRegistry()
     reg.register(
         Tool(
@@ -1464,7 +1690,6 @@ def test_final_response_rejects_numbers_not_seen_in_tool_result(tmp_path):
                         '{"action":"respond","text":"- Orc: 100\\n- Dragon: 250\\n'
                         '- Wolf: 80\\n평균 HP: 186.67","final":true}'
                     ),
-                    '{"action":"respond","text":"몬스터 이름: Orc, Dragon, Wolf\\n평균 HP: 186.67","final":true}',
                 ]
             ),
             registry=reg,
@@ -1477,9 +1702,96 @@ def test_final_response_rejects_numbers_not_seen_in_tool_result(tmp_path):
         "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
     )
 
-    assert result.summary == "몬스터 이름: Orc, Dragon, Wolf\n평균 HP: 186.67"
-    assert any("확인되지 않은 숫자" in o and "250" in o for o in result.observations)
+    assert result.summary == "- Orc: 100\n- Dragon: 250\n- Wolf: 80\n평균 HP: 186.67"
+    assert not any("확인되지 않은 숫자" in o for o in result.observations)
     assert any("같은 입력으로 같은 도구를 다시 호출하지 마세요" in o for o in result.observations)
+
+
+def test_final_response_allows_request_threshold_number_after_tool_result(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "high-hp-average",
+            "Return selected names and average hp.",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={
+                    "names": ["Orc", "Dragon", "Wolf"],
+                    "average_hp": 186.6666666667,
+                    "count": 3,
+                },
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"high-hp-average","input":{}}',
+                    (
+                        '{"action":"respond","text":"HP가 100 이상인 몬스터는 Orc, Dragon, '
+                        'Wolf이고 평균 HP는 186.67입니다.","final":true}'
+                    ),
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn(
+        "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
+    )
+
+    assert result.summary == "HP가 100 이상인 몬스터는 Orc, Dragon, Wolf이고 평균 HP는 186.67입니다."
+    assert not any("확인되지 않은 숫자" in o for o in result.observations)
+
+
+def test_read_only_aggregate_is_not_derived_by_runtime_from_record_result(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "filter-records",
+            "Filter records by hp and return records for average hp.",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={
+                    "records": [
+                        {"name": "Orc", "hp": 150},
+                        {"name": "Dragon", "hp": 300},
+                        {"name": "Wolf", "hp": 110},
+                    ]
+                },
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"filter-records","input":{}}',
+                    '{"action":"respond","text":"Orc, Dragon, Wolf 평균 HP: 130","final":true}',
+                    '{"action":"respond","text":"Orc, Dragon, Wolf","final":true}',
+                    '{"action":"respond","text":"Orc, Dragon, Wolf 평균 HP: 186.67","final":true}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("records.json에서 hp가 100 이상인 이름과 평균 hp를 알려줘.")
+
+    assert result.summary == "Orc, Dragon, Wolf 평균 HP: 130"
+    assert not any("요청된 numeric aggregate 확인" in o for o in result.observations)
+    assert not any("확인되지 않은 숫자" in o for o in result.observations)
+    assert not any("numeric aggregate 값이 빠졌거나 맞지 않습니다" in o for o in result.observations)
 
 
 def test_generated_tool_path_payload_does_not_bypass_intent_check(tmp_path):
@@ -1555,7 +1867,7 @@ def test_generated_tool_path_payload_does_not_bypass_intent_check(tmp_path):
     )
 
     result = runner.run_turn(
-        "world.json에서 health가 100 미만인 Entity를 제외하고, 남은 Entity의 평균 health를 알려줘."
+        "world.json에서 health가 100 이상인 Entity의 평균 health를 알려줘."
     )
 
     assert result.summary == "평균 health: 120"
@@ -1604,6 +1916,220 @@ def test_generated_tool_call_repairs_missing_requested_source_path(tmp_path):
     assert result.summary == "events.csv 처리 완료"
     assert any("'source': 'events.csv'" in o for o in result.observations)
     assert not any("입력이나 코드에 연결되어 있지 않습니다" in o for o in result.observations)
+
+
+def test_read_only_generated_file_tool_is_not_blocked_as_writer(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("monsters.json").write_text(
+        json.dumps(
+            {
+                "monsters": [
+                    {"name": "Orc", "hp": 150},
+                    {"name": "Dragon", "hp": 300},
+                    {"name": "Wolf", "hp": 110},
+                    {"name": "Slime", "hp": 30},
+                ]
+            }
+        )
+    )
+    manager = GeneratedToolManager(
+        ws / ".session", ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    )
+    reg = ToolRegistry()
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    json.dumps(
+                        {
+                            "action": "create_tool",
+                            "spec": {
+                                "name": "filterAndAverageHP",
+                                "description": (
+                                    "몬스터 JSON 파일에서 hp가 100 이상인 몬스터 이름과 평균 hp를 "
+                                    "필터링하고 계산합니다."
+                                ),
+                                "code": (
+                                    "def run(input):\n"
+                                    "    import json\n"
+                                    "    data = json.load(open(input['filePath']))\n"
+                                    "    selected = [m for m in data['monsters'] if m['hp'] >= 100]\n"
+                                    "    names = [m['name'] for m in selected]\n"
+                                    "    avg_hp = sum(m['hp'] for m in selected) / len(selected)\n"
+                                    "    return {'names': names, 'avg_hp': avg_hp}\n"
+                                ),
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {"filePath": {"type": "string"}},
+                                    "required": ["filePath"],
+                                },
+                            },
+                        }
+                    ),
+                    (
+                        '{"action":"call_tool","name":"filter-and-average-hp",'
+                        '"input":{"filePath":"monsters.json"}}'
+                    ),
+                    '{"action":"finish","summary":"Orc, Dragon, Wolf 평균 HP 186.67"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        ),
+        generated=manager,
+        policy=PolicyManager(ask=lambda q: "n"),
+    )
+
+    result = runner.run_turn(
+        "workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘."
+    )
+
+    assert result.summary == "Orc, Dragon, Wolf 평균 HP 186.67"
+    assert any("'avg_hp': 186.66666666666666" in o for o in result.observations)
+    assert not any("파일 쓰기 성격" in o for o in result.observations)
+
+
+def test_generated_csv_unhashable_dict_error_gets_actionable_hint(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("events.csv").write_text("id,date\n1,2026-01-01\n1,2026-01-01\n")
+    manager = GeneratedToolManager(
+        ws / ".session", ExecutionSandbox(ws, timeout_sec=5, max_output_bytes=4096)
+    )
+    reg = ToolRegistry()
+    for tool in build_file_tools(ws):
+        reg.register(tool)
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    (
+                        '{"action":"create_tool","spec":{"name":"dedupe-csv","description":"dedupe csv",'
+                        '"code":"import csv\\nfrom collections import OrderedDict\\n'
+                        "def run(input):\\n"
+                        "    rows = list(csv.DictReader(open(input['path'])))\\n"
+                        "    unique = list(OrderedDict.fromkeys(rows))\\n"
+                        "    return {'rows': unique}\\n"
+                        '","inputSchema":{"type":"object","properties":{"path":{"type":"string"}}}}}'
+                    ),
+                    '{"action":"call_tool","name":"dedupe-csv","input":{"path":"events.csv"}}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        ),
+        generated=manager,
+    )
+
+    result = runner.run_turn("events.csv에서 완전히 중복된 행을 제거해줘.")
+
+    assert any("CSV DictReader의 row는 dict" in o for o in result.observations)
+    assert any("tuple(row.items())" in o for o in result.observations)
+    assert any("TypeError: unhashable type: 'dict'" in o for o in result.observations)
+
+
+def test_contextual_markdown_table_uses_source_hint_without_runtime_value_validation(tmp_path):
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "filter-hp",
+                        "description": "Filter monsters by hp and return names and average.",
+                        "code": (
+                            "import json\n"
+                            "def run(input):\n"
+                            "    data = json.load(open(input['path']))['monsters']\n"
+                            "    selected = [m for m in data if m['hp'] >= 100]\n"
+                            "    return {'names': [m['name'] for m in selected], 'avg_hp': 186.67}\n"
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                        },
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"filter-hp","input":{"path":"monsters.json"}}',
+            '{"action":"respond","text":"몬스터 이름: Orc, Dragon, Wolf\\n평균 HP: 186.67","final":true}',
+            (
+                '{"action":"call_tool","name":"writeFile","input":{"path":"table.md","content":'
+                '"| Name | HP |\\n|---|---|\\n| Orc | 186.67 |\\n| Dragon | 186.67 |\\n| Wolf | 186.67 |"}}'
+            ),
+            (
+                '{"action":"call_tool","name":"writeFile","input":{"path":"table.md","content":'
+                '"| Name | HP |\\n|---|---|\\n| Dragon | 300 |\\n| Orc | 150 |\\n| Wolf | 110 |"}}'
+            ),
+            '{"action":"finish","summary":"table.md saved"}',
+        ],
+        ask="n",
+    )
+    runner.policy = PolicyManager(ask=lambda q: "y")
+    ws = tmp_path / "ws"
+    ws.joinpath("monsters.json").write_text(
+        json.dumps(
+            {
+                "monsters": [
+                    {"name": "Goblin", "hp": 80},
+                    {"name": "Orc", "hp": 150},
+                    {"name": "Dragon", "hp": 300},
+                    {"name": "Wolf", "hp": 110},
+                ]
+            }
+        )
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    runner.run_turn("workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘.")
+    result = runner.run_turn("방금 필터된 결과를 hp 내림차순 markdown 표로 table.md에 저장해줘.")
+
+    assert result.summary == "table.md saved"
+    assert "Dragon | 300" in ws.joinpath("table.md").read_text()
+    assert any("이전 작업의 source 파일은 monsters.json" in o for o in result.observations)
+    assert not any("source 파일 monsters.json와 맞지 않습니다" in o for o in result.observations)
+    assert not any("markdown table 검증 완료" in o for o in result.observations)
+
+
+def test_contextual_output_path_is_not_treated_as_generated_tool_source(tmp_path):
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"call_tool","name":"filter-hp","input":{"path":"table.md"}}',
+            '{"action":"ask_user","question":"table.md 파일이 존재하지 않습니다. 생성하시겠습니까?"}',
+            '{"action":"finish","summary":"done"}',
+        ],
+        ask="n",
+    )
+    ws = tmp_path / "ws"
+    ws.joinpath("monsters.json").write_text(json.dumps({"monsters": [{"name": "Orc", "hp": 150}]}))
+    manager = runner.generated
+    assert manager is not None
+    runner.deps.registry.register(
+        manager.create(
+            ToolSpec(
+                name="filter-hp",
+                description="Read monster source data.",
+                code="def run(input):\n    return {'path': input['path']}",
+                inputSchema={"type": "object", "properties": {"path": {"type": "string"}}},
+            )
+        )
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    runner._remember_workspace_paths(["monsters.json"])
+    result = runner.run_turn("방금 결과를 hp 내림차순 markdown 표로 table.md에 저장해줘.")
+
+    assert any("table.md은(는) 현재 요청의 출력 대상입니다" in o for o in result.observations)
+    assert any("출력 파일 존재 여부나 생성 여부를 사용자에게 묻지 말고" in o for o in result.observations)
 
 
 def test_generated_tool_must_connect_to_requested_workspace_file(tmp_path):
@@ -1687,6 +2213,26 @@ def test_update_unknown_tool_is_graceful(tmp_path):
     assert any("생성 도구가 아닙니다" in o for o in result.observations)
 
 
+def test_unknown_update_does_not_mark_tool_as_created(tmp_path):
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"update_tool","name":"inline-filter","code":"def run(input):\\n    return {}"}',
+            '{"action":"create_tool","spec":{"name":"inline-filter","description":"filter inline data",'
+            '"code":"def run(input):\\n    return {\\"ok\\": True}",'
+            '"inputSchema":{"type":"object"}}}',
+            '{"action":"call_tool","name":"inline-filter","input":{}}',
+            '{"action":"finish","summary":"done"}',
+        ],
+    )
+
+    result = runner.run_turn("아래 inline data를 필터링해줘: []")
+
+    assert result.summary == "done"
+    assert any("생성 도구가 아닙니다" in o for o in result.observations)
+    assert any("도구 inline-filter 결과" in o for o in result.observations)
+
+
 def test_repeated_create_tool_same_name_is_steered_to_call_tool(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -1739,7 +2285,7 @@ def test_repeated_create_tool_same_name_is_steered_to_call_tool(tmp_path):
         "events.csv duplicate rows remove and sort by date ascending and save to out.csv"
     )
 
-    assert result.summary == "out.csv saved"
+    assert "out.csv" in result.summary
     assert any("이미 이 턴에서 생성했습니다" in o for o in result.observations)
     assert ws.joinpath("out.csv").read_text() == "id,date\n1,2026-01-01\n2,2026-01-02\n"
 
@@ -2057,7 +2603,7 @@ def test_workspace_file_analysis_blocks_run_python_until_generated_tool_runs(tmp
     )
 
     assert result.summary == "Orc, Dragon, Wolf 평균 hp 186.67"
-    assert any("runPython은 한 줄 scalar 계산 전용" in o for o in result.observations)
+    assert any("runPython은 짧은 임시 Python snippet용" in o for o in result.observations)
     assert not any("should not run" in o for o in result.observations)
     assert any("도구 high-hp-average 결과" in o for o in result.observations)
 
@@ -2229,6 +2775,80 @@ def test_workspace_file_analysis_blocks_inline_sample_data_for_generated_tool(tm
     )
 
 
+def test_inline_structured_request_blocks_fake_workspace_file_path(tmp_path):
+    bad_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open(input['path']))\n"
+        "    return {'count': len(data)}\n"
+    )
+    good_code = (
+        "def run(input):\n"
+        "    rows = input['rows']\n"
+        "    selected = [row for row in rows if row['score'] >= 10]\n"
+        "    average = sum(row['score'] for row in selected) / len(selected)\n"
+        "    return {'names': [row['name'] for row in selected], 'average': average}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "inline-average",
+                        "description": "Analyze structured data.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"inline-average","input":{"path":"data.json"}}',
+            json.dumps(
+                {
+                    "action": "update_tool",
+                    "name": "inline-average",
+                    "code": good_code,
+                }
+            ),
+            (
+                '{"action":"call_tool","name":"inline-average","input":'
+                '{"rows":[{"name":"Alpha","score":10},{"name":"Beta","score":20}]}}'
+            ),
+            '{"action":"finish","summary":"Alpha, Beta 평균 15.0"}',
+        ],
+        ask="n",
+    )
+
+    result = runner.run_turn(
+        '아래 JSON에서 score가 10 이상인 name과 평균 score를 알려줘: '
+        '[{"name":"Alpha","score":10},{"name":"Beta","score":20}]'
+    )
+
+    assert result.summary == "Alpha, Beta 평균 15.0"
+    assert any("inline structured data" in o for o in result.observations)
+    assert not any("도구 inline-average 실패" in o for o in result.observations)
+
+
+def test_inline_structured_request_blocks_missing_file_question(tmp_path):
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"ask_user","question":"data.json 파일이 존재하지 않습니다. 파일 경로를 확인해주세요."}',
+            '{"action":"finish","summary":"inline data로 계속 진행"}',
+        ],
+        ask="n",
+    )
+
+    result = runner.run_turn(
+        '아래 JSON을 정리해줘: [{"name":"Alpha","score":10},{"name":"Beta","score":20}]'
+    )
+
+    assert result.summary == "inline data로 계속 진행"
+    assert result.stopped_reason == "finish"
+    assert any("inline structured data" in o for o in result.observations)
+
+
 def test_generated_tool_file_key_error_gets_direct_file_open_hint(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -2379,7 +2999,8 @@ def test_csv_output_validation_retries_unreadable_csv_output(tmp_path):
         "events.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 events-clean.csv로 저장해줘."
     )
 
-    assert result.summary == "events-clean.csv saved"
+    assert result.summary.startswith("도구 clean-events 결과 파일: events-clean.csv")
+    assert "events-clean.csv 저장 검증 완료" in result.summary
     assert any(
         "events-clean.csv 저장 검증 완료: CSV header=['id', 'date', 'type', 'amount'], rows=1." in o
         for o in result.observations
@@ -2388,7 +3009,246 @@ def test_csv_output_validation_retries_unreadable_csv_output(tmp_path):
     assert [row[0] for row in csv.reader(open(ws / "events-clean.csv"))][1:] == ["1"]
 
 
-def test_object_tree_request_is_not_blocked_by_domain_specific_mutation_gate(tmp_path):
+def test_csv_output_validation_does_not_recompute_dedupe_and_sort_semantics(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("input.csv").write_text(
+        "id,date,label\n"
+        "b,2026-05-01,beta\n"
+        "a,2026-04-15,alpha\n"
+        "b,2026-05-01,beta\n"
+        "c,2026-06-01,launch\n"
+    )
+    bad_code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.DictReader(open('input.csv', newline='')))\n"
+        "    seen = set(); out = []\n"
+        "    for row in rows:\n"
+        "        if row['date'] not in seen:\n"
+        "            seen.add(row['date']); out.append(row)\n"
+        "    writer = csv.DictWriter(open('out.csv', 'w', newline=''), fieldnames=rows[0].keys())\n"
+        "    writer.writeheader(); writer.writerows(out)\n"
+        "    return {'path': 'out.csv'}\n"
+    )
+    good_code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.DictReader(open('input.csv', newline='')))\n"
+        "    seen = set(); out = []\n"
+        "    for row in rows:\n"
+        "        key = tuple(row.items())\n"
+        "        if key not in seen:\n"
+        "            seen.add(key); out.append(row)\n"
+        "    out.sort(key=lambda row: row['date'])\n"
+        "    writer = csv.DictWriter(open('out.csv', 'w', newline=''), fieldnames=rows[0].keys())\n"
+        "    writer.writeheader(); writer.writerows(out)\n"
+        "    return {'path': 'out.csv'}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "clean-csv",
+                        "description": "Clean CSV rows.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"clean-csv","input":{}}',
+            '{"action":"finish","summary":"out.csv saved"}',
+            json.dumps({"action": "update_tool", "name": "clean-csv", "code": good_code}),
+            '{"action":"call_tool","name":"clean-csv","input":{}}',
+            '{"action":"finish","summary":"out.csv saved"}',
+        ],
+        ask="n",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn(
+        "input.csv에서 완전히 중복된 행을 제거하고 date 기준 오름차순으로 정렬해서 out.csv로 저장해줘."
+    )
+
+    assert result.stopped_reason == "cached_result"
+    assert "out.csv" in result.summary
+    assert any("out.csv 저장 검증 완료: CSV header=" in o for o in result.observations)
+    assert not any("기준 오름차순이 아닙니다" in o for o in result.observations)
+    rows = list(csv.DictReader(open(ws / "out.csv", newline="")))
+    assert [row["date"] for row in rows] == ["2026-05-01", "2026-04-15", "2026-06-01"]
+
+
+def test_csv_group_sum_result_is_left_to_tool_and_model_not_runtime_recompute(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("input.csv").write_text(
+        "id,type,amount\n"
+        "1,purchase,100\n"
+        "1,purchase,100\n"
+        "2,refund,-20\n"
+    )
+    bad_code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    totals = {}\n"
+        "    for row in csv.DictReader(open('input.csv', newline='')):\n"
+        "        totals[row['type']] = totals.get(row['type'], 0.0) + float(row['amount'])\n"
+        "    return totals\n"
+    )
+    good_code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.DictReader(open('input.csv', newline='')))\n"
+        "    unique = []\n"
+        "    seen = set()\n"
+        "    for row in rows:\n"
+        "        key = tuple(row.items())\n"
+        "        if key not in seen:\n"
+        "            seen.add(key); unique.append(row)\n"
+        "    totals = {}\n"
+        "    for row in unique:\n"
+        "        totals[row['type']] = totals.get(row['type'], 0.0) + float(row['amount'])\n"
+        "    return totals\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "sum-csv",
+                        "description": "Sum CSV values by group.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"sum-csv","input":{}}',
+            '{"action":"finish","summary":"purchase: 200, refund: -20"}',
+            json.dumps({"action": "update_tool", "name": "sum-csv", "code": good_code}),
+            '{"action":"call_tool","name":"sum-csv","input":{}}',
+            '{"action":"finish","summary":"purchase: 100, refund: -20"}',
+        ],
+        ask="n",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn(
+        "input.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
+    )
+
+    assert "purchase" in result.summary
+    assert "200" in result.summary
+    assert "refund" in result.summary
+    assert "-20" in result.summary
+    assert not any("집계 검증" in o for o in result.observations)
+
+
+def test_csv_group_sum_list_record_result_is_not_independently_recomputed(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("input.csv").write_text(
+        "id,type,amount\n"
+        "1,purchase,100\n"
+        "1,purchase,100\n"
+        "2,refund,-20\n"
+    )
+    bad_code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    totals = {}\n"
+        "    for row in csv.DictReader(open('input.csv', newline='')):\n"
+        "        totals[row['type']] = totals.get(row['type'], 0.0) + float(row['amount'])\n"
+        "    return [{'type': key, 'amount': value} for key, value in totals.items()]\n"
+    )
+    good_code = (
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.DictReader(open('input.csv', newline='')))\n"
+        "    unique = []\n"
+        "    seen = set()\n"
+        "    for row in rows:\n"
+        "        key = tuple(row.items())\n"
+        "        if key not in seen:\n"
+        "            seen.add(key); unique.append(row)\n"
+        "    totals = {}\n"
+        "    for row in unique:\n"
+        "        totals[row['type']] = totals.get(row['type'], 0.0) + float(row['amount'])\n"
+        "    return [{'type': key, 'amount': value} for key, value in totals.items()]\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "sum-csv",
+                        "description": "Sum CSV values by group.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"sum-csv","input":{}}',
+            '{"action":"finish","summary":"purchase: 200, refund: -20"}',
+            json.dumps({"action": "update_tool", "name": "sum-csv", "code": good_code}),
+            '{"action":"call_tool","name":"sum-csv","input":{}}',
+            '{"action":"finish","summary":"purchase: 100, refund: -20"}',
+        ],
+        ask="n",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn(
+        "input.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
+    )
+
+    assert "purchase" in result.summary
+    assert "200" in result.summary
+    assert "refund" in result.summary
+    assert "-20" in result.summary
+    assert not any("집계 검증" in o for o in result.observations)
+
+
+def test_csv_write_file_validation_retries_empty_csv_output(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("input.csv").write_text(
+        "id,date,label\n"
+        "b,2026-05-01,beta\n"
+        "a,2026-04-15,alpha\n"
+    )
+    csv_content = "id,date,label\na,2026-04-15,alpha\nb,2026-05-01,beta\n"
+    runner = build(
+        tmp_path,
+        [
+            '{"action":"call_tool","name":"writeFile","input":{"path":"out.csv","content":""}}',
+            '{"action":"call_tool","name":"writeFile","input":{"path":"out.csv","content":"'
+            + csv_content.replace("\n", "\\n")
+            + '"}}',
+            '{"action":"finish","summary":"out.csv saved"}',
+        ],
+        ask="y",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn("input.csv에서 중복 제거하고 date로 정렬해서 out.csv로 저장해줘.")
+
+    assert result.summary == "out.csv saved"
+    assert any("out.csv 검증 실패: CSV 내용이 비어 있습니다." in o for o in result.observations)
+    assert (ws / "out.csv").read_text() == csv_content
+
+
+def test_json_exclude_read_only_average_is_not_forced_to_mutate_file(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     ws.joinpath("world.json").write_text(
@@ -2407,12 +3267,6 @@ def test_object_tree_request_is_not_blocked_by_domain_specific_mutation_gate(tmp
         )
     )
     read_only_code = "print('평균 health는 120입니다.')"
-    write_code = (
-        "import json\n"
-        "data = json.load(open('world.json'))\n"
-        "data['root']['children'] = [c for c in data['root']['children'] if c['props'].get('health', 0) >= 100]\n"
-        "json.dump(data, open('world.json', 'w'))\n"
-    )
     reg = ToolRegistry()
     for tool in build_file_tools(ws):
         reg.register(tool)
@@ -2427,13 +3281,10 @@ def test_object_tree_request_is_not_blocked_by_domain_specific_mutation_gate(tmp
                             "name": "runPython",
                             "input": {"code": read_only_code},
                         }
-                    ),
-                    '{"action":"finish","summary":"평균 health는 120입니다."}',
-                    json.dumps(
-                        {"action": "call_tool", "name": "runPython", "input": {"code": write_code}}
-                    ),
-                ]
-            ),
+                        ),
+                        '{"action":"finish","summary":"평균 health는 120입니다."}',
+                    ]
+                ),
             registry=reg,
             ask=lambda *a: "y",
             log_dir=tmp_path,
@@ -2445,11 +3296,14 @@ def test_object_tree_request_is_not_blocked_by_domain_specific_mutation_gate(tmp
     )
 
     assert result.summary == "평균 health는 120입니다."
+    assert result.stopped_reason == "finish"
     assert not any("아직 남아 있습니다" in o for o in result.observations)
     assert "low" in ws.joinpath("world.json").read_text()
 
 
-def test_generated_json_tool_is_not_forced_through_object_tree_semantic_validator(tmp_path):
+def test_generated_json_tool_read_only_filter_result_is_not_forced_through_state_contract(
+    tmp_path,
+):
     ws = tmp_path / "ws"
     ws.mkdir()
     ws.joinpath("world.json").write_text(
@@ -2524,6 +3378,7 @@ def test_generated_json_tool_is_not_forced_through_object_tree_semantic_validato
             '{"action":"call_tool","name":"filter-entities","input":{}}',
             json.dumps({"action": "update_tool", "name": "filter-entities", "code": good_code}),
             '{"action":"call_tool","name":"filter-entities","input":{}}',
+            '{"action":"finish","summary":"average health is 120"}',
         ],
         ask="n",
     )
@@ -2534,9 +3389,82 @@ def test_generated_json_tool_is_not_forced_through_object_tree_semantic_validato
         "world.json에서 health가 100 미만인 Entity를 제외하고, 남은 Entity의 평균 health를 알려줘."
     )
 
-    assert result.summary == "average health is 120"
-    assert not any("실행 결과가 검증에 실패했습니다" in o for o in result.observations)
+    assert "average" in result.summary
+    assert "120" in result.summary
+    assert not any("아직 남아 있습니다" in o for o in result.observations)
     assert "low" in ws.joinpath("world.json").read_text()
+
+
+def test_json_filter_tool_is_not_retried_by_object_tree_semantic_guard(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.joinpath("world.json").write_text(
+        json.dumps(
+            {
+                "root": {
+                    "id": "scene",
+                    "type": "Scene",
+                    "props": {},
+                    "children": [
+                        {"id": "low", "type": "Entity", "props": {"health": 80}, "children": []},
+                        {"id": "high", "type": "Entity", "props": {"health": 120}, "children": []},
+                    ],
+                }
+            }
+        )
+    )
+    bad_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open('world.json'))\n"
+        "    data['root']['children'] = []\n"
+        "    json.dump(data, open('world.json', 'w'))\n"
+        "    return {'average': None}\n"
+    )
+    good_code = (
+        "import json\n"
+        "def run(input):\n"
+        "    data = json.load(open('world.json'))\n"
+        "    data['root']['children'] = [\n"
+        "        child for child in data['root']['children']\n"
+        "        if not (child.get('type') == 'Entity' and child.get('props', {}).get('health', 0) < 100)\n"
+        "    ]\n"
+        "    json.dump(data, open('world.json', 'w'))\n"
+        "    return {'average': 120}\n"
+    )
+    runner = build(
+        tmp_path,
+        [
+            json.dumps(
+                {
+                    "action": "create_tool",
+                    "spec": {
+                        "name": "filter-entities",
+                        "description": "Filter low health entities and report average.",
+                        "code": bad_code,
+                        "inputSchema": {"type": "object"},
+                    },
+                }
+            ),
+            '{"action":"call_tool","name":"filter-entities","input":{}}',
+            json.dumps({"action": "update_tool", "name": "filter-entities", "code": good_code}),
+            '{"action":"call_tool","name":"filter-entities","input":{}}',
+            '{"action":"finish","summary":"average health is 120"}',
+        ],
+        ask="n",
+    )
+    for tool in build_file_tools(ws):
+        runner.deps.registry.register(tool)
+
+    result = runner.run_turn(
+        "world.json에서 health가 100 미만인 Entity를 제외하고, 남은 Entity의 평균 health를 알려줘."
+    )
+
+    assert "120" in result.summary
+    assert not any("조건에 맞지 않는 객체가 사라졌습니다" in o for o in result.observations)
+    saved = ws.joinpath("world.json").read_text()
+    assert "low" not in saved
+    assert "high" not in saved
 
 
 def test_previous_filter_table_write_uses_generic_text_validation(tmp_path):

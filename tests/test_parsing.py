@@ -104,6 +104,17 @@ def test_parse_create_tool_inputs_alias_as_input_schema():
     }
 
 
+def test_parse_update_tool_field_aliases():
+    res = parse_action_text(
+        '{"action":"update_tool","tool_name":"clean-csv","new_code":"def run(input):\\n    return {}"}'
+    )
+
+    assert res.ok
+    assert res.action.action == "update_tool"
+    assert res.action.name == "clean-csv"
+    assert res.action.code == "def run(input):\n    return {}"
+
+
 def test_parse_bare_json_without_action_returns_protocol_error():
     res = parse_action_text('{"path":"events-clean.csv","rows":5,"removed":2}')
     assert not res.ok

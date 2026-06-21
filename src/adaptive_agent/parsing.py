@@ -128,6 +128,15 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
         if spec is not None:
             return {**value, "spec": spec}
 
+    if action == "update_tool":
+        input_data = value.get("input", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        name = value.get("name", value.get("tool_name", input_data.get("name", input_data.get("tool_name"))))
+        code = value.get("code", value.get("new_code", input_data.get("code", input_data.get("new_code"))))
+        if name is not None or code is not None:
+            return {**value, "name": name, "code": code}
+
     if action in _CANONICAL_ACTIONS:
         return value
 

@@ -22,7 +22,7 @@
             └─ Tracer                   매 단계를 JSONL로 기록
 ```
 
-읽는 순서를 추천하면 `schemas.py` → `parsing.py` → `runner.py` → `tools/` → `skills.py`
+읽는 순서를 추천하면 `schemas.py` → `parsing.py` → `source_contracts.py` → `runner.py` → `tools/` → `skills.py`
 순서다. action의 모양을 먼저 익히면 나머지가 쉽게 읽힌다.
 
 ## 2. 한 턴이 도는 과정
@@ -67,6 +67,13 @@ def run_turn(self, request: str) -> TurnResult:
 
 인사, 모델명 질문, 파일 작업 같은 입력은 모두 같은 ReAct 루프에 들어간다. 러너는 자연어
 문구를 세밀하게 해석하지 않고, 모델이 낸 action을 파싱한 뒤 도구·정책 경계에서 검증한다.
+요청 본문과 tool payload의 workspace 경로, inline JSON/CSV 여부처럼 루프와 독립적인 source
+판별은 `source_contracts.py`의 순수 helper가 맡는다. runner는 그 결과를 이용해 요청 파일과
+무관한 이전 도구 호출, workspace 파일 요청에 임의 inline payload를 주입하는 호출, inline 데이터
+요청을 존재하지 않는 workspace 파일로 치환하는 호출을 observation으로 되돌린다.
+system prompt와 `[runtime-state]`는 현재 설정된 workspace root를 알려 주고, 사용자가 특별히
+다른 위치를 지정하지 않으면 `events.csv` 같은 파일명과 상대 경로를 그 workspace 안의 파일로
+가정하도록 명시한다. 파일이 없을 수는 있으므로 최종 답변 전에 read/list/tool 실행으로 확인한다.
 
 종료는 다섯 갈래다: `finish` action, `final`이 참인 `respond`, 최대 반복 도달,
 도구 호출이 연속으로 실패해 상한을 넘는 경우, 그리고 LLM이 유효한 JSON action을
@@ -81,13 +88,19 @@ def run_turn(self, request: str) -> TurnResult:
 
 `TurnExecutionState`는 파일 결과가 필요한 턴에서 생성/수정한 도구를 실제로 실행했는지 기록한다.
 이 상태 검증 덕분에 생성 도구를 등록만 하고 종료하는 흐름을 문장 패턴이 아니라 실행 증거로 막는다.
+같은 턴에서 차단된 tool action도 runtime state에 남긴다. 모델이 이전 턴 도구를 다시 고르거나
+현재 요청을 그대로 확인 질문으로 되풀이하면, 러너는 이를 사용자 상호작용으로 넘기지 않고 다른
+도구 생성·수정·호출 경로를 선택하라는 observation으로 되돌린다.
 또 사용자가 "tool을 만들어서", "도구를 만들어"처럼 도구 생성을 명시하면, 러너는 `runPython`이나
 기존 도구 호출로 바로 답하는 액션을 observation으로 되돌리고 `create_tool` 뒤 생성 도구 `call_tool`을
 요구한다. 이 검사는 에이전트의 핵심 흐름인 도구 생성·실행을 프롬프트 의존이 아니라 런타임 불변식으로
 보호한다.
 명시적 도구 생성 요청이 아니더라도 workspace 파일을 줄 단위로 읽고 필터링·변환·집계해야 하는
-요청은 생성 도구 경로가 기본이다. `runPython`은 `print(3+4)` 같은 한 줄 scalar 계산에만 남겨 두고,
-파일 I/O나 여러 줄 코드가 보이면 실행하지 않고 생성 도구를 만들도록 되먹인다.
+요청은 생성 도구 경로가 기본이다. `runPython`은 간단한 산술, regex 확인, 작은 list/filter 검증처럼
+짧은 임시 snippet에 남겨 두고, workspace 파일 I/O나 재사용 가능한 데이터 처리 작업이면 생성 도구를
+만들도록 되먹인다.
+이 판단은 `hp`, `date`, `type` 같은 필드명이나 "알려줘" 같은 일반 동사만으로 켜지지 않고,
+평균·합계·정렬·필터·변환·저장처럼 실제 작업 동작이 보일 때 강하게 작동한다.
 도구를 만든 뒤에도 완료 조건은 "생성"이 아니라 "생성한 도구의 실행"이다. 생성 후 `runPython`,
 `writeFile`, 기존 도구로 우회하려는 액션은 다시 observation으로 되먹이고, 방금 만든 generated tool을
 실행하게 한다.
@@ -233,8 +246,14 @@ def _gate_file_write_path(self, name, path):
 파일 출력처럼 결과 상태가 중요한 요청은 도구 성공만으로 끝내지 않고, 도구가 반환한 출력 경로나
 `writeFile` payload를 기준으로 작업 영역 파일을 다시 읽어 가벼운 sanity check를 한다. JSON은
 파싱 가능해야 하고, CSV는 header와 행을 읽을 수 있어야 하며, 텍스트 파일은 비어 있지 않아야 한다.
-특정 데모용 semantic 검증을 러너에 박지 않고, 실패한 도구는 오류 observation과 현재 요청-tool
-정합성 guard를 통해 수정 루프로 되돌린다.
+러너는 CSV 중복 제거·정렬·group sum, JSON/object-tree 삭제 조건, markdown table 값 검산 같은
+semantic contract를 독립 재계산하지 않는다. 그런 판단은 생성 도구와 LLM의 책임으로 두고,
+런타임은 경로·권한·파일 형식·반복 진행 상태처럼 작업 종류와 독립적인 경계만 검증한다. 생성 도구가
+파일 출력 sanity check를 통과하면 루프는 `cached_result`로 닫을 수 있다. 검증된 산출물을 다시
+LLM planning에 넘기면 후속 action이 같은 작업을 반복하거나 산출물을 덮어쓸 수 있기 때문이다.
+마찬가지로 최종 답변의 숫자를 도구 결과와 다시 대조해 막지 않는다. 조건 임계값, 개수, 반올림 표현처럼
+정상적인 숫자가 섞일 수 있고, 이 검산을 런타임에 넣으면 모델이 이미 답을 냈는데도 반복 루프에 빠질 수
+있기 때문이다. 숫자 환각 방지는 system prompt와 도구 observation grounding에 맡긴다.
 이 guard는 workspace 파일명이 같다는 이유만으로 이전 generated tool을 재사용하지 않는다. action
 input이 요청 파일을 명시적으로 연결하거나 tool code가 파일을 직접 읽더라도, 도구 설명과 이름의
 작업 의도가 현재 요청과 충분히 맞지 않으면 호출 전에 observation으로 되돌린다. 또한 현재 턴에
@@ -245,6 +264,10 @@ input이 요청 파일을 명시적으로 연결하거나 tool code가 파일을
 흘려 보낸다. `ask_user`가 같은 차단 observation을 반복하면 조기 no-progress로 닫고, `text` 필드로
 질문을 내는 흔한 schema 오류는 parser가 `question` alias로 복구한다. 파일이 실제로 없다는
 확인 질문은 차단하지 않는다.
+후속 요청이 "방금 필터된 결과"처럼 이전 tool result를 변환하는 흐름이면 generated tool이 그
+record list를 input으로 받을 수 있다. 반대로 현재 요청에 명시된 source 파일이 있으면 임의 inline
+sample payload를 차단한다. 출력 파일명만 있는 contextual follow-up은 그 출력 경로를 source로
+오해하지 않는다.
 같은 이름의 `create_tool` 반복은 보통 기존 도구를 `call_tool`하라는 observation으로 되돌리지만,
 새 code가 기존 code와 다르면 corrected create로 보고 update 경로로 처리한다.
 generated tool 실행 실패도 update-required 상태로 기록해 같은 failing call이 반복 실행되지 않게
@@ -322,12 +345,13 @@ except Exception:
 
 1. `schemas.py` — action과 도구 계약의 모양
 2. `parsing.py` — 약한 모델 출력 방어
-3. `runner.py` — 전체 루프와 분기
-4. `tools/base.py`, `tools/registry.py`, `tools/builtins.py` — 도구 모델과 내장 도구
-5. `tools/generated.py`, `sandbox.py` — 생성 도구의 격리 실행
-6. `skills.py` — 영속화와 재로딩
-7. `policy.py`, `context.py`, `observability.py` — 권한·컨텍스트·관측
-8. `cli.py` — 조립
+3. `source_contracts.py` — 요청·payload의 경로와 inline structured data 판별
+4. `runner.py` — 전체 루프와 분기
+5. `tools/base.py`, `tools/registry.py`, `tools/builtins.py` — 도구 모델과 내장 도구
+6. `tools/generated.py`, `sandbox.py` — 생성 도구의 격리 실행
+7. `skills.py` — 영속화와 재로딩
+8. `policy.py`, `context.py`, `observability.py` — 권한·컨텍스트·관측
+9. `cli.py` — 조립
 
 테스트는 각 모듈 옆의 `tests/test_*.py`가, 끝에서 끝까지 흐름은
 `tests/test_demo_integration.py`가 보여준다.

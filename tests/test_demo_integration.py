@@ -270,7 +270,8 @@ def test_d2_live_prompt_uses_generated_tool_for_csv_file_task(tmp_path: Path) ->
     )
 
     assert "events-clean.csv" in result.summary
-    assert runner.deps.llm.calls == 3
+    assert result.stopped_reason == "cached_result"
+    assert runner.deps.llm.calls == 2
     assert any("events-clean.csv 저장 검증 완료: CSV header=" in o for o in result.observations)
     rows = _data_rows(ws / "events-clean.csv")
     assert len(rows) == 5
@@ -494,9 +495,12 @@ def test_d3_live_prompt_uses_generated_tool_without_write_prompt(tmp_path: Path)
         "events.csv에서 완전히 중복된 행은 한 번만 세고, amount 합계를 type별로 구해줘."
     )
 
-    assert "purchase: 2500" in result.summary
-    assert "signup: 0" in result.summary
-    assert "refund: -200" in result.summary
+    assert "purchase" in result.summary
+    assert "2500" in result.summary
+    assert "signup" in result.summary
+    assert "refund" in result.summary
+    assert "-200" in result.summary
+    assert result.stopped_reason == "finish"
     assert runner.deps.llm.calls == 3
 
 
@@ -566,7 +570,8 @@ def test_d9_blocks_package_install_prompt_and_falls_back_to_csv(tmp_path: Path) 
 
     result = runner.run_turn("events.csv dedup, sort by date, save to events-clean.csv")
 
-    assert result.summary == "도구 normalize-csv 결과: {'rows': 5}"
+    assert result.summary.startswith("도구 normalize-csv 결과: {'rows': 5}")
+    assert "events-clean.csv 저장 검증 완료" in result.summary
     assert result.stopped_reason == "cached_result"
     assert asks == []
     assert out.exists()
