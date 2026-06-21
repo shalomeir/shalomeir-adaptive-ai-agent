@@ -31,6 +31,13 @@
 파싱 결과를 loop guard에 통과시킨 뒤 action dispatcher로 넘긴다. action별 세부 처리는
 `_handle_respond_action`, `_handle_call_tool_action` 같은 작은 메서드가 맡고, 턴 종료 정리는
 `_finish_turn`이 맡는다.
+LLM 호출에는 누적 대화만 그대로 던지지 않는다. `_planning_messages`가 현재 요청, 이번 턴의
+action index, 생성·수정한 도구, 호출한 generated tool, 마지막 tool input, 검증 실패, missing
+workspace path, 차단된 tool action, 최근 observation을 담은 `[runtime-state]` JSON 메시지를 매번 합성해 붙인다.
+이 메시지는 대화 저장소에 누적하지 않고 호출 시점에만 생성하므로, 모델은 현재 루프 상태를 구조적으로
+보고 다음 action을 고를 수 있고 히스토리는 불필요하게 부풀지 않는다.
+`readFile` 같은 context tool은 같은 입력으로 반복 호출돼도 캐시 결과를 최종 답변으로 접지 않는다.
+이미 읽은 preview는 다음 계획의 근거로만 쓰고, 실제 작업 도구 생성·호출로 넘어가야 한다.
 
 ```python
 def run_turn(self, request: str) -> TurnResult:
@@ -78,6 +85,9 @@ def run_turn(self, request: str) -> TurnResult:
 기존 도구 호출로 바로 답하는 액션을 observation으로 되돌리고 `create_tool` 뒤 생성 도구 `call_tool`을
 요구한다. 이 검사는 에이전트의 핵심 흐름인 도구 생성·실행을 프롬프트 의존이 아니라 런타임 불변식으로
 보호한다.
+명시적 도구 생성 요청이 아니더라도 workspace 파일을 줄 단위로 읽고 필터링·변환·집계해야 하는
+요청은 생성 도구 경로가 기본이다. `runPython`은 `print(3+4)` 같은 한 줄 scalar 계산에만 남겨 두고,
+파일 I/O나 여러 줄 코드가 보이면 실행하지 않고 생성 도구를 만들도록 되먹인다.
 도구를 만든 뒤에도 완료 조건은 "생성"이 아니라 "생성한 도구의 실행"이다. 생성 후 `runPython`,
 `writeFile`, 기존 도구로 우회하려는 액션은 다시 observation으로 되먹이고, 방금 만든 generated tool을
 실행하게 한다.
@@ -220,12 +230,25 @@ def _gate_file_write_path(self, name, path):
 경로 이탈 후보로 본다. 해당 값이 절대 경로, `~`, 또는 `..`를 포함하면 모델 판단과 무관하게
 거부한다.
 
-파일 변환처럼 결과 상태가 중요한 요청은 도구 성공만으로 끝내지 않고 작업 영역 파일을 다시 읽어
-가벼운 검증을 한다. CSV 중복 제거·date 정렬은 전체 행 기준 dedupe와 stable date sort를 확인하고,
-object tree 제거 요청은 저장된 JSON에 제거 대상이 남아 있는지 확인한다. 이전 필터 결과를 markdown
-표로 저장하는 후속 요청은 이전 JSON 소스를 다시 읽어 실제 값과 정렬 순서를 검증한다. 검증 실패는
-observation으로 되먹이고, 검증 성공은 약한 모델이 final을 반복하지 않도록 완료 summary로 접을 수
-있다.
+파일 출력처럼 결과 상태가 중요한 요청은 도구 성공만으로 끝내지 않고, 도구가 반환한 출력 경로나
+`writeFile` payload를 기준으로 작업 영역 파일을 다시 읽어 가벼운 sanity check를 한다. JSON은
+파싱 가능해야 하고, CSV는 header와 행을 읽을 수 있어야 하며, 텍스트 파일은 비어 있지 않아야 한다.
+특정 데모용 semantic 검증을 러너에 박지 않고, 실패한 도구는 오류 observation과 현재 요청-tool
+정합성 guard를 통해 수정 루프로 되돌린다.
+이 guard는 workspace 파일명이 같다는 이유만으로 이전 generated tool을 재사용하지 않는다. action
+input이 요청 파일을 명시적으로 연결하거나 tool code가 파일을 직접 읽더라도, 도구 설명과 이름의
+작업 의도가 현재 요청과 충분히 맞지 않으면 호출 전에 observation으로 되돌린다. 또한 현재 턴에
+작업 실행 근거가 없는데 이전 assistant 결과처럼 보이는 최종 답변을 내면, 현재 요청에 맞는 도구
+실행이나 사용자 확인으로 되돌린다.
+파일 구조 확인 질문도 현재 요청의 파일에 anchor되어 있을 때만 자동 차단한다. 모델이 이전 문맥의
+파일명을 모호한 새 요청에 끌어오면 runtime이 그 파일을 읽도록 강화하지 않고, 사용자 확인으로
+흘려 보낸다. `ask_user`가 같은 차단 observation을 반복하면 조기 no-progress로 닫고, `text` 필드로
+질문을 내는 흔한 schema 오류는 parser가 `question` alias로 복구한다. 파일이 실제로 없다는
+확인 질문은 차단하지 않는다.
+같은 이름의 `create_tool` 반복은 보통 기존 도구를 `call_tool`하라는 observation으로 되돌리지만,
+새 code가 기존 code와 다르면 corrected create로 보고 update 경로로 처리한다.
+generated tool 실행 실패도 update-required 상태로 기록해 같은 failing call이 반복 실행되지 않게
+한다.
 
 `PolicyManager`는 `_DENY`, `_ASK` 집합으로 행동을 분류한다. 작업 영역 밖 접근은 `_DENY`에
 있어 사용자 승인으로도 우회되지 않는다.

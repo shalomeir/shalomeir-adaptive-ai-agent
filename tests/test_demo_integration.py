@@ -235,36 +235,30 @@ def test_d2_persist_then_d5_reuse(tmp_path: Path) -> None:
     assert [r[0] for r in rows2] == ["a", "b", "c"]
 
 
-def test_d2_live_prompt_uses_general_python_then_write_file(tmp_path: Path) -> None:
+def test_d2_live_prompt_uses_generated_tool_for_csv_file_task(tmp_path: Path) -> None:
     ws = _make_ws(tmp_path)
     shutil.copy(DEMORSC / "data" / "events.csv", ws / "events.csv")
-    content = (
-        "id,date,type,amount\n"
-        "1,2026-01-15,signup,0\n"
-        "4,2026-01-15,refund,-200\n"
-        "2,2026-02-20,purchase,800\n"
-        "3,2026-03-02,purchase,1200\n"
-        "5,2026-04-10,purchase,500\n"
-    )
     code = (
-        "import csv, io, json\n"
-        "rows = list(csv.reader(open('events.csv', newline='')))\n"
-        "header, body = rows[0], rows[1:]\n"
-        "seen = set(); unique = []\n"
-        "for row in body:\n"
-        "    key = tuple(row)\n"
-        "    if key not in seen:\n"
-        "        seen.add(key); unique.append(row)\n"
-        "unique.sort(key=lambda row: row[header.index('date')])\n"
-        "buf = io.StringIO(); writer = csv.writer(buf); writer.writerow(header); writer.writerows(unique)\n"
-        "print(json.dumps({'content': buf.getvalue(), 'rows': len(unique)}, ensure_ascii=False))\n"
+        "import csv\n"
+        "def run(input):\n"
+        "    rows = list(csv.reader(open('events.csv', newline='')))\n"
+        "    header, body = rows[0], rows[1:]\n"
+        "    seen = set(); unique = []\n"
+        "    for row in body:\n"
+        "        key = tuple(row)\n"
+        "        if key not in seen:\n"
+        "            seen.add(key); unique.append(row)\n"
+        "    unique.sort(key=lambda row: row[header.index('date')])\n"
+        "    with open('events-clean.csv', 'w', newline='') as f:\n"
+        "        writer = csv.writer(f); writer.writerow(header); writer.writerows(unique)\n"
+        "    return {'path': 'events-clean.csv', 'rows': len(unique)}\n"
     )
     runner = _runner(
         tmp_path,
         ws,
         [
-            _call("runPython", {"code": code}),
-            _call("writeFile", {"path": "events-clean.csv", "content": content}),
+            _create("clean-events", code),
+            _call("clean-events", {}),
             _finish("events-clean.csv 저장 완료"),
         ],
         ask="y",
@@ -276,7 +270,8 @@ def test_d2_live_prompt_uses_general_python_then_write_file(tmp_path: Path) -> N
     )
 
     assert "events-clean.csv" in result.summary
-    assert runner.deps.llm.calls == 2
+    assert runner.deps.llm.calls == 3
+    assert any("events-clean.csv 저장 검증 완료: CSV header=" in o for o in result.observations)
     rows = _data_rows(ws / "events-clean.csv")
     assert len(rows) == 5
     assert [row[1] for row in rows] == sorted(row[1] for row in rows)
@@ -571,7 +566,8 @@ def test_d9_blocks_package_install_prompt_and_falls_back_to_csv(tmp_path: Path) 
 
     result = runner.run_turn("events.csv dedup, sort by date, save to events-clean.csv")
 
-    assert result.summary == "saved"
+    assert result.summary == "도구 normalize-csv 결과: {'rows': 5}"
+    assert result.stopped_reason == "cached_result"
     assert asks == []
     assert out.exists()
     rows = _data_rows(out)

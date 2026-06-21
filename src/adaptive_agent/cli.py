@@ -7,12 +7,16 @@ from typing import Callable
 
 import typer
 from dotenv import load_dotenv
+from rich import box
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table
+from rich.text import Text
 
 from . import __version__
 from .config import AgentConfig
-from .llm import HttpLLMClient
+from .llm import AnthropicMessagesClient, HttpLLMClient, LLMClient
 from .monitoring import get_exporter
 from .policy import PolicyManager
 from .runner import NON_INTERACTIVE_ASK, AgentRunner, RunnerDeps
@@ -33,7 +37,9 @@ LOADING_FRAMES = ("loading.", "loading..", "loading...", "loading..")
 LOADING_INTERVAL_SEC = 0.35
 LOADING_STYLE_START = "\033[33m"
 LOADING_STYLE_END = "\033[0m"
+EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit"}
 _active_loading_stop: Callable[[], None] | None = None
+_active_loading_resume: Callable[[], None] | None = None
 
 
 @app.command()
@@ -46,9 +52,10 @@ def _ask(question: str, choices: list[str] | None = None) -> str:
     """Render an agent clarification as dialogue instead of a raw prompt."""
     _stop_active_loading()
     console.print(f"[green]agent[/green]: {question}")
-    answer = Prompt.ask("[cyan]you[/cyan]", choices=choices)
-    if answer.strip().lower() in {"exit", "quit"}:
+    answer = _prompt_user(choices=choices)
+    if _is_exit_command(answer):
         raise EOFError
+    _resume_active_loading()
     return answer
 
 
@@ -56,12 +63,58 @@ def _confirm(question: str) -> str:
     """Render policy confirmations separately from open-ended chat."""
     _stop_active_loading()
     console.print(f"[green]agent[/green]: {question}")
-    return Prompt.ask("[cyan]you[/cyan]", default="n")
+    answer = _prompt_user(default="n")
+    _resume_active_loading()
+    return answer
+
+
+def _prompt_user(*, choices: list[str] | None = None, default: str | None = None) -> str:
+    answer = Prompt.ask("[cyan]you[/cyan]", choices=choices, default=default)
+    if answer is None:
+        answer = ""
+    if not _is_interactive_stdin():
+        console.print()
+    return answer
+
+
+def _is_interactive_stdin() -> bool:
+    return sys.stdin.isatty()
+
+
+def _is_exit_command(value: str) -> bool:
+    return value.strip().lower() in EXIT_COMMANDS
+
+
+def _render_startup_banner(cfg: AgentConfig) -> None:
+    directory = Path.cwd().resolve()
+    workspace = Path(cfg.workspace_dir).expanduser()
+    if not workspace.is_absolute():
+        workspace = directory / workspace
+    workspace = workspace.resolve()
+
+    details = Table.grid(padding=(0, 1))
+    details.add_column(style="bold", no_wrap=True)
+    details.add_column(overflow="fold")
+    details.add_row("model:", cfg.model)
+    details.add_row("directory:", str(directory))
+    details.add_row("workspace:", str(workspace))
+
+    title = Text(f">_ Adaptive AI Agent CLI (v{__version__})", style="bold cyan")
+    console.print(
+        Panel.fit(
+            details, title=title, box=box.ROUNDED, border_style="bright_black", padding=(1, 2)
+        )
+    )
 
 
 def _stop_active_loading() -> None:
     if _active_loading_stop is not None:
         _active_loading_stop()
+
+
+def _resume_active_loading() -> None:
+    if _active_loading_resume is not None:
+        _active_loading_resume()
 
 
 class _LoadingIndicator:
@@ -86,12 +139,22 @@ class _LoadingIndicator:
         self.done.set()
         if self.thread is not None and threading.current_thread() is not self.thread:
             self.thread.join(timeout=LOADING_INTERVAL_SEC + 0.1)
+        self.pause()
+
+    def pause(self) -> None:
         with self.lock:
             if not self.active:
                 return
             self.console.file.write("\r\033[K")
             self.console.file.flush()
             self.active = False
+
+    def resume(self) -> None:
+        with self.lock:
+            if self.done.is_set() or self.active or self.thread is None:
+                return
+            self.active = True
+        self._render(LOADING_FRAMES[0])
 
     def _animate(self) -> None:
         index = 0
@@ -115,17 +178,23 @@ def _run_turn_with_loading(runner: AgentRunner, request: str, *, enabled: bool =
         return runner.run_turn(request)
 
     indicator = _LoadingIndicator(console)
-    stop_loading = indicator.stop
+    pause_loading = indicator.pause
+    resume_loading = indicator.resume
     global _active_loading_stop
+    global _active_loading_resume
     previous_stop = _active_loading_stop
+    previous_resume = _active_loading_resume
     indicator.start()
-    _active_loading_stop = stop_loading
+    _active_loading_stop = pause_loading
+    _active_loading_resume = resume_loading
     try:
         return runner.run_turn(request)
     finally:
-        stop_loading()
-        if _active_loading_stop is stop_loading:
+        indicator.stop()
+        if _active_loading_stop is pause_loading:
             _active_loading_stop = previous_stop
+        if _active_loading_resume is resume_loading:
+            _active_loading_resume = previous_resume
 
 
 def _assemble_runner(
@@ -153,7 +222,7 @@ def _assemble_runner(
     registry.register(build_search_docs(docs_dir))
     registry.register(build_ask_user(free_ask))
     deps = RunnerDeps(
-        llm=HttpLLMClient(cfg.base_url, cfg.model, cfg.api_key, cfg.llm_timeout_sec),
+        llm=_build_llm_client(cfg),
         registry=registry,
         ask=free_ask,
         log_dir=Path(cfg.log_dir),
@@ -171,6 +240,12 @@ def _assemble_runner(
     )
 
 
+def _build_llm_client(cfg: AgentConfig) -> LLMClient:
+    if cfg.provider == "anthropic":
+        return AnthropicMessagesClient(cfg.base_url, cfg.model, cfg.api_key, cfg.llm_timeout_sec)
+    return HttpLLMClient(cfg.base_url, cfg.model, cfg.api_key, cfg.llm_timeout_sec)
+
+
 @app.command()
 def chat(
     docs_dir: str = "demorsc/docs",
@@ -180,15 +255,18 @@ def chat(
     load_dotenv()  # read provider settings from a local .env if present
     cfg = AgentConfig.load()
     runner = _assemble_runner(cfg, docs_dir, free_ask=_ask, confirm_ask=_confirm)
-    console.print("[bold]세션을 시작합니다. 'exit'로 종료.[/bold]")
+    _render_startup_banner(cfg)
+    console.print("[bold]세션을 시작합니다. 'exit' 또는 '/exit'로 종료.[/bold]")
     while True:
         try:
-            request = Prompt.ask("[cyan]you[/cyan]")
+            request = _prompt_user()
         except (EOFError, KeyboardInterrupt):
             break
-        if not request.strip() and not sys.stdin.isatty():
+        if not request.strip():
+            if _is_interactive_stdin():
+                continue
             break
-        if request.strip().lower() in {"exit", "quit"}:
+        if _is_exit_command(request):
             break
         try:
             result = _run_turn_with_loading(runner, request, enabled=loading)

@@ -20,50 +20,39 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-adaptive-agent version   # 0.1.0 이 찍히면 설치 성공
+adaptive-agent version   # 0.1.1 이 찍히면 설치 성공
 ```
 
 ---
 
 ## 직접 대화하며 시연하기
 
-OpenAI API 키를 쓰는 호스팅 모델 방식과, 키 없이 로컬 [Ollama](https://ollama.com)로 돌리는
-방식 둘 다 가능하다. 처음 시연은 OpenAI 키 방식이 가장 간단하다.
+기본 실행 방식은 키 없이 로컬 [Ollama](https://ollama.com)의 `qwen2.5-coder:7b` 모델을
+사용하는 것이다. OpenAI API, Claude API, Vercel AI Gateway, OpenRouter API 키를 쓰는
+방식도 지원한다.
 
-### 1) 모델 준비
+### 1) Model 설정
+
+#### a. 로컬 Ollama 기본 설정
 
 ```bash
-# 방법 A: OpenAI 호스팅 모델 사용
 cp .env.example .env
-# 아래쪽의 OpenAI 예시 네 줄을 주석 해제한 뒤 AGENT_API_KEY만 본인 키로 바꾼다.
-# 같은 .env 안에서는 아래쪽 OpenAI 값이 위쪽 Ollama 기본값보다 우선된다.
-# AGENT_PROVIDER=openai
-# AGENT_BASE_URL=https://api.openai.com/v1
-# AGENT_MODEL=gpt-4o-mini
-# AGENT_API_KEY=sk-...
-
-# 방법 B: Ollama 로컬 모델 사용
 ollama pull qwen2.5-coder:7b
 ```
 
-### 2) 에이전트가 바라볼 엔드포인트 설정
+기본값 그대로 쓴다면 사실상 설정은 여기서 끝난다. `.env.example`을 복사한 `.env`에는 이미
+Ollama의 OpenAI 호환 엔드포인트와 `qwen2.5-coder:7b` 모델명이 들어 있다.
 
-OpenAI를 쓸 때는 `.env.example`에서 복사한 `.env`의 OpenAI 설정을 활성화하면 된다. 위쪽
-Ollama 줄을 주석 처리해도 되지만 필수는 아니다. 이미 터미널에 `AGENT_*` 환경 변수를 export해
-둔 경우 `.env`보다 그 값이 우선될 수 있으므로, 의도와 다르게 로컬 모델이 잡히면 먼저 해제한다.
+다른 Ollama 로컬 모델을 쓰고 싶다면 `.env`의 `AGENT_MODEL`만 바꾼다.
 
-```bash
-unset AGENT_PROVIDER AGENT_BASE_URL AGENT_MODEL AGENT_API_KEY
-```
+#### b. API key 설정
 
-```bash
-# Ollama를 쓸 때만 아래처럼 로컬 OpenAI 호환 엔드포인트로 바꾼다
-export AGENT_BASE_URL=http://localhost:11434/v1
-export AGENT_MODEL=qwen2.5-coder:7b
-unset AGENT_API_KEY
-```
+OpenAI API, Claude API, Vercel AI Gateway, OpenRouter를 쓰고 싶다면 `.env` 하단의 해당
+provider 블록을 수정한다. OpenAI, Claude, Vercel AI Gateway, OpenRouter 블록 중 하나에서
+"uncomment the four lines below" 안내가 붙은 네 줄을 주석 해제하고, `AGENT_API_KEY`와
+`AGENT_MODEL`을 본인 계정에 맞게 바꾼다.
 
-### 3) 작업 영역에 데모 데이터 넣기
+### 2) 작업 영역에 데모 데이터 넣기
 
 에이전트의 파일 도구는 작업 영역(`./workspace`) 안에서만 동작한다. 데모 입력을 그 안으로
 복사한다.
@@ -76,16 +65,16 @@ cp demorsc/data/events2.csv    workspace/
 cp demorsc/world/world.json    workspace/
 ```
 
-### 4) 세션 시작
+### 3) 세션 시작
 
 ```bash
 adaptive-agent chat
 ```
 
 `you:` 프롬프트가 뜨면 아래 데모 문장을 입력한다. 작업 중 파일 쓰기나 도구 저장처럼 되돌리기
-어려운 단계에서는 에이전트가 `(y/n)`으로 확인을 묻는다. `exit` 또는 `quit`으로 종료한다.
+어려운 단계에서는 에이전트가 `(y/n)`으로 확인을 묻는다. `exit`, `/exit`, `quit`, `/quit`으로 종료한다.
 
-### 5) 데모별 입력 문장과 기대 동작1
+### 4) 데모별 입력 문장과 기대 동작
 
 - **D1 · 데이터 질의**
   입력: `workspace의 monsters.json에서 hp가 100 이상인 몬스터 이름과 평균 hp를 알려줘.`
@@ -155,14 +144,18 @@ adaptive-agent run "..." --max-iterations 30   # 반복 상한 override
 
 대화형 `chat` 세션 동작은 이렇다.
 
+- 시작할 때 현재 CLI 버전, 적용된 모델명, 실행 디렉터리, workspace 경로를 보여준다.
+- 이어서 `세션을 시작합니다. 'exit' 또는 '/exit'로 종료.` 안내를 보여준다.
 - `you:` 프롬프트에 자연어로 요청을 적는다.
 - 요청을 받은 뒤 처리 중에는 `agent: loading.`, `loading..`, `loading...`을 순환 표시한다.
-  이 표시는 답변이나 사용자 확인 prompt 전에 지워지고, `--no-loading`으로 끌 수 있다.
+  이 표시는 답변이나 사용자 확인 prompt 전에 지워지고, 답을 입력하면 같은 턴의 남은 처리 동안
+  다시 표시된다. `--no-loading`으로 끌 수 있다.
 - 인사, 모델명 질문, 짧은 잡담도 같은 JSON action 루프를 거쳐 답한다.
 - 요청이 모호하면 에이전트가 되묻는다. 답을 입력하면 이어 진행한다.
 - 파일 쓰기, 도구 저장처럼 부수효과가 있는 단계에서 `(y/n)`을 묻는다. `y`로 승인, `n`으로 거절.
 - 작업이 끝나면 `agent:` 줄에 요약을 보여준다.
-- `exit` 또는 `quit`으로 종료한다.
+- 작업이 실패 한도에 걸려 중단되면 raw traceback 대신 마지막 실패 원인을 짧게 보여준다.
+- `exit`, `/exit`, `quit`, `/quit`으로 종료한다.
 
 세션이 남기는 것들:
 
@@ -217,11 +210,17 @@ ruff format --check .
 
 ## 설정
 
-복사해서 시작할 `.env.example`이 있다. 환경 변수로 바꾼다.
+복사해서 시작할 `.env.example`이 있다. 기본값은 로컬 Ollama이며, OpenAI 호환 Chat
+Completions 엔드포인트라면 `AGENT_BASE_URL`, `AGENT_MODEL`, `AGENT_API_KEY` 조합으로 바꿔
+쓸 수 있다. Vercel AI Gateway는 `https://ai-gateway.vercel.sh/v1`, OpenRouter는
+`https://openrouter.ai/api/v1` base URL을 사용한다. `AGENT_PROVIDER=anthropic`이면 같은
+설정값으로 Anthropic native Messages API를 호출한다. Anthropic의 Opus 4.8 모델 ID는
+`claude-opus-4-8`처럼 hyphen 표기를 쓴다. Anthropic native 호출은 Opus 계열의 sampling
+파라미터 제한을 피하기 위해 `temperature`를 처음부터 보내지 않는다.
 
 | 변수 | 기본값 | 의미 |
 | --- | --- | --- |
-| `AGENT_PROVIDER` | `openai-compatible` | provider 표식 |
+| `AGENT_PROVIDER` | `openai-compatible` | provider 표식. 실제 호출 방식은 base URL과 model 조합이 정한다 |
 | `AGENT_BASE_URL` | `http://localhost:11434/v1` | chat completions 엔드포인트 |
 | `AGENT_MODEL` | `qwen2.5-coder:7b` | 모델 이름 |
 | `AGENT_API_KEY` | (없음) | 호스팅 provider에서만 필요 |

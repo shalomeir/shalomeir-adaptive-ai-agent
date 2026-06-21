@@ -228,6 +228,11 @@ def run(input: dict) -> dict:
 
 ### 3.4 runPython
 
+`runPython`은 `print(3+4)`처럼 한 줄 scalar 계산을 확인하는 보조 도구다. `import`, 파일 I/O,
+반복문, 조건문, helper 함수, 여러 줄 스크립트가 필요하면 `create_tool`로 생성 도구를 만든 뒤
+그 도구를 `call_tool`로 실행한다. workspace 파일을 줄 단위로 읽거나 필터링·변환·집계하는 작업은
+읽기 전용이어도 생성 도구 경로가 기본이다.
+
 ```json
 { "input": { "type": "object",
     "properties": { "code": { "type": "string" }, "file": { "type": "string" },

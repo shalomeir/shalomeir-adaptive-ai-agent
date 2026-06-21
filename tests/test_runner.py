@@ -48,6 +48,20 @@ class RecordingLLM:
         return self.reply
 
 
+class RecordingSequenceLLM:
+    def __init__(self, replies: list[str]) -> None:
+        self._replies = list(replies)
+        self.calls = 0
+        self.messages_by_call: list[list[Message]] = []
+
+    def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str:
+        self.calls += 1
+        self.messages_by_call.append(messages)
+        if not self._replies:
+            return '{"action":"finish"}'
+        return self._replies.pop(0)
+
+
 class HangingLLM:
     def __init__(self) -> None:
         self.timeout = 0.05
@@ -283,6 +297,95 @@ def test_known_file_is_inspected_before_first_plan(tmp_path):
     assert "root.children[].props.health" in rendered
 
 
+def test_runtime_state_is_sent_with_each_plan(tmp_path):
+    llm = RecordingLLM()
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=ToolRegistry(),
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    runner.run_turn("events.csv에서 amount 합계를 type별로 알려줘")
+
+    runtime_state = llm.messages[-1]
+    assert runtime_state.role == "tool"
+    assert runtime_state.content.startswith("[runtime-state]")
+    assert '"currentRequest": "events.csv에서 amount 합계를 type별로 알려줘"' in runtime_state.content
+    assert '"recentObservations"' in runtime_state.content
+
+
+def test_runtime_state_carries_tool_failure_to_next_plan(tmp_path):
+    llm = RecordingSequenceLLM(
+        [
+            '{"action":"call_tool","name":"boom","input":{"path":"missing.json"}}',
+            '{"action":"finish","summary":"done"}',
+        ]
+    )
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "boom",
+            "boom",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=False,
+                error="FileNotFoundError: [Errno 2] No such file or directory: 'missing.json'",
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    runner.run_turn("missing.json을 처리해줘")
+
+    second_runtime_state = llm.messages_by_call[1][-1].content
+    assert '"missingWorkspacePaths": ["missing.json"]' in second_runtime_state
+    assert '"validationFailures"' in second_runtime_state
+    assert "FileNotFoundError" in second_runtime_state
+
+
+def test_runtime_state_carries_blocked_tool_actions(tmp_path):
+    llm = RecordingSequenceLLM(
+        [
+            '{"action":"call_tool","name":"old-cleaner","input":{"path":"world.json"}}',
+            '{"action":"finish","summary":"done"}',
+        ]
+    )
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "old-cleaner",
+            "Remove duplicate rows and sort CSV by date.",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=True, output={"path": "out.csv"}),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=llm,
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    runner.run_turn("world.json에서 health 평균을 알려줘")
+
+    second_runtime_state = llm.messages_by_call[1][-1].content
+    assert '"blockedToolActions": {"old-cleaner": "tool_intent_mismatch_current_request"}' in second_runtime_state
+
+
 def test_run_python_failure_repeats_file_structure_hint(tmp_path):
     reg = ToolRegistry()
     reg.register(
@@ -468,9 +571,81 @@ def test_runtime_identity_complaint_does_not_reuse_previous_task(tmp_path):
     assert "previous data result" not in second.summary
 
 
+def test_current_data_request_blocks_previous_result_without_current_work(tmp_path):
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"respond","text":"purchase: 2500.0, signup: 0.0, refund: -200.0","final":true}',
+            '{"action":"respond","text":"purchase: 2500.0, signup: 0.0, refund: -200.0","final":true}',
+            '{"action":"respond","text":"어떤 데이터와 정리 기준이 필요한지 알려주세요.","final":true}',
+        ],
+    )
+
+    first = runner.run_turn("events.csv 합계를 알려줘.")
+    result = runner.run_turn("데이터 좀 정리해줘.")
+
+    assert first.summary == "purchase: 2500.0, signup: 0.0, refund: -200.0"
+    assert result.summary == "어떤 데이터와 정리 기준이 필요한지 알려주세요."
+    assert any("이번 턴에서 그 결과를 뒷받침하는 도구 실행이 없습니다" in o for o in result.observations)
+
+
+def test_ambiguous_followup_allows_user_question_for_unanchored_file_from_history(tmp_path):
+    asks = []
+    runner = build_runner(
+        tmp_path,
+        [
+            '{"action":"respond","text":"purchase: 2500.0, signup: 0.0, refund: -200.0","final":true}',
+            '{"action":"ask_user","question":"events.csv 파일의 내용을 확인해 주시면 감사하겠습니다."}',
+            '{"action":"finish","summary":"continued"}',
+        ],
+    )
+    runner.deps.ask = lambda *a: asks.append(a[0]) or "events.csv를 중복 제거해줘"
+
+    first = runner.run_turn("events.csv amount 합계를 알려줘.")
+    second = runner.run_turn("데이터 좀 정리해줘.")
+
+    assert first.summary == "purchase: 2500.0, signup: 0.0, refund: -200.0"
+    assert second.summary == "continued"
+    assert asks == ["events.csv 파일의 내용을 확인해 주시면 감사하겠습니다."]
+    assert not any("질문에 나온 작업 영역 파일" in o for o in second.observations)
+
+
+def test_current_small_talk_blocks_previous_generated_tool_call(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "sort-csv",
+            "Sort a CSV file by date.",
+            "generated",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=True, output={"path": "events-clean.csv"}),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"call_tool","name":"sort-csv","input":{}}',
+                    '{"action":"respond","text":"저는 이 도구 실행 에이전트입니다.","final":true}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("너 뭐야?")
+
+    assert result.summary == "저는 이 도구 실행 에이전트입니다."
+    assert any("새 도구 실행을 요구하지 않습니다" in o for o in result.observations)
+
+
 def test_system_prompt_tells_model_not_to_dump_full_records():
     assert "specific fields or aggregates" in _SYSTEM
     assert "instead of dumping full records" in _SYSTEM
+    assert "Successful tool observations are authoritative" in _SYSTEM
+    assert "do not call the same tool again with the same input" in _SYSTEM
 
 
 def test_incomplete_loop_reports_last_result(tmp_path):
@@ -533,6 +708,19 @@ def test_ask_user_flow(tmp_path):
 
 
 def test_non_interactive_file_structure_ask_is_auto_blocked(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={"content": '{"monsters":[{"name":"Orc","hp":150}]}', "truncated": False},
+            ),
+        )
+    )
     runner = AgentRunner(
         RunnerDeps(
             llm=FakeLLMClient(
@@ -542,7 +730,7 @@ def test_non_interactive_file_structure_ask_is_auto_blocked(tmp_path):
                     '{"action":"finish","summary":"continued"}',
                 ]
             ),
-            registry=ToolRegistry(),
+            registry=reg,
             ask=lambda *a: NON_INTERACTIVE_ASK,
             log_dir=tmp_path,
             non_interactive=True,
@@ -553,6 +741,45 @@ def test_non_interactive_file_structure_ask_is_auto_blocked(tmp_path):
 
     assert result.summary == "continued"
     assert sum("파일을 직접 열어" in o for o in result.observations) == 2
+
+
+def test_repeated_blocked_file_structure_ask_stops_before_max_iterations(tmp_path):
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "readFile",
+            "read",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(
+                ok=True,
+                output={"content": '{"monsters":[{"name":"Orc","hp":150}]}', "truncated": False},
+            ),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=[
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주세요."}',
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주시면 감사하겠습니다."}',
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주실 수 있나요?"}',
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주세요."}',
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주시면 감사하겠습니다."}',
+                    '{"action":"ask_user","question":"monsters.json 파일의 내용을 확인해 주실 수 있나요?"}',
+                ]
+            ),
+            registry=reg,
+            ask=lambda *a: "no",
+            log_dir=tmp_path,
+        )
+    )
+
+    result = runner.run_turn("monsters.json 분석")
+
+    assert result.stopped_reason == "no_progress"
+    assert result.summary.startswith("작업이 진전 없이 반복되어 중단했습니다.")
+    assert runner.deps.llm.calls < 10
 
 
 def test_non_interactive_general_ask_ends_with_hitl_required(tmp_path):
@@ -853,7 +1080,7 @@ def test_file_content_ask_with_path_in_question_is_blocked_before_user_prompt(tm
         )
     )
 
-    result = runner.run_turn("글자 3개인 경우만 처리하라니까.")
+    result = runner.run_turn("monsters.json에서 글자 3개인 경우만 처리하라니까.")
 
     assert result.summary == "continued"
     assert asks == []
@@ -956,6 +1183,51 @@ def test_consecutive_failures_stop(tmp_path):
     )
     result = runner.run_turn("go")
     assert result.stopped_reason == "consecutive_failures"
+    assert "도구 실행이 반복해서 실패해 중단했습니다." in result.summary
+    assert "마지막 실패: 도구 boom 실패: boom" in result.summary
+    assert "연속 실패가 한계를 넘었습니다" not in result.summary
+
+
+def test_consecutive_failures_summarizes_traceback(tmp_path):
+    traceback = """Traceback (most recent call last):
+  File "/tmp/workspace/.session/filter-monsters-by-hp/_runner.py", line 8, in <module>
+    result = getattr(mod, "run")(payload)
+  File "/tmp/workspace/.session/filter-monsters-by-hp/tool.py", line 3, in run
+    data = json.load(open('monsters.json'))
+FileNotFoundError: [Errno 2] No such file or directory: 'monsters.json'
+"""
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            "filter-monsters-by-hp",
+            "always fails with traceback",
+            "builtin",
+            {"type": "object"},
+            lambda inp: ToolResult(ok=False, error=traceback),
+        )
+    )
+    runner = AgentRunner(
+        RunnerDeps(
+            llm=FakeLLMClient(
+                replies=['{"action":"call_tool","name":"filter-monsters-by-hp","input":{}}'] * 10
+            ),
+            registry=reg,
+            ask=lambda *a: "n",
+            log_dir=tmp_path,
+            max_iterations=20,
+            max_fix_retries=0,
+        )
+    )
+
+    result = runner.run_turn("workspace의 monsters.json에서 hp 평균을 알려줘")
+
+    assert result.stopped_reason == "consecutive_failures"
+    assert (
+        "마지막 실패: 도구 filter-monsters-by-hp 실패: monsters.json 파일이 존재하지 않습니다."
+    ) in result.summary
+    assert "Traceback" not in result.summary
+    assert "_runner.py" not in result.summary
+    assert "tool.py" not in result.summary
 
 
 def test_system_prompt_is_not_demo_case_specific():

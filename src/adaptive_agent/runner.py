@@ -19,7 +19,8 @@ from .monitoring import Exporter
 from .observability import Tracer
 from .parsing import parse_action_text
 from .policy import PolicyManager
-from .schemas import AskUser, CallTool, CreateTool, Finish, Respond, UpdateTool
+from .python_repair import escape_newlines_in_string_literals
+from .schemas import AskUser, CallTool, CreateTool, Finish, Message, Respond, ToolSpec, UpdateTool
 from .skills import SkillStore
 from .tools.base import ToolResult
 from .tools.generated import GeneratedToolManager
@@ -60,7 +61,24 @@ GENERATED_WRITE_PATH_FIELD_NAMES = frozenset(
     }
 )
 AMBIGUOUS_WRITE_PATH_FIELD_NAMES = frozenset({"dest", "destination", "output", "target"})
+AMBIGUOUS_FILE_PATH_FIELD_NAMES = frozenset({"file", "filepath", "filename", "name"})
+GENERATED_SOURCE_PATH_FIELD_NAMES = frozenset(
+    {
+        "file",
+        "filepath",
+        "filename",
+        "input",
+        "inputfile",
+        "inputpath",
+        "path",
+        "source",
+        "sourcefile",
+        "sourcepath",
+        "src",
+    }
+)
 UNKNOWN_DYNAMIC_WRITE_PATH = "<dynamic path>"
+CONTEXT_TOOL_NAMES = {"readFile", "listFiles", "searchDocs", "askUser"}
 FILE_WRITE_INTENT_TERMS = (
     "as a file",
     "create",
@@ -129,6 +147,62 @@ DATA_TOOL_TASK_TERMS = (
     "date",
     "mermaid",
 )
+CONTEXT_FOLLOWUP_TERMS = (
+    "above",
+    "again",
+    "filtered",
+    "last",
+    "previous",
+    "that",
+    "those",
+    "그 결과",
+    "그걸",
+    "그거",
+    "다시",
+    "방금",
+    "앞서",
+    "위",
+    "이전",
+)
+TOOL_MATCH_STOPWORDS = {
+    "and",
+    "csv",
+    "data",
+    "file",
+    "for",
+    "from",
+    "json",
+    "the",
+    "tool",
+    "with",
+}
+TOOL_INTENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "aggregate": ("aggregate", "group", "집계"),
+    "average": ("average", "avg", "mean", "평균"),
+    "clean": ("clean", "정리"),
+    "count": ("count", "세", "개수"),
+    "dedupe": ("dedupe", "duplicate", "duplicates", "중복"),
+    "delete": ("delete", "remove", "제거", "삭제", "제외"),
+    "extract": ("extract", "list", "나열", "추출"),
+    "filter": ("filter", "where", "필터", "이상", "이하", "초과", "미만"),
+    "sort": ("sort", "order", "sorted", "정렬", "순으로", "오름차순", "내림차순"),
+    "sum": ("sum", "total", "합계", "합산"),
+    "table": ("table", "markdown", "표"),
+    "transform": ("convert", "parse", "transform", "변환", "분석"),
+    "write": ("output", "save", "write", "저장", "작성", "파일로"),
+    "field:amount": ("amount",),
+    "field:atk": ("atk", "attack", "공격력"),
+    "field:date": ("date",),
+    "field:hp": ("hp", "health"),
+    "field:type": ("type",),
+}
+BROAD_TOOL_INTENTS = {"clean", "transform"}
+TOOL_RESULT_FINALIZATION_HINT = (
+    "이 도구 결과는 현재 요청에 대한 최종 근거입니다. 같은 입력으로 같은 도구를 다시 호출하지 "
+    "마세요. 요청한 답이 결과에 있으면 다음 action은 respond(final:true) 또는 finish입니다. "
+    "최종 답변에는 위 결과에 있는 값만 사용하고, 결과에 없는 숫자나 필드를 추정하지 마세요. "
+    "요청을 답하기에 결과가 부족할 때만 다른 도구 호출이나 update_tool을 사용하세요."
+)
 
 _SYSTEM = (
     "You are a task-solving agent that creates and runs small Python tools. You are not a "
@@ -154,30 +228,30 @@ _SYSTEM = (
     'absolute paths or "..". Use readFile only to inspect a small file before deciding what to do.\n'
     'There are TWO ways to run Python. Both are invoked with call_tool — "runPython" and any tool '
     'you create are tool NAMES, never values of the "action" field:\n'
-    "(a) The built-in runPython tool. Invoke it as "
-    '{"action":"call_tool","name":"runPython","input":{"code":"<script>"}}. The code is a TOP-LEVEL '
-    "script: there is NO input variable, do NOT write return — PRINT the result, e.g. "
-    "print(json.dumps(result)).\n"
+    "(a) The built-in runPython tool is ONLY for one-line scalar calculations such as "
+    '{"action":"call_tool","name":"runPython","input":{"code":"print(3+4)"}}. Do not use '
+    "runPython for imports, file I/O, loops, conditionals, helper functions, multi-line scripts, "
+    "or any task that would naturally become a function.\n"
     "(b) A tool you create_tool, then call_tool by its name. Its code defines run(input) where "
     '`input` is the call_tool "input" dict, and you RETURN the result.\n'
     "To process a workspace file, OPEN IT DIRECTLY inside your code by its relative name — your code "
     "runs with the workspace as the working directory. You do NOT need to readFile first or pass "
-    "file contents through input for normal file processing.\n"
+    "file contents through input for normal file processing. If you need to read a file line by line, "
+    "filter rows/items, aggregate values, transform records, or inspect more than a tiny preview, use "
+    "create_tool/update_tool/call_tool, not runPython.\n"
     "Default to tool management: for workspace file/data analysis, transformation, aggregation, or "
-    "state changes, prefer create_tool/update_tool/call_tool and reuse existing generated tools when "
-    "they exactly match. Use runPython only for tiny scalar calculations, quick diagnostics, schema "
-    "inspection, or verification where creating a managed tool would add no reusable value.\n"
+    "state changes, create or reuse a generated tool. Use runPython only for tiny one-line scalar "
+    "calculations where creating a managed tool would add no reusable value.\n"
     "After a generated tool failure, use update_tool to fix that generated tool and call it again. "
-    "After a runPython failure, retry with corrected runPython only when runPython was appropriate.\n"
+    "After a runPython failure, retry with corrected runPython only when the task is still a one-line "
+    "scalar calculation; otherwise create_tool and call that generated tool.\n"
     "When writing Python for JSON files, inspect whether the top-level value is a dict or list. If the "
-    "top-level value is a dict with one relevant list field, operate on that list field. If the "
-    "top-level dict contains a root node with children, treat it as an object tree and traverse "
-    "children recursively instead of asking the user for internal field names.\n"
+    "top-level value is a dict with one relevant list field, operate on that list field. If nested "
+    "children are present, traverse them recursively instead of asking the user for internal field "
+    "names.\n"
     "When a request asks for records matching a condition and an average for those records, calculate "
     "the average over the filtered records only, never over the full dataset. Do not invent numeric "
     "field values; read them from the source file.\n"
-    "For object tree requests that ask to remove, exclude, delete, 제거, 제외, or 삭제 nodes, update the "
-    "workspace file copy and then verify the saved state before answering.\n"
     "For follow-up requests that refer to previous results, use the conversation history. If the "
     "follow-up needs values not present in the summary, reopen the source file mentioned earlier "
     "and reconstruct the result set from the previous condition. For sorted tables, use actual values "
@@ -202,9 +276,13 @@ _SYSTEM = (
     "READ the error message carefully and fix it: use update_tool for a created tool, or call the "
     "tool again with corrected input. Do not repeat the same question; if you already have what you "
     "need, act. Only call writeFile when the user explicitly asks to save, write, create, or update "
-    "a file. For read-only questions, answer with respond(final:true) or finish. If the user asks "
+    "a file. For read-only non-file questions, answer with respond(final:true) or finish. For "
+    "workspace file analysis, answer only after the matching generated tool has run. If the user asks "
     "for specific fields or aggregates, answer only those requested values instead of dumping full "
-    "records. Keep tool names in "
+    "records. Successful tool observations are authoritative: when an observation says "
+    "`도구 <name> 결과: ...`, use only that result to synthesize the final answer, do not invent "
+    "missing values, and do not call the same tool again with the same input. If the result is "
+    "insufficient, fix or call tools only to obtain the missing information. Keep tool names in "
     "kebab-case. When you have the answer, reply with respond (final:true) or finish — do not keep "
     "calling tools."
 )
@@ -244,7 +322,13 @@ class _TurnLoopState:
     called_changed_tools: set[str] = field(default_factory=set)
     called_generated_tools: set[str] = field(default_factory=set)
     validation_failed_tool_indices: dict[str, int] = field(default_factory=dict)
+    validation_failed_tool_messages: dict[str, str] = field(default_factory=dict)
     last_tool_call_index: int | None = None
+    last_tool_inputs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    missing_workspace_paths: set[str] = field(default_factory=set)
+    blocked_tool_actions: dict[str, str] = field(default_factory=dict)
+    last_blocked_ask_observation: str | None = None
+    blocked_ask_repeats: int = 0
 
 
 _StepAction = Literal["dispatch", "continue", "break"]
@@ -343,13 +427,19 @@ class AgentRunner:
             return f"respond:{action.text}"
         return None
 
-    def _blocked_ask_user_observation(self, question: str, request: str = "") -> str | None:
+    def _blocked_ask_user_observation(
+        self,
+        question: str,
+        request: str = "",
+        missing_workspace_paths: set[str] | None = None,
+    ) -> str | None:
         """Convert invalid ask_user package prompts into a runtime observation."""
         repeated_request = self._repeated_actionable_request_observation(question, request)
         if repeated_request is not None:
             return repeated_request
 
         lowered = question.lower()
+        known_paths = self._mentioned_workspace_paths(request)
         mentions_package = any(
             term in lowered
             for term in (
@@ -371,7 +461,7 @@ class AgentRunner:
                 "계속 진행하세요."
             )
         question_paths = self._mentioned_workspace_paths(question)
-        if len(question_paths) == 1:
+        if len(question_paths) == 1 and question_paths[0] in known_paths:
             structure_hint = self._workspace_structure_hint(question)
             if structure_hint:
                 return (
@@ -379,7 +469,6 @@ class AgentRunner:
                     "readFile 또는 runPython으로 직접 열어 필요한 값을 확인하고 계속 진행하세요."
                     f"\n{structure_hint}"
                 )
-        known_paths = self._mentioned_workspace_paths(request)
         asks_for_known_paths = known_paths and any(
             term in lowered
             for term in (
@@ -393,7 +482,11 @@ class AgentRunner:
                 "파일 이름",
             )
         )
-        if asks_for_known_paths:
+        known_missing_paths = missing_workspace_paths or set()
+        has_missing_source_path = self._request_has_missing_source_path(request) or any(
+            path in known_missing_paths for path in self._request_source_paths(request)
+        )
+        if asks_for_known_paths and not has_missing_source_path:
             return (
                 "입출력 파일 경로는 사용자에게 다시 묻지 않습니다. 요청에 나온 상대 경로를 "
                 f"그대로 사용하세요: {', '.join(known_paths)}."
@@ -436,9 +529,11 @@ class AgentRunner:
             )
         )
         if asks_about_file_structure:
+            if question_paths and not all(path in known_paths for path in question_paths):
+                return None
             structure_target = f"{request}\n{question}"
             structure_hint = self._workspace_structure_hint(structure_target)
-            if not structure_hint and not self._mentioned_workspace_paths(structure_target):
+            if not structure_hint:
                 return None
             return (
                 "작업 영역 파일의 구조는 사용자에게 묻지 않습니다. readFile 또는 runPython으로 "
@@ -487,6 +582,23 @@ class AgentRunner:
             if path and ".." not in Path(path).parts and path not in paths:
                 paths.append(path)
         return paths
+
+    def _workspace_path_exists(self, path: str) -> bool:
+        if self._path_escapes_workspace(path):
+            return False
+        if self.deps.registry.get("readFile") is None:
+            return True
+        res = self.deps.registry.call("readFile", {"path": path, "maxBytes": 1})
+        return res.ok
+
+    def _request_source_paths(self, request: str) -> list[str]:
+        paths = self._mentioned_workspace_paths(request)
+        if len(paths) >= 2 and self._request_mentions_file_write(request):
+            return paths[:-1]
+        return paths
+
+    def _request_has_missing_source_path(self, request: str) -> bool:
+        return any(not self._workspace_path_exists(path) for path in self._request_source_paths(request))
 
     def _conversation_context_text(self) -> str:
         return "\n".join(message.content for message in self.conv.body())
@@ -557,9 +669,6 @@ class AgentRunner:
             return None
         return str(result.output.get("content", ""))
 
-    def _request_context(self, request: str) -> str:
-        return f"{self._conversation_context_text()}\n{request}"
-
     def _likely_output_path(self, request: str, suffix: str) -> str | None:
         paths = [path for path in self._mentioned_workspace_paths(request) if path.endswith(suffix)]
         if len(paths) >= 2:
@@ -568,332 +677,65 @@ class AgentRunner:
             return paths[0]
         return None
 
-    def _likely_source_path(
-        self, request: str, suffix: str, output_path: str | None = None
-    ) -> str | None:
-        paths = [path for path in self._mentioned_workspace_paths(request) if path.endswith(suffix)]
-        for path in paths:
-            if path != output_path:
-                return path
-        return paths[0] if paths else None
-
-    def _csv_rows(self, content: str) -> list[list[str]] | None:
-        rows = list(csv.reader(io.StringIO(content)))
-        return rows if rows else None
-
-    def _csv_dedup_sort_validation(self, request: str) -> tuple[bool, str] | None:
-        lowered = request.lower()
-        compact = lowered.replace(" ", "")
-        if not (
-            (("duplicate" in lowered or "중복" in lowered) and "date" in lowered)
-            and ("sort" in lowered or "정렬" in lowered or "오름차순" in lowered)
-        ):
-            return None
-        output_path = self._likely_output_path(request, ".csv")
-        source_path = self._likely_source_path(request, ".csv", output_path)
-        if output_path is None or source_path is None:
-            return None
-
-        source_text = self._read_workspace_text(source_path)
-        output_text = self._read_workspace_text(output_path)
-        if source_text is None:
-            return None
-        if output_text is None:
-            return (
-                False,
-                f"{output_path} 검증 실패: 파일이 아직 없거나 읽을 수 없습니다. "
-                "runPython 또는 생성 도구로 실제 파일을 만든 뒤 다시 확인하세요.",
-            )
-        source_rows = self._csv_rows(source_text)
-        output_rows = self._csv_rows(output_text)
-        if not source_rows or not output_rows:
-            return (
-                False,
-                f"{output_path} 검증 실패: CSV 내용이 비어 있습니다. 원본 header와 행을 유지해 다시 저장하세요.",
-            )
-        header, body = source_rows[0], source_rows[1:]
-        if "date" not in header:
-            return None
-        date_index = header.index("date")
-        seen: set[tuple[str, ...]] = set()
-        unique: list[list[str]] = []
-        for row in body:
-            key = tuple(row)
-            if key not in seen:
-                seen.add(key)
-                unique.append(row)
-        expected = [header, *sorted(unique, key=lambda row: row[date_index])]
-        if output_rows != expected:
-            expected_ids = [row[0] for row in expected[1:] if row]
-            return (
-                False,
-                f"{output_path} 검증 실패: 완전히 중복된 전체 행만 제거하고 date 오름차순으로 "
-                "안정 정렬해야 합니다. date는 정렬 키일 뿐 dedupe 키가 아닙니다. "
-                "seen_dates 또는 row['date'] 기준 중복 제거는 금지입니다. "
-                "반드시 seen_rows=set(); key=tuple(row.values()) 또는 tuple(row.items())로 "
-                f"전체 행을 비교하세요. 같은 date의 원본 상대 순서를 유지하세요. expectedIds={expected_ids}.",
-            )
-        if "pandas" in compact or "numpy" in compact:
-            return False, "외부 패키지 대신 Python 표준 라이브러리 csv로 다시 처리하세요."
-        return True, f"{output_path} 저장 검증 완료: 고유 {len(expected) - 1}행, date 오름차순."
-
-    def _entity_health_threshold(self, request: str) -> int | None:
-        match = re.search(
-            r"health[^0-9-]*(?:<|미만|below|under|less than)[^0-9-]*(\d+)", request, re.I
-        )
-        if match:
-            return int(match.group(1))
-        match = re.search(r"(\d+)[^0-9]*(?:미만|below|under)", request, re.I)
-        return int(match.group(1)) if match else None
-
-    def _collect_json_nodes(self, value: Any) -> list[dict[str, Any]]:
-        nodes: list[dict[str, Any]] = []
-
-        def walk(item: Any) -> None:
-            if isinstance(item, dict):
-                nodes.append(item)
-                for child in item.values():
-                    if isinstance(child, dict):
-                        walk(child)
-                    elif isinstance(child, list):
-                        for entry in child:
-                            walk(entry)
-            elif isinstance(item, list):
-                for entry in item:
-                    walk(entry)
-
-        walk(value)
-        return nodes
-
-    def _object_tree_mutation_validation(self, request: str) -> tuple[bool, str] | None:
-        if not self._request_needs_object_tree_mutation(request):
-            return None
-        threshold = self._entity_health_threshold(request)
-        source_path = self._likely_source_path(request, ".json")
-        if threshold is None or source_path is None:
-            return None
-        content = self._read_workspace_text(source_path)
-        if content is None:
-            return None
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(data, dict) and "root" not in data:
-            return (
-                False,
-                f"{source_path} 검증 실패: top-level root wrapper가 사라졌습니다. "
-                "data['root']만 저장하지 말고 전체 data 객체를 유지해 저장하세요.",
-            )
-        entities = [
-            node
-            for node in self._collect_json_nodes(data)
-            if node.get("type") == "Entity" and isinstance(node.get("props"), dict)
-        ]
-        if not entities:
-            return (
-                False,
-                f"{source_path} 검증 실패: 남은 Entity가 0개입니다. Container/Scene node는 보존하고 "
-                "health 조건에 맞는 Entity만 제거하세요.",
-            )
-        low = [node.get("id") for node in entities if node["props"].get("health", 0) < threshold]
-        if low:
-            return (
-                False,
-                f"{source_path} 검증 실패: health가 {threshold} 미만인 Entity가 아직 남아 있습니다: {low}. "
-                "평균만 계산하지 말고 파일을 실제로 다시 저장한 뒤, 저장된 파일을 재읽어서 평균을 계산하세요.",
-            )
-        healths = [node["props"].get("health", 0) for node in entities]
-        avg = round(sum(healths) / len(healths), 2) if healths else 0
-        return (
-            True,
-            f"{source_path} 저장 검증 완료: 남은 Entity {len(entities)}개, 평균 health {avg:g}.",
-        )
-
-    def _mutation_restore_snapshots(self, request: str, action: CallTool) -> dict[str, str]:
-        if action.name != "runPython" or not self._request_needs_object_tree_mutation(request):
-            return {}
-        snapshots: dict[str, str] = {}
-        for path in self._mentioned_workspace_paths(request):
-            if not path.endswith(".json"):
-                continue
-            content = self._read_workspace_text(path)
-            if content is not None:
-                snapshots[path] = content
-        return snapshots
-
-    def _restore_workspace_files(self, snapshots: dict[str, str]) -> None:
-        for path, content in snapshots.items():
-            result = self.deps.registry.call("writeFile", {"path": path, "content": content})
-            self._log_tool_call("writeFile", {"path": path, "content": content}, result)
-
-    def _try_repair_completed_work(
-        self, request: str, snapshots: dict[str, str]
-    ) -> tuple[bool, str] | None:
-        if not self._request_needs_object_tree_mutation(request):
-            return None
-        threshold = self._entity_health_threshold(request)
-        source_path = self._likely_source_path(request, ".json")
-        if threshold is None or source_path is None or source_path not in snapshots:
-            return None
-        try:
-            data = json.loads(snapshots[source_path])
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, dict) or "root" not in data:
-            return None
-
-        def prune(node: dict[str, Any]) -> bool:
-            if node.get("type") == "Entity":
-                props = node.get("props")
-                if isinstance(props, dict) and props.get("health", 0) < threshold:
-                    return False
-            children = node.get("children")
-            if isinstance(children, list):
-                kept = []
-                for child in children:
-                    if isinstance(child, dict) and prune(child):
-                        kept.append(child)
-                node["children"] = kept
-            return True
-
-        root = data.get("root")
-        if not isinstance(root, dict):
-            return None
-        prune(root)
-        content = json.dumps(data, ensure_ascii=False, indent=2)
-        result = self.deps.registry.call("writeFile", {"path": source_path, "content": content})
-        self._log_tool_call("writeFile", {"path": source_path, "content": content}, result)
-        if not result.ok:
-            return None
-        validation = self._object_tree_mutation_validation(request)
-        if validation is None or not validation[0]:
-            return None
-        return (
-            True,
-            f"{validation[1]} 검증 실패한 도구 결과는 원본 snapshot에서 재구성해 복구했습니다.",
-        )
-
-    def _request_needs_object_tree_mutation(self, request: str) -> bool:
-        lowered = request.lower()
-        return (
-            "entity" in lowered
-            and "health" in lowered
-            and any(
-                term in lowered
-                for term in ("remove", "exclude", "delete", "제거", "제외", "제외하", "삭제")
-            )
-        )
-
-    def _run_python_missing_required_mutation_observation(
-        self, request: str, action: CallTool
-    ) -> str | None:
-        if action.name != "runPython" or not self._request_needs_object_tree_mutation(request):
-            return None
-        code = str(action.input.get("code", ""))
-        if self._code_writes_workspace_file(code):
-            return None
-        source_path = self._likely_source_path(request, ".json") or "the JSON file"
-        threshold = self._entity_health_threshold(request)
-        threshold_text = str(threshold) if threshold is not None else "요청 기준"
-        return (
-            f"이 요청은 읽기 전용 평균 계산이 아니라 {source_path} 상태 변경 작업입니다. "
-            f"health가 {threshold_text} 미만인 Entity node를 children에서 재귀적으로 제거하고 "
-            f"json.dump(..., open('{source_path}', 'w'))로 같은 파일에 저장한 뒤, 저장된 파일을 "
-            "다시 읽어서 남은 Entity 평균을 계산하세요."
-        )
-
-    def _previous_json_filter_table_validation(
-        self, request: str, path: str, content: str
-    ) -> tuple[bool, str] | None:
-        lowered = request.lower()
-        if not (
-            path.endswith(".md")
-            and (
-                "방금" in request
-                or "previous" in lowered
-                or "filtered" in lowered
-                or "필터" in request
-            )
-            and ("table" in lowered or "표" in request)
-            and ("내림차순" in request or "desc" in lowered)
-        ):
-            return None
-        context = self._request_context(request)
-        source_path = self._likely_source_path(context, ".json")
-        if source_path is None:
-            return None
-        field_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:내림차순|desc)", context)
-        if not field_match:
-            return None
-        field = field_match.group(1)
-        threshold_match = re.search(
-            rf"{re.escape(field)}[^0-9]*(?:>=\s*(\d+)|(\d+)\s*(?:이상|or more|and above))",
-            context,
-            re.I,
-        )
-        if not threshold_match:
-            return None
-        threshold = int(threshold_match.group(1) or threshold_match.group(2))
-        source_text = self._read_workspace_text(source_path)
-        if source_text is None:
-            return None
-        try:
-            data = json.loads(source_text)
-        except json.JSONDecodeError:
-            return None
-
-        def has_selected_numeric_field(item: dict[str, Any]) -> bool:
-            value = item.get(field)
-            return isinstance(value, int | float) and value >= threshold
-
-        records = [
-            node for node in self._collect_json_nodes(data) if has_selected_numeric_field(node)
-        ]
-        if not records and isinstance(data, dict):
-            for value in data.values():
-                if isinstance(value, list):
-                    records.extend(
-                        item
-                        for item in value
-                        if isinstance(item, dict) and has_selected_numeric_field(item)
-                    )
-        records = sorted(records, key=lambda item: item[field], reverse=True)
-        names = [str(item.get("name") or item.get("id") or "") for item in records]
-        values = [str(item[field]) for item in records]
-        positions = [content.find(name) for name in names]
-        if any(pos < 0 for pos in positions) or positions != sorted(positions):
-            return (
-                False,
-                f"{path} 검증 실패: 이전 필터 결과를 {field} 내림차순으로 다시 구성해야 합니다. "
-                f"expectedOrder={names}. {source_path}를 다시 읽고 실제 값을 사용하세요.",
-            )
-        for name, value in zip(names, values, strict=True):
-            row_pattern = re.compile(
-                rf"\|\s*{re.escape(name)}\s*\|\s*{re.escape(value)}\s*\|", re.I
-            )
-            if not row_pattern.search(content):
-                return (
-                    False,
-                    f"{path} 검증 실패: {name}의 실제 {field} 값은 {value}입니다. "
-                    f"{source_path}를 다시 읽고 추정값이 아닌 실제 값으로 표를 작성하세요.",
-                )
-        return True, f"{path} 저장 검증 완료: {field} 내림차순 표."
-
     def _validate_completed_work(
         self, request: str, action: CallTool | None = None, result: ToolResult | None = None
     ) -> tuple[bool, str] | None:
         if action is not None and action.name == "writeFile":
             path = str(action.input.get("path", ""))
             content = str(action.input.get("content", ""))
-            table_validation = self._previous_json_filter_table_validation(request, path, content)
-            if table_validation is not None:
-                return table_validation
+            return self._generic_file_content_validation(path, content)
 
-        for validator in (self._csv_dedup_sort_validation, self._object_tree_mutation_validation):
-            validation = validator(request)
-            if validation is not None:
-                return validation
+        if result is not None and result.ok and self._request_mentions_file_write(request):
+            output_path = self._generic_completed_output_path(result)
+            if output_path is None:
+                return None
+            requested_output_path = self._likely_output_path(request, Path(output_path).suffix)
+            if requested_output_path is not None and output_path != requested_output_path:
+                return (
+                    False,
+                    f"{output_path} 검증 실패: 요청한 출력 경로는 {requested_output_path}입니다. "
+                    "도구가 요청한 출력 파일을 만들거나 반환하도록 코드를 수정하세요.",
+                )
+            output_content = self._read_workspace_text(output_path)
+            if output_content is None:
+                return (
+                    False,
+                    f"{output_path} 검증 실패: 파일이 아직 없거나 읽을 수 없습니다.",
+                )
+            return self._generic_file_content_validation(output_path, output_content)
+
+        return None
+
+    def _generic_completed_output_path(self, result: ToolResult) -> str | None:
+        if isinstance(result.output, dict):
+            for key in ("path", "output", "outputPath", "output_file", "outputFile"):
+                value = result.output.get(key)
+                if isinstance(value, str) and self._looks_like_file_path(value):
+                    return value
+        return None
+
+    def _generic_file_content_validation(self, path: str, content: str) -> tuple[bool, str] | None:
+        if not path:
+            return None
+        suffix = Path(path).suffix.lower()
+        if suffix == ".json":
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                return False, f"{path} 검증 실패: JSON으로 파싱할 수 없습니다: {exc.msg}."
+            return True, f"{path} 저장 검증 완료: JSON 파일을 읽을 수 있습니다."
+        if suffix == ".csv":
+            try:
+                rows = list(csv.reader(io.StringIO(content)))
+            except csv.Error as exc:
+                return False, f"{path} 검증 실패: CSV로 파싱할 수 없습니다: {exc}."
+            if not rows:
+                return False, f"{path} 검증 실패: CSV 내용이 비어 있습니다."
+            return True, f"{path} 저장 검증 완료: CSV header={rows[0]}, rows={len(rows) - 1}."
+        if suffix in {".md", ".txt"}:
+            if not content.strip():
+                return False, f"{path} 검증 실패: 파일 내용이 비어 있습니다."
+            return True, f"{path} 저장 검증 완료: 텍스트 파일을 읽을 수 있습니다."
         return None
 
     def _tool_call_next_step_hint(self, action: CreateTool, request: str) -> str:
@@ -1000,6 +842,18 @@ class AgentRunner:
             return None
         tool = self.deps.registry.get(tool_name)
         is_generated_tool = tool is not None and tool.origin == "generated"
+        file_match = re.search(r"No such file or directory: ['\"]([^'\"]+)['\"]", error)
+        if is_generated_tool and file_match is not None:
+            missing_path = file_match.group(1)
+            paths = self._mentioned_workspace_paths(request)
+            path_hint = f" 요청 파일: {', '.join(paths)}." if paths else ""
+            return (
+                f"생성 도구가 workspace에서 파일을 열지 못했습니다: {missing_path}. "
+                "같은 call_tool을 반복하지 마세요. 요청 파일이 실제로 없으면 ask_user로 확인하고, "
+                "코드가 잘못된 경로를 하드코딩했거나 call_tool input의 path를 무시했다면 "
+                "update_tool로 `input.get('path', '파일명')` 또는 올바른 상대 경로를 열도록 "
+                f"수정한 뒤 다시 실행하세요.{path_hint}"
+            )
         if "NameError: name 'json' is not defined" in error:
             if is_generated_tool:
                 return (
@@ -1041,6 +895,18 @@ class AgentRunner:
                 "별도 writeFile 호출로 저장하세요."
             )
         return None
+
+    def _missing_path_from_tool_error(self, error: str | None) -> str | None:
+        if not error:
+            return None
+        file_match = re.search(r"No such file or directory: ['\"]([^'\"]+)['\"]", error)
+        if file_match is None:
+            return None
+        missing_path = file_match.group(1)
+        display_path = Path(missing_path).name if Path(missing_path).is_absolute() else missing_path
+        if self._path_escapes_workspace(display_path):
+            return None
+        return display_path
 
     def _request_mentions_file_write(self, request: str) -> bool:
         if self._request_forbids_file_write(request):
@@ -1167,10 +1033,11 @@ class AgentRunner:
                 f"{', '.join(existing_generated)}."
             )
         return (
-            "workspace 파일을 분석/변환/집계하는 작업은 runPython으로 바로 처리하지 않습니다. "
-            "요청에 맞는 generated tool이 이미 있으면 call_tool로 재사용하고, 없으면 create_tool로 "
-            "관리형 도구를 만든 뒤 그 도구를 call_tool로 실행하세요. runPython은 작은 진단이나 "
-            f"검증에만 사용하세요.{existing_hint}"
+            "runPython은 한 줄 scalar 계산 전용입니다. workspace 파일을 읽어 line-by-line 확인, "
+            "필터링, 변환, 집계, 평균 계산을 해야 하면 runPython을 다시 시도하지 말고 generated "
+            "tool 경로를 사용하세요. 요청에 맞는 generated tool이 이미 있으면 call_tool로 "
+            "재사용하고, 없으면 create_tool로 관리형 도구를 만든 뒤 그 도구를 call_tool로 "
+            f"실행하세요.{existing_hint}"
         )
 
     def _blocks_managed_tool_default(self, state: _TurnLoopState) -> bool:
@@ -1180,7 +1047,7 @@ class AgentRunner:
 
     def _payload_mentions_any_path(self, payload: Any, paths: list[str]) -> bool:
         if isinstance(payload, str):
-            return payload in paths
+            return any(path == payload or path in payload for path in paths)
         if isinstance(payload, dict):
             return any(self._payload_mentions_any_path(value, paths) for value in payload.values())
         if isinstance(payload, list):
@@ -1232,29 +1099,7 @@ class AgentRunner:
             ".read_bytes(",
         )
         if any(marker in lowered for marker in file_read_markers):
-            if not self._request_needs_object_tree_mutation(state.effective_request):
-                return None
-            if self._code_writes_workspace_file(code):
-                return None
-            paths = self._mentioned_workspace_paths(state.effective_request)
-            source = paths[0] if paths else "요청 파일"
-            return (
-                f"생성 도구 {name}은(는) 상태 변경 작업용인데 코드가 {source}를 다시 저장하지 않습니다. "
-                "평균 계산만 하는 도구를 만들지 말고, 조건에 맞지 않는 node를 children에서 제거한 뒤 "
-                f"`json.dump(data, open('{source}', 'w'))` 또는 동등한 파일 쓰기로 저장하고, "
-                "저장된 파일을 다시 읽어 결과를 계산하도록 create_tool/update_tool을 다시 작성하세요. "
-                "코드는 다음 구조를 그대로 따르세요: "
-                "`import json; def run(input): data=json.load(open('"
-                f"{source}"
-                "')); def prune(node): node['children']=[child for child in node.get('children', []) "
-                "if not (child.get('type')=='Entity' and child.get('props', {}).get('health', 0) < 100)]; "
-                "[prune(child) for child in node.get('children', [])]; prune(data['root']); "
-                "json.dump(data, open('"
-                f"{source}"
-                "', 'w')); saved=json.load(open('"
-                f"{source}"
-                "')); ... saved에서 Entity health 평균 계산 후 return`."
-            )
+            return None
         paths = self._mentioned_workspace_paths(state.effective_request)
         source = paths[0] if paths else "요청 파일"
         return (
@@ -1310,6 +1155,30 @@ class AgentRunner:
             f"먼저 call_tool로 실행해 실제 오류 또는 결과를 확인하세요.{input_hint}"
         )
 
+    def _generated_tool_entrypoint_observation(
+        self, name: str, code: str, entrypoint: str = "run"
+    ) -> str | None:
+        try:
+            tree = ast.parse(escape_newlines_in_string_literals(code))
+        except SyntaxError as exc:
+            return (
+                f"생성 도구 {name}의 Python 코드 문법이 올바르지 않습니다: {exc.msg}. "
+                f"코드는 반드시 `def {entrypoint}(input):` 함수 안에 작성하고 결과를 return하세요."
+            )
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == entrypoint:
+                if not node.args.args:
+                    return (
+                        f"생성 도구 {name}의 `{entrypoint}` 함수는 input 인자를 받아야 합니다. "
+                        f"`def {entrypoint}(input):` 형태로 다시 작성하세요."
+                    )
+                return None
+        return (
+            f"생성 도구 {name} 코드에는 반드시 `def {entrypoint}(input):` entrypoint가 있어야 합니다. "
+            "module top-level에서 파일을 읽거나 작업을 실행하지 말고, 모든 작업을 이 함수 안에 넣고 "
+            "결과를 return하세요."
+        )
+
     def _tool_needs_update_after_validation_failure(self, state: _TurnLoopState, name: str) -> bool:
         failure_index = state.validation_failed_tool_indices.get(name)
         if failure_index is None:
@@ -1334,11 +1203,17 @@ class AgentRunner:
             return None
         paths = self._mentioned_workspace_paths(state.effective_request)
         path_hint = f" 요청 파일: {', '.join(paths)}." if paths else ""
+        failure_details = [
+            state.validation_failed_tool_messages[tool_name]
+            for tool_name in failed_names
+            if tool_name in state.validation_failed_tool_messages
+        ]
+        detail_hint = f" 마지막 실패: {' '.join(failure_details)}" if failure_details else ""
         return (
-            f"생성 도구 {', '.join(failed_names)}의 실행 결과가 검증에 실패했습니다. "
+            f"생성 도구 {', '.join(failed_names)}의 실행 또는 검증이 실패했습니다. "
             "같은 도구를 그대로 다시 call_tool 하거나 finish 하지 말고 update_tool로 코드를 수정하세요. "
-            "상태 변경 요청이면 평균 계산만 하지 말고 파일을 실제로 다시 저장한 뒤, 저장된 파일을 "
-            f"재읽어 결과를 계산해야 합니다.{path_hint}"
+            f"실패 메시지의 조건을 코드에 직접 반영한 뒤 다시 실행해 확인하세요."
+            f"{detail_hint}{path_hint}"
         )
 
     def _blocks_explicit_tool_creation(self, state: _TurnLoopState) -> bool:
@@ -1379,11 +1254,241 @@ class AgentRunner:
             if normalized_key in AMBIGUOUS_WRITE_PATH_FIELD_NAMES:
                 return description_suggests_write or self._looks_like_file_path(value)
             return True
+        if normalized_key in AMBIGUOUS_FILE_PATH_FIELD_NAMES:
+            return description_suggests_write and self._looks_like_file_path(value)
         return normalized_key == "path" and description_suggests_write
 
     def _description_suggests_file_write(self, description: str) -> bool:
         lowered = description.lower()
         return any(term in lowered for term in FILE_WRITE_INTENT_TERMS)
+
+    def _generated_tool_read_only_write_observation(
+        self, state: _TurnLoopState, action: CallTool
+    ) -> str | None:
+        tool = self.deps.registry.get(action.name)
+        if tool is None or tool.origin != "generated":
+            return None
+        if self._request_mentions_file_write(state.effective_request):
+            return None
+        if not self._description_suggests_file_write(tool.description):
+            return None
+        has_content_payload = any(
+            self._normalized_field_name(str(key)) in {"content", "body", "text"}
+            for key in action.input
+        )
+        has_ambiguous_file_target = any(
+            self._normalized_field_name(str(key)) in AMBIGUOUS_FILE_PATH_FIELD_NAMES | {"path"}
+            and isinstance(value, str)
+            and self._looks_like_file_path(value)
+            for key, value in action.input.items()
+        )
+        if not has_content_payload and not has_ambiguous_file_target:
+            return None
+        return (
+            f"현재 요청은 읽기 전용 계산입니다. generated tool {action.name}은(는) 파일 쓰기 "
+            "성격이 있어 실행하지 않습니다. 입력 파일을 저장/덮어쓰지 말고, 요청에 맞는 읽기 전용 "
+            "generated tool을 create_tool로 만든 뒤 call_tool로 실행하세요."
+        )
+
+    def _generated_tool_spec(self, name: str) -> ToolSpec | None:
+        if self.generated is not None:
+            spec = self.generated.specs().get(name)
+            if spec is not None:
+                return spec
+        if self.skills is not None:
+            try:
+                return self.skills.load_spec(name)
+            except (FileNotFoundError, ValueError):
+                return None
+        return None
+
+    def _input_field_names_from_generated_tool(self, name: str) -> set[str]:
+        fields: set[str] = set()
+        tool = self.deps.registry.get(name)
+        if tool is not None:
+            properties = tool.input_schema.get("properties")
+            if isinstance(properties, dict):
+                fields.update(str(key) for key in properties)
+        spec = self._generated_tool_spec(name)
+        if spec is not None:
+            properties = spec.input_schema.get("properties")
+            if isinstance(properties, dict):
+                fields.update(str(key) for key in properties)
+            fields.update(
+                match.group(1)
+                for match in re.finditer(r"input\s*\[\s*['\"]([^'\"]+)['\"]\s*\]", spec.code)
+            )
+            fields.update(
+                match.group(1)
+                for match in re.finditer(r"input\.get\(\s*['\"]([^'\"]+)['\"]", spec.code)
+            )
+        return fields
+
+    def _generated_source_path_field(self, name: str) -> str | None:
+        fields = self._input_field_names_from_generated_tool(name)
+        for field_name in fields:
+            if self._normalized_field_name(field_name) in GENERATED_SOURCE_PATH_FIELD_NAMES:
+                return field_name
+        return None
+
+    def _generated_output_path_field(self, name: str) -> str | None:
+        fields = self._input_field_names_from_generated_tool(name)
+        tool = self.deps.registry.get(name)
+        description = tool.description if tool is not None else ""
+        description_suggests_write = self._description_suggests_file_write(description)
+        for field_name in fields:
+            normalized = self._normalized_field_name(field_name)
+            if self._is_generated_write_path_field(
+                normalized, "result.csv", description_suggests_write
+            ):
+                return field_name
+        return None
+
+    def _repair_generated_tool_path_input(
+        self, state: _TurnLoopState, action: CallTool
+    ) -> bool:
+        tool = self.deps.registry.get(action.name)
+        if tool is None or tool.origin != "generated":
+            return False
+        paths = self._mentioned_workspace_paths(state.effective_request)
+        if not paths or self._payload_mentions_any_path(action.input, paths):
+            return False
+        changed = False
+        source_field = self._generated_source_path_field(action.name)
+        if source_field is not None and source_field not in action.input:
+            action.input[source_field] = paths[0]
+            changed = True
+        if len(paths) >= 2 and self._request_mentions_file_write(state.effective_request):
+            output_field = self._generated_output_path_field(action.name)
+            if output_field is not None and output_field not in action.input:
+                action.input[output_field] = paths[-1]
+                changed = True
+        return changed
+
+    def _generated_tool_missing_requested_source_observation(
+        self, state: _TurnLoopState, action: CallTool
+    ) -> str | None:
+        tool = self.deps.registry.get(action.name)
+        if tool is None or tool.origin != "generated":
+            return None
+        paths = self._mentioned_workspace_paths(state.effective_request)
+        if not paths:
+            return None
+        if self._payload_mentions_any_path(action.input, paths):
+            return None
+        spec = self._generated_tool_spec(action.name)
+        if spec is None:
+            return None
+        if any(path in spec.code for path in paths):
+            return None
+        source_field = self._generated_source_path_field(action.name)
+        if source_field is not None:
+            suggested_input = dict(action.input)
+            suggested_input[source_field] = paths[0]
+            return (
+                f"현재 요청의 workspace 파일({', '.join(paths)})이 generated tool {action.name}의 "
+                "입력에 들어가지 않았습니다. 같은 빈 input을 반복하지 말고 다음처럼 요청 파일을 "
+                f"넘겨 실행하세요: "
+                f'{{"action":"call_tool","name":"{action.name}","input":'
+                f"{json.dumps(suggested_input, ensure_ascii=False, sort_keys=True)}}}"
+            )
+        return (
+            f"현재 요청의 workspace 파일({', '.join(paths)})이 generated tool {action.name}의 "
+            "입력이나 코드에 연결되어 있지 않습니다. 이전 작업용 도구를 억지로 재사용하지 말고, "
+            "요청 파일을 직접 읽는 generated tool을 만들거나 수정한 뒤 실행하세요."
+        )
+
+    def _current_turn_tool_mismatch_observation(
+        self, state: _TurnLoopState, action: CallTool
+    ) -> str | None:
+        if action.name in {"readFile", "listFiles", "searchDocs", "askUser"}:
+            return None
+        tool = self.deps.registry.get(action.name)
+        if (
+            tool is not None
+            and tool.origin != "generated"
+            and action.name not in {"runPython", "writeFile"}
+        ):
+            return None
+        if action.name in (state.turn_state.changed_tool_names or []):
+            return None
+        request = state.effective_request
+        if self._request_allows_tool_work(request):
+            if tool is None or tool.origin != "generated":
+                return None
+            paths = self._mentioned_workspace_paths(request)
+            tool_has_detectable_intent = bool(self._tool_intents(f"{tool.name} {tool.description}"))
+            if self._request_is_contextual_followup(request):
+                return None
+            if self._tool_covers_request_intent(tool.name, tool.description, request):
+                return None
+            if (
+                paths
+                and self._payload_mentions_any_path(action.input, paths)
+                and not tool_has_detectable_intent
+            ):
+                return None
+            return (
+                f"generated tool {action.name}은(는) 현재 사용자 요청과 충분히 맞지 않습니다. "
+                "이전 턴의 도구 호출을 계속하지 말고, 현재 요청에 맞는 도구만 사용하거나 "
+                "필요한 입력이 없으면 사용자에게 물어보세요."
+            )
+        return (
+            f"현재 사용자 요청은 새 도구 실행을 요구하지 않습니다. {action.name}을(를) 호출하지 말고 "
+            "현재 요청에 직접 답하세요. 이전 턴의 도구 호출을 이어서 실행하지 마세요."
+        )
+
+    def _request_allows_tool_work(self, request: str) -> bool:
+        lowered = request.lower()
+        compact = re.sub(r"\s+", "", lowered)
+        return bool(
+            self._mentioned_workspace_paths(request)
+            or self._request_mentions_file_write(request)
+            or self._request_requires_new_tool(request)
+            or self._request_is_contextual_followup(request)
+            or any(term in lowered for term in DATA_TOOL_TASK_TERMS)
+            or any(term in compact for term in DATA_TOOL_TASK_TERMS)
+            or "tool" in lowered
+            or "도구" in request
+        )
+
+    def _request_is_contextual_followup(self, request: str) -> bool:
+        lowered = request.lower()
+        return any(term in lowered or term in request for term in CONTEXT_FOLLOWUP_TERMS)
+
+    def _tool_matches_request(self, name: str, description: str, request: str) -> bool:
+        request_terms = self._match_terms(request)
+        tool_terms = self._match_terms(f"{name} {description}")
+        return bool(request_terms & tool_terms)
+
+    def _tool_covers_request_intent(self, name: str, description: str, request: str) -> bool:
+        request_intents = self._tool_intents(request)
+        tool_intents = self._tool_intents(f"{name} {description}")
+        if not request_intents or not tool_intents:
+            return self._tool_matches_request(name, description, request)
+        specific_request_intents = request_intents - BROAD_TOOL_INTENTS
+        required_intents = specific_request_intents or request_intents
+        overlap = required_intents & tool_intents
+        if not overlap:
+            return False
+        return (len(overlap) / len(required_intents)) >= 0.6
+
+    def _tool_intents(self, text: str) -> set[str]:
+        lowered = text.lower()
+        compact = re.sub(r"\s+", "", lowered)
+        intents: set[str] = set()
+        for intent, aliases in TOOL_INTENT_ALIASES.items():
+            if any(alias in lowered or alias in compact for alias in aliases):
+                intents.add(intent)
+        return intents
+
+    def _match_terms(self, text: str) -> set[str]:
+        terms = {
+            term
+            for term in re.findall(r"[a-zA-Z][a-zA-Z0-9_]+|[가-힣]{2,}", text.lower())
+            if len(term) >= 3 and term not in TOOL_MATCH_STOPWORDS
+        }
+        return terms
 
     def _normalized_field_name(self, name: str) -> str:
         return re.sub(r"[^a-z0-9]", "", name.lower())
@@ -1463,11 +1568,46 @@ class AgentRunner:
         if isinstance(result.output, dict):
             path = result.output.get("path")
             if path:
-                return f"{name} 실행은 이미 성공했습니다. 결과 파일: {path}"
-        return f"{name} 실행은 이미 성공했습니다. 마지막 결과: {result.output}"
+                return f"도구 {name} 결과 파일: {path}"
+        return f"도구 {name} 결과: {result.output}"
 
     def _cached_tool_observation(self, name: str, result: ToolResult) -> str:
         return f"도구 {name} 캐시 결과: {result.output}"
+
+    def _tool_success_observation(self, name: str, result: ToolResult) -> str:
+        observation = f"도구 {name} 결과: {result.output}"
+        if name not in CONTEXT_TOOL_NAMES:
+            observation = f"{observation}\n{TOOL_RESULT_FINALIZATION_HINT}"
+        return observation
+
+    def _read_only_path_only_result_observation(
+        self, request: str, action: CallTool, result: ToolResult
+    ) -> str | None:
+        tool = self.deps.registry.get(action.name)
+        if tool is None or tool.origin != "generated" or not result.ok:
+            return None
+        if self._request_mentions_file_write(request):
+            return None
+        if not isinstance(result.output, dict) or not result.output:
+            return None
+        path_fields = {"dest", "destination", "file", "filename", "output", "outputpath", "path"}
+        if not all(
+            self._normalized_field_name(str(key)) in path_fields
+            and isinstance(value, str)
+            and self._looks_like_file_path(value)
+            for key, value in result.output.items()
+        ):
+            return None
+        return (
+            f"도구 {action.name} 결과는 파일 경로만 반환했습니다: {result.output}. "
+            "현재 요청은 파일 저장이 아니라 계산 결과 답변이 필요하므로, 이 결과만으로 종료하지 마세요. "
+            "요청한 값을 반환하는 generated tool을 만들거나 수정해 실행하세요."
+        )
+
+    def _tool_result_satisfies_request(
+        self, request: str, action: CallTool, result: ToolResult
+    ) -> bool:
+        return self._read_only_path_only_result_observation(request, action, result) is None
 
     def _log_parsed_action(self, action: Any) -> None:
         fields: dict[str, Any] = {"actionType": action.action, "parseOk": True}
@@ -1595,10 +1735,7 @@ class AgentRunner:
         for path in paths:
             if path != UNKNOWN_DYNAMIC_WRITE_PATH and self._path_escapes_workspace(path):
                 return self._gate_file_write_path(action.name, path)
-        if not (
-            self._request_mentions_file_write(request)
-            or self._request_needs_object_tree_mutation(request)
-        ):
+        if not self._request_mentions_file_write(request):
             return (
                 False,
                 "현재 요청은 저장/수정 요청이 아닌 읽기 전용 계산입니다. runPython에서 파일을 "
@@ -1613,12 +1750,12 @@ class AgentRunner:
                 return allowed, blocked
         return True, None
 
-    def _plan_raw(self) -> str:
+    def _plan_raw(self, state: _TurnLoopState) -> str:
         with self.tracer.span():
             digests = self.deps.registry.digests()
             self.tracer.log(kind="llm_call_start", model=getattr(self.deps.llm, "model", None))
             try:
-                raw = self._chat_with_deadline(digests)
+                raw = self._chat_with_deadline(state, digests)
             except Exception as exc:
                 self.tracer.log(
                     kind="error",
@@ -1637,13 +1774,47 @@ class AgentRunner:
             )
             return raw
 
-    def _chat_with_deadline(self, digests: list[Any]) -> str:
+    def _planning_messages(self, state: _TurnLoopState) -> list[Message]:
+        messages = self.conv.messages()
+        return [*messages, self._runtime_state_message(state)]
+
+    def _runtime_state_message(self, state: _TurnLoopState) -> Message:
+        recent_observations = state.result.observations[-5:]
+        payload: dict[str, Any] = {
+            "currentRequest": state.effective_request,
+            "turnActionIndex": state.turn_state.action_index,
+            "requiresExecution": state.turn_state.requires_execution,
+            "changedGeneratedTools": state.turn_state.changed_tool_names or [],
+            "calledGeneratedTools": sorted(state.called_generated_tools),
+            "calledChangedTools": sorted(state.called_changed_tools),
+            "lastToolInputs": state.last_tool_inputs,
+            "validationFailures": state.validation_failed_tool_messages,
+            "missingWorkspacePaths": sorted(state.missing_workspace_paths),
+            "blockedToolActions": state.blocked_tool_actions,
+            "recentObservations": recent_observations,
+        }
+        if state.turn_state.last_generated_tool_change is not None:
+            payload["lastGeneratedToolChangeIndex"] = state.turn_state.last_generated_tool_change
+        if state.turn_state.last_successful_work_call is not None:
+            payload["lastSuccessfulWorkCallIndex"] = state.turn_state.last_successful_work_call
+        preview, _, _ = _preview_value(payload, limit=3000)
+        return Message(
+            role="tool",
+            content=(
+                "[runtime-state]\n"
+                "Use this structured state to choose the next JSON action for the current turn. "
+                "Do not continue stale actions from previous turns.\n"
+                f"{preview}"
+            ),
+        )
+
+    def _chat_with_deadline(self, state: _TurnLoopState, digests: list[Any]) -> str:
         timeout = getattr(self.deps.llm, "timeout", None)
         if timeout is None:
-            return self.deps.llm.chat(self.conv.messages(), digests)
+            return self.deps.llm.chat(self._planning_messages(state), digests)
         timeout_sec = float(timeout)
         result_queue: queue.Queue[tuple[str, str | Exception]] = queue.Queue(maxsize=1)
-        messages = self.conv.messages()
+        messages = self._planning_messages(state)
 
         def call_llm() -> None:
             try:
@@ -1689,7 +1860,7 @@ class AgentRunner:
 
             for _ in range(self.deps.max_iterations):
                 try:
-                    raw = self._plan_raw()
+                    raw = self._plan_raw(state)
                 except Exception as exc:
                     state.result.summary = self._llm_error_summary(exc)
                     state.result.stopped_reason = "llm_error"
@@ -1731,6 +1902,7 @@ class AgentRunner:
 
     def _start_turn(self, request: str) -> _TurnLoopState:
         self.tracer.log(kind="turn_start")
+        self._tool_result_cache.clear()
         self.conv.add_user(request)
         result = TurnResult()
         state = _TurnLoopState(
@@ -1747,6 +1919,11 @@ class AgentRunner:
     def _append_observation(self, state: _TurnLoopState, observation: str) -> None:
         self.conv.add_observation(observation)
         state.result.observations.append(observation)
+
+    def _record_blocked_tool_action(
+        self, state: _TurnLoopState, action: CallTool, reason: str
+    ) -> None:
+        state.blocked_tool_actions[action.name] = reason
 
     def _handle_parse_failure(self, state: _TurnLoopState, error: str | None) -> _StepAction:
         state.parse_failures += 1
@@ -1773,24 +1950,46 @@ class AgentRunner:
             and sig is not None
             and sig in self._tool_result_cache
             and not self._tool_needs_update_after_validation_failure(state, action.name)
-            and state.action_repeats > self.deps.max_fix_retries
         ):
             cached = self._tool_result_cache[sig]
+            if action.name in CONTEXT_TOOL_NAMES:
+                if state.action_repeats > self.deps.max_fix_retries:
+                    state.result.stopped_reason = "no_progress"
+                    return sig, "break"
+                self._append_observation(
+                    state,
+                    f"{action.name}은(는) 이미 같은 입력으로 실행했습니다. 캐시된 context 결과를 "
+                    "다시 최종 답변으로 내보내지 말고, 그 결과를 근거로 현재 요청을 수행할 "
+                    "작업 도구를 만들거나 호출하세요.",
+                )
+                return sig, "continue"
+            if not self._tool_result_satisfies_request(state.effective_request, action, cached):
+                state.result.stopped_reason = "no_progress"
+                return sig, "break"
+            if self._cached_tool_call_should_continue(state, action):
+                self._append_observation(state, self._cached_tool_observation(action.name, cached))
+                if warning := self._read_only_path_only_result_observation(
+                    state.effective_request, action, cached
+                ):
+                    self._append_observation(state, warning)
+                return sig, "continue"
             state.result.summary = self._cached_tool_summary(action.name, cached)
             state.result.stopped_reason = "cached_result"
             return sig, "break"
 
-        if (
-            isinstance(action, CallTool)
-            and sig is not None
-            and sig in self._tool_result_cache
-            and not self._tool_needs_update_after_validation_failure(state, action.name)
-            and state.action_repeats > 0
-        ):
-            cached = self._tool_result_cache[sig]
-            self._append_observation(state, self._cached_tool_observation(action.name, cached))
-            return sig, "continue"
+        return self._apply_non_cached_loop_guards(state, action, sig)
 
+    def _cached_tool_call_should_continue(self, state: _TurnLoopState, action: CallTool) -> bool:
+        """Allow one cached runPython observation when a following write may use it."""
+        return (
+            action.name == "runPython"
+            and state.action_repeats == 1
+            and self._request_mentions_file_write(state.effective_request)
+        )
+
+    def _apply_non_cached_loop_guards(
+        self, state: _TurnLoopState, action: Any, sig: str | None
+    ) -> tuple[str | None, _StepAction]:
         if state.action_repeats > self.deps.max_fix_retries:
             # Keep this runtime note out of result.observations so incomplete
             # finalization can still surface the last real result if there was one.
@@ -1827,6 +2026,101 @@ class AgentRunner:
     def _terminal_block(self, state: _TurnLoopState) -> str | None:
         return state.turn_state.terminal_block_observation()
 
+    def _ungrounded_current_turn_result_observation(
+        self, state: _TurnLoopState, text: str
+    ) -> str | None:
+        if state.turn_state.last_successful_work_call is not None:
+            return None
+        if not self._request_allows_tool_work(state.effective_request):
+            return None
+        if self._request_is_contextual_followup(state.effective_request):
+            return None
+        if self._looks_like_clarification(text):
+            return None
+        if not self._looks_like_work_result(text):
+            return None
+        if not self._has_previous_result_like_assistant_message():
+            return None
+        return (
+            "현재 응답은 작업 결과처럼 보이지만, 이번 턴에서 그 결과를 뒷받침하는 도구 실행이 "
+            "없습니다. 이전 턴 결과를 재사용하지 말고, 현재 요청에 맞는 도구를 실행하세요. "
+            "요청이 모호하면 ask_user로 필요한 데이터와 정리 기준을 물어보세요."
+        )
+
+    def _looks_like_clarification(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        return stripped.endswith("?")
+
+    def _looks_like_work_result(self, text: str) -> bool:
+        lowered = text.lower()
+        if self._numbers_in_text(text):
+            return True
+        return any(
+            marker in lowered
+            for marker in (
+                ":",
+                "완료",
+                "저장",
+                "합계",
+                "평균",
+                "rows",
+                "path",
+                "removed",
+            )
+        )
+
+    def _has_previous_result_like_assistant_message(self) -> bool:
+        return any(
+            message.role == "assistant" and self._looks_like_work_result(message.content)
+            for message in self.conv.body()
+        )
+
+    def _unsupported_numeric_response_observation(
+        self, state: _TurnLoopState, text: str
+    ) -> str | None:
+        if not state.called_generated_tools:
+            return None
+        claimed = self._numbers_in_text(text)
+        if not claimed:
+            return None
+        observed = self._observed_tool_result_numbers(state.result.observations)
+        if not observed:
+            return None
+        unsupported = [
+            number for number in claimed if not any(self._numbers_close(number, item) for item in observed)
+        ]
+        if not unsupported:
+            return None
+        display = ", ".join(f"{number:g}" for number in unsupported[:5])
+        return (
+            f"최종 답변에 최근 도구 결과에서 확인되지 않은 숫자가 포함되어 있습니다: {display}. "
+            "추정값을 넣지 말고 최근 도구 결과에 있는 값만 사용해 respond(final:true)로 답하세요. "
+            "같은 입력으로 같은 도구를 다시 호출하지 마세요. 요청을 답하기에 결과가 부족할 때만 "
+            "다른 도구 호출이나 update_tool로 빠진 정보를 얻으세요."
+        )
+
+    def _observed_tool_result_numbers(self, observations: list[str]) -> list[float]:
+        numbers: list[float] = []
+        for observation in observations:
+            if not observation.startswith("도구 ") or " 결과: " not in observation:
+                continue
+            numbers.extend(self._numbers_in_text(observation))
+        return numbers
+
+    def _numbers_in_text(self, text: str) -> list[float]:
+        numbers: list[float] = []
+        for match in re.finditer(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])", text):
+            try:
+                numbers.append(float(match.group(0)))
+            except ValueError:
+                continue
+        return numbers
+
+    def _numbers_close(self, left: float, right: float) -> bool:
+        return abs(left - right) <= 0.01
+
     def _handle_finish_action(self, state: _TurnLoopState, action: Finish) -> _StepAction:
         if self._blocks_explicit_tool_creation(state):
             self._append_observation(state, self._explicit_tool_creation_observation())
@@ -1839,6 +2133,14 @@ class AgentRunner:
             return "continue"
         if validation := self._terminal_validation_observation(state):
             self._append_observation(state, validation)
+            return "continue"
+        if ungrounded := self._ungrounded_current_turn_result_observation(
+            state, action.summary or ""
+        ):
+            self._append_observation(state, ungrounded)
+            return "continue"
+        if unsupported := self._unsupported_numeric_response_observation(state, action.summary or ""):
+            self._append_observation(state, unsupported)
             return "continue"
         if terminal_block := self._terminal_block(state):
             self._append_observation(state, terminal_block)
@@ -1871,6 +2173,12 @@ class AgentRunner:
             if validation := self._terminal_validation_observation(state):
                 self._append_observation(state, validation)
                 return "continue"
+            if ungrounded := self._ungrounded_current_turn_result_observation(state, action.text):
+                self._append_observation(state, ungrounded)
+                return "continue"
+            if unsupported := self._unsupported_numeric_response_observation(state, action.text):
+                self._append_observation(state, unsupported)
+                return "continue"
             if terminal_block := self._terminal_block(state):
                 self._append_observation(state, terminal_block)
                 return "continue"
@@ -1894,9 +2202,20 @@ class AgentRunner:
         return None if ok else message
 
     def _handle_ask_user_action(self, state: _TurnLoopState, action: AskUser) -> _StepAction:
-        blocked_ask = self._blocked_ask_user_observation(action.question, state.effective_request)
+        blocked_ask = self._blocked_ask_user_observation(
+            action.question, state.effective_request, state.missing_workspace_paths
+        )
         if blocked_ask is not None:
+            if blocked_ask == state.last_blocked_ask_observation:
+                state.blocked_ask_repeats += 1
+            else:
+                state.last_blocked_ask_observation = blocked_ask
+                state.blocked_ask_repeats = 0
             self._append_observation(state, blocked_ask)
+            if state.blocked_ask_repeats > self.deps.max_fix_retries:
+                self.conv.add_observation("같은 차단된 질문이 진전 없이 반복되어 작업을 중단합니다.")
+                state.result.stopped_reason = "no_progress"
+                return "break"
             return "continue"
         if self.deps.non_interactive:
             state.result.summary = self._hitl_required_summary(action.question)
@@ -1949,7 +2268,35 @@ class AgentRunner:
         if inline_data_block is not None:
             state.turn_state.record_tool_call(action.name, False)
             state.last_tool_call_index = state.turn_state.action_index
+            self._record_blocked_tool_action(state, action, "inline_data_not_workspace_file")
             self._append_observation(state, inline_data_block)
+            return "continue"
+
+        if self._repair_generated_tool_path_input(state, action):
+            sig = self._action_signature(action)
+
+        missing_source_block = self._generated_tool_missing_requested_source_observation(state, action)
+        if missing_source_block is not None:
+            state.turn_state.record_tool_call(action.name, False)
+            state.last_tool_call_index = state.turn_state.action_index
+            self._record_blocked_tool_action(state, action, "missing_requested_source_file")
+            self._append_observation(state, missing_source_block)
+            return "continue"
+
+        read_only_write_block = self._generated_tool_read_only_write_observation(state, action)
+        if read_only_write_block is not None:
+            state.turn_state.record_tool_call(action.name, False)
+            state.last_tool_call_index = state.turn_state.action_index
+            self._record_blocked_tool_action(state, action, "read_only_request_would_write")
+            self._append_observation(state, read_only_write_block)
+            return "continue"
+
+        current_turn_mismatch = self._current_turn_tool_mismatch_observation(state, action)
+        if current_turn_mismatch is not None:
+            state.turn_state.record_tool_call(action.name, False)
+            state.last_tool_call_index = state.turn_state.action_index
+            self._record_blocked_tool_action(state, action, "tool_intent_mismatch_current_request")
+            self._append_observation(state, current_turn_mismatch)
             return "continue"
 
         generated_write_fields = self._generated_tool_write_path_fields(action.name, action.input)
@@ -1984,36 +2331,6 @@ class AgentRunner:
                 self._append_observation(state, blocked)
                 return "continue"
 
-        if (
-            action.name != "searchDocs"
-            and self.deps.registry.has("searchDocs")
-            and self._request_needs_object_tree_mutation(state.effective_request)
-            and not state.used_search_docs
-        ):
-            self._append_observation(
-                state,
-                "이 작업은 문서 근거가 필요한 object tree 상태 변경입니다. 먼저 searchDocs를 "
-                "호출해 Entity health와 children 구조를 확인한 뒤 파일을 수정하세요.",
-            )
-            return "continue"
-
-        missing_mutation = self._run_python_missing_required_mutation_observation(
-            state.effective_request, action
-        )
-        if missing_mutation is not None:
-            self._append_observation(state, missing_mutation)
-            return "continue"
-
-        if action.name == "writeFile":
-            table_validation = self._previous_json_filter_table_validation(
-                state.effective_request,
-                str(action.input.get("path", "")),
-                str(action.input.get("content", "")),
-            )
-            if table_validation is not None and not table_validation[0]:
-                self._append_observation(state, table_validation[1])
-                return "continue"
-
         if self.policy is not None:
             allowed, blocked = self._gate(action.name, action.input)
             if not allowed:
@@ -2021,7 +2338,8 @@ class AgentRunner:
                 self._append_observation(state, blocked)
                 return "continue"
 
-        restore_snapshots = self._mutation_restore_snapshots(state.effective_request, action)
+        called_tool = self.deps.registry.get(action.name)
+        state.last_tool_inputs[action.name] = dict(action.input)
         res = self.deps.registry.call(action.name, action.input)
         self._log_tool_call(action.name, action.input, res)
         if res.ok:
@@ -2029,7 +2347,7 @@ class AgentRunner:
             if action.name == "searchDocs":
                 state.used_search_docs = True
             assert sig is not None
-            observation = f"도구 {action.name} 결과: {res.output}"
+            observation = self._tool_success_observation(action.name, res)
             self._tool_result_cache[sig] = res
         else:
             state.fix_failures += 1
@@ -2042,10 +2360,16 @@ class AgentRunner:
             recovery_hint = self._tool_failure_recovery_hint(state.effective_request)
             if recovery_hint is not None:
                 observation = f"{observation}\n{recovery_hint}"
+            if called_tool is not None and called_tool.origin == "generated":
+                missing_path = self._missing_path_from_tool_error(res.error)
+                if missing_path is not None:
+                    state.missing_workspace_paths.add(missing_path)
+                state.validation_failed_tool_indices[action.name] = state.turn_state.action_index
+                concise_failure = self._concise_failed_observation(observation) or observation
+                state.validation_failed_tool_messages[action.name] = concise_failure
 
         state.turn_state.record_tool_call(action.name, res.ok)
         state.last_tool_call_index = state.turn_state.action_index
-        called_tool = self.deps.registry.get(action.name)
         if (
             res.ok
             and called_tool is not None
@@ -2056,6 +2380,10 @@ class AgentRunner:
         if res.ok and called_tool is not None and called_tool.origin == "generated":
             state.called_generated_tools.add(action.name)
         self._append_observation(state, observation)
+        if warning := self._read_only_path_only_result_observation(
+            state.effective_request, action, res
+        ):
+            self._append_observation(state, warning)
         if not res.ok and state.fix_failures > self.deps.max_fix_retries:
             self._append_observation(state, "연속 실패가 한계를 넘었습니다. 작업을 중단합니다.")
             state.result.stopped_reason = "consecutive_failures"
@@ -2064,15 +2392,6 @@ class AgentRunner:
             post_validation = self._validate_completed_work(state.effective_request, action, res)
             if post_validation is not None:
                 ok, message = post_validation
-                if not ok and restore_snapshots:
-                    repair = self._try_repair_completed_work(
-                        state.effective_request, restore_snapshots
-                    )
-                    if repair is not None:
-                        ok, message = repair
-                    else:
-                        self._restore_workspace_files(restore_snapshots)
-                        message = f"{message} 잘못된 파일 변경은 원본 상태로 되돌렸습니다."
                 self._append_observation(state, message)
                 if ok:
                     output_path = self._likely_output_path(
@@ -2080,13 +2399,12 @@ class AgentRunner:
                     )
                     if output_path is not None:
                         state.completed_output_paths.add(output_path)
-                    state.result.summary = message
-                    state.result.stopped_reason = "finish"
-                    return "break"
+                    return "continue"
                 if called_tool is not None and called_tool.origin == "generated":
                     state.validation_failed_tool_indices[action.name] = (
                         state.turn_state.action_index
                     )
+                    state.validation_failed_tool_messages[action.name] = message
                     update_hint = self._validation_failed_tool_update_observation(
                         state, action.name
                     )
@@ -2095,6 +2413,12 @@ class AgentRunner:
         return "continue"
 
     def _handle_create_tool_action(self, state: _TurnLoopState, action: CreateTool) -> _StepAction:
+        entrypoint_block = self._generated_tool_entrypoint_observation(
+            action.spec.name, action.spec.code, action.spec.entrypoint
+        )
+        if entrypoint_block is not None:
+            self._append_observation(state, entrypoint_block)
+            return "continue"
         file_read_block = self._generated_tool_file_read_observation(
             state, action.spec.name, action.spec.code
         )
@@ -2105,6 +2429,23 @@ class AgentRunner:
             state.turn_state.changed_tool_names is not None
             and action.spec.name in state.turn_state.changed_tool_names
         ):
+            existing_spec = self.generated.specs().get(action.spec.name) if self.generated else None
+            if existing_spec is not None and existing_spec.code != action.spec.code:
+                self._tool_result_cache.clear()
+                update_action = UpdateTool(
+                    action="update_tool", name=action.spec.name, code=action.spec.code
+                )
+                observation = (
+                    f"도구 {action.spec.name}은(는) 이미 이 턴에서 생성했지만 새 코드가 달라 "
+                    "수정으로 처리합니다.\n"
+                    + self._handle_update(update_action)
+                    + self._tool_call_next_step_hint(action, state.effective_request)
+                )
+                state.turn_state.record_tool_change(action.spec.name)
+                state.validation_failed_tool_indices.pop(action.spec.name, None)
+                state.validation_failed_tool_messages.pop(action.spec.name, None)
+                self._append_observation(state, observation)
+                return "continue"
             self._append_observation(
                 state,
                 f"도구 {action.spec.name}은(는) 이미 이 턴에서 생성했습니다."
@@ -2121,13 +2462,18 @@ class AgentRunner:
         return "continue"
 
     def _handle_update_tool_action(self, state: _TurnLoopState, action: UpdateTool) -> _StepAction:
+        entrypoint_block = self._generated_tool_entrypoint_observation(action.name, action.code)
+        if entrypoint_block is not None:
+            self._append_observation(state, entrypoint_block)
+            return "continue"
         file_read_block = self._generated_tool_file_read_observation(
             state, action.name, action.code
         )
         if file_read_block is not None:
             self._append_observation(state, file_read_block)
             return "continue"
-        if self._updated_tool_needs_execution(state, action.name):
+        auto_call_input = state.last_tool_inputs.get(action.name)
+        if self._updated_tool_needs_execution(state, action.name) and auto_call_input is None:
             self._append_observation(
                 state,
                 self._updated_tool_call_observation(action.name, state.effective_request),
@@ -2137,7 +2483,18 @@ class AgentRunner:
         observation = self._handle_update(action)
         state.turn_state.record_tool_change(action.name)
         state.validation_failed_tool_indices.pop(action.name, None)
+        state.validation_failed_tool_messages.pop(action.name, None)
         self._append_observation(state, observation)
+        if auto_call_input is not None:
+            self._append_observation(
+                state,
+                f"수정한 도구 {action.name}을(를) 이전 입력으로 즉시 실행해 결과를 확인합니다.",
+            )
+            state.turn_state.advance()
+            auto_call = CallTool(action="call_tool", name=action.name, input=auto_call_input)
+            return self._handle_call_tool_action(
+                state, auto_call, self._action_signature(auto_call)
+            )
         return "continue"
 
     def _finish_turn(self, result: TurnResult) -> None:
@@ -2158,11 +2515,25 @@ class AgentRunner:
         user-facing fallback and record the stop reason as an error event so the
         run is traceable from the log alone.
         """
-        last = result.observations[-1] if result.observations else ""
-        visible = self._visible_incomplete_observation(last)
+        visible = self._visible_incomplete_observation_from_history(result.observations)
         message = self._incomplete_stop_message(result.stopped_reason)
-        result.summary = message + (f"\n마지막 결과: {visible}" if visible else "")
+        label = self._incomplete_detail_label(result.stopped_reason, visible)
+        result.summary = message + (f"\n{label}: {visible}" if visible else "")
         self.tracer.log(kind="error", errorKind=result.stopped_reason, message=result.summary)
+
+    def _visible_incomplete_observation_from_history(self, observations: list[str]) -> str:
+        """Return the latest user-useful observation, skipping terminal guard text."""
+        for observation in reversed(observations):
+            visible = self._visible_incomplete_observation(observation)
+            if visible:
+                return visible
+        return ""
+
+    def _incomplete_detail_label(self, stopped_reason: str, visible: str) -> str:
+        """Choose a precise label for the extra detail shown after an incomplete stop."""
+        if stopped_reason == "consecutive_failures" or " 실패: " in visible:
+            return "마지막 실패"
+        return "마지막 결과"
 
     def _incomplete_stop_message(self, stopped_reason: str) -> str:
         """Map internal stop reasons to concise user-facing text."""
@@ -2180,6 +2551,8 @@ class AgentRunner:
         """Strip runtime-only observation text before surfacing a fallback."""
         if not observation:
             return ""
+        if concise := self._concise_failed_observation(observation):
+            return concise
         hidden_markers = (
             "작업 영역 파일의 구조는 사용자에게 묻지 않습니다.",
             "패키지 설치 질문은 사용자에게 묻지 않습니다.",
@@ -2189,6 +2562,7 @@ class AgentRunner:
             "수정 완료",
             "사용자 답변:",
             "이미 이 턴에서 생성했습니다.",
+            "연속 실패가 한계를 넘었습니다.",
         )
         if any(marker in observation for marker in hidden_markers):
             return ""
@@ -2202,6 +2576,26 @@ class AgentRunner:
                 stdout = str(value.get("stdout", "")).strip()
                 if stdout:
                     return stdout
+        return observation
+
+    def _concise_failed_observation(self, observation: str) -> str:
+        match = re.match(r"도구 (?P<tool>[\w.-]+) 실패: (?P<error>.*)", observation, re.S)
+        if match is None:
+            return ""
+        tool_name = match.group("tool")
+        error = match.group("error").strip()
+        if file_match := re.search(r"No such file or directory: ['\"]([^'\"]+)['\"]", error):
+            missing_path = file_match.group(1)
+            display_path = (
+                Path(missing_path).name if Path(missing_path).is_absolute() else missing_path
+            )
+            return f"도구 {tool_name} 실패: {display_path} 파일이 존재하지 않습니다."
+        if "Traceback (most recent call last):" in error:
+            last_line = next(
+                (line.strip() for line in reversed(error.splitlines()) if line.strip()), ""
+            )
+            if last_line:
+                return f"도구 {tool_name} 실패: {last_line}"
         return observation
 
     def _handle_create(self, action: CreateTool) -> str:

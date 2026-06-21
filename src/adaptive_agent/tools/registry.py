@@ -84,4 +84,40 @@ class ToolRegistry:
                 f"{tool.name} input 필드가 스키마와 맞지 않습니다. "
                 f"사용할 입력 필드: {', '.join(property_names)}"
             )
+        if isinstance(properties, dict):
+            for field, value in payload.items():
+                field_schema = properties.get(field)
+                if not isinstance(field_schema, dict):
+                    continue
+                expected = field_schema.get("type")
+                if expected is None or self._matches_json_schema_type(value, expected):
+                    continue
+                expected_text = (
+                    ", ".join(str(item) for item in expected)
+                    if isinstance(expected, list)
+                    else str(expected)
+                )
+                return (
+                    f"{tool.name} input 필드 '{field}' 타입이 스키마와 맞지 않습니다. "
+                    f"기대 타입: {expected_text}."
+                )
         return None
+
+    def _matches_json_schema_type(self, value: Any, expected: Any) -> bool:
+        if isinstance(expected, list):
+            return any(self._matches_json_schema_type(value, item) for item in expected)
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "number":
+            return isinstance(value, int | float) and not isinstance(value, bool)
+        if expected == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "object":
+            return isinstance(value, dict)
+        if expected == "array":
+            return isinstance(value, list)
+        if expected == "null":
+            return value is None
+        return True

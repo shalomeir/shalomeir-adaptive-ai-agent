@@ -7,6 +7,10 @@ import httpx
 
 from .schemas import Message, ToolDigest
 
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+DEFAULT_SAMPLING_MODELS = ("gpt-5.5",)
+
 
 class LLMClient(Protocol):
     """Structural interface for any LLM backend."""
@@ -66,6 +70,35 @@ def _build_payload_messages(
     return [{"role": "system", "content": inventory}, *[_to_provider_message(m) for m in messages]]
 
 
+def _response_error_param(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    param = error.get("param")
+    return str(param) if param is not None else ""
+
+
+def _response_error_message(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    message = error.get("message")
+    return str(message) if message is not None else ""
+
+
+def _uses_default_sampling(model: str) -> bool:
+    normalized = model.lower()
+    return normalized.startswith(DEFAULT_SAMPLING_MODELS)
+
+
 class HttpLLMClient:
     """Calls an OpenAI-compatible chat completions endpoint directly.
 
@@ -89,15 +122,25 @@ class HttpLLMClient:
         payload: dict[str, object] = {
             "model": self.model,
             "messages": payload_messages,
-            "temperature": 0,
             "response_format": {"type": "json_object"},
         }
+        if not _uses_default_sampling(self.model):
+            payload["temperature"] = 0
         resp = httpx.post(
             f"{self.base_url}/chat/completions",
             json=payload,
             headers=headers,
             timeout=self.timeout,
         )
+        if resp.status_code in {400, 422} and _response_error_param(resp) == "temperature":
+            # Unknown hosted models may reject explicit sampling; remove only that field.
+            payload.pop("temperature", None)
+            resp = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
         if resp.status_code in {400, 422}:
             # Some OpenAI-compatible local servers do not implement response_format.
             payload.pop("response_format", None)
@@ -107,9 +150,74 @@ class HttpLLMClient:
                 headers=headers,
                 timeout=self.timeout,
             )
+        if resp.status_code in {400, 422} and _response_error_param(resp) == "temperature":
+            # Some reasoning models only accept the provider default temperature.
+            payload.pop("temperature", None)
+            resp = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
         resp.raise_for_status()
         content: str = resp.json()["choices"][0]["message"]["content"]
         return content
+
+
+class AnthropicMessagesClient:
+    """Calls Anthropic's native Messages API without changing the runner contract."""
+
+    def __init__(
+        self, base_url: str, model: str, api_key: str | None = None, timeout: float = 180
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def chat(self, messages: list[Message], digests: list[ToolDigest]) -> str:
+        payload_messages = _build_payload_messages(messages, digests)
+        system_parts: list[str] = []
+        anthropic_messages: list[dict[str, str]] = []
+        for message in payload_messages:
+            role = message["role"]
+            if role == "system":
+                system_parts.append(message["content"])
+                continue
+            anthropic_messages.append(
+                {
+                    "role": "assistant" if role == "assistant" else "user",
+                    "content": message["content"],
+                }
+            )
+
+        headers = {
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+
+        payload: dict[str, object] = {
+            "model": self.model,
+            "max_tokens": ANTHROPIC_DEFAULT_MAX_TOKENS,
+            "messages": anthropic_messages,
+        }
+        if system_parts:
+            payload["system"] = "\n\n".join(system_parts)
+
+        resp = httpx.post(
+            f"{self.base_url}/messages",
+            json=payload,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        content = resp.json().get("content", [])
+        text_parts = [
+            item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        return "".join(text_parts)
 
 
 class FakeLLMClient:

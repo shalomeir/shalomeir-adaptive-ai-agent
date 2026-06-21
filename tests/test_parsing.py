@@ -63,12 +63,45 @@ def test_parse_camel_case_call_tool_alias():
     assert res.action.name == "readFile"
 
 
+def test_parse_call_tool_top_level_extra_fields_into_input():
+    res = parse_action_text(
+        '{"action":"call_tool","name":"csv-cleaner","input":{"path":"events2.csv"},'
+        '"output_path":"events2-clean.csv"}'
+    )
+    assert res.ok
+    assert res.action.action == "call_tool"
+    assert res.action.name == "csv-cleaner"
+    assert res.action.input == {"path": "events2.csv", "output_path": "events2-clean.csv"}
+
+
 def test_parse_respond_summary_alias():
     res = parse_action_text('{"action":"respond","summary":"done","final":true}')
     assert res.ok
     assert res.action.action == "respond"
     assert res.action.text == "done"
     assert res.action.final is True
+
+
+def test_parse_ask_user_text_alias():
+    res = parse_action_text('{"action":"ask_user","text":"어떤 파일을 정리할까요?","final":false}')
+    assert res.ok
+    assert res.action.action == "ask_user"
+    assert res.action.question == "어떤 파일을 정리할까요?"
+
+
+def test_parse_create_tool_inputs_alias_as_input_schema():
+    res = parse_action_text(
+        '{"action":"create_tool","spec":{"name":"clean-csv","description":"clean",'
+        '"code":"def run(input):\\n    return input[\\"path\\"]","inputs":["path"]}}'
+    )
+
+    assert res.ok
+    assert res.action.action == "create_tool"
+    assert res.action.spec.input_schema == {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
 
 
 def test_parse_bare_json_without_action_returns_protocol_error():

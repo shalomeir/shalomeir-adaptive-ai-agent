@@ -6,18 +6,19 @@ from typer.testing import CliRunner
 from adaptive_agent import cli
 from adaptive_agent.cli import app
 from adaptive_agent.config import AgentConfig
-from adaptive_agent.llm import FakeLLMClient
+from adaptive_agent.llm import AnthropicMessagesClient, FakeLLMClient, HttpLLMClient
 
 
 def test_version_command():
     result = CliRunner().invoke(app, ["version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.stdout
+    assert "0.1.1" in result.stdout
 
 
 def _patch_llm(monkeypatch, replies):
     fake = FakeLLMClient(replies=replies)
     monkeypatch.setattr(cli, "HttpLLMClient", lambda *a, **k: fake)
+    monkeypatch.setattr(cli, "AnthropicMessagesClient", lambda *a, **k: fake)
     return fake
 
 
@@ -31,13 +32,56 @@ def test_run_command_reports_summary(monkeypatch, tmp_path):
 
 def test_chat_exits_on_empty_piped_stdin(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("AGENT_MODEL", "qwen2.5-coder:7b")
+    monkeypatch.delenv("AGENT_WORKSPACE_DIR", raising=False)
     fake = _patch_llm(monkeypatch, ['{"action":"finish","summary":"should-not-run"}'])
 
     result = CliRunner().invoke(app, ["chat"], input="")
 
     assert result.exit_code == 0
-    assert "세션을 시작합니다" in result.stdout
+    assert "Adaptive AI Agent CLI" in result.stdout
+    assert "0.1.1" in result.stdout
+    assert "model:" in result.stdout
+    assert "qwen2.5-coder:7b" in result.stdout
+    assert "directory:" in result.stdout
+    assert "workspace:" in result.stdout
+    assert "세션을 시작합니다. 'exit' 또는 '/exit'로 종료." in result.stdout
     assert fake.calls == 0
+
+
+def test_startup_banner_shows_runtime_context(monkeypatch, tmp_path):
+    stream = StringIO()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "console", Console(file=stream, width=200))
+
+    cli._render_startup_banner(AgentConfig(model="custom-model", workspace_dir="custom-workspace"))
+
+    output = stream.getvalue()
+    assert "Adaptive AI Agent CLI" in output
+    assert "v0.1.1" in output
+    assert "model:" in output
+    assert "custom-model" in output
+    assert "directory:" in output
+    assert str(tmp_path) in output
+    assert "workspace:" in output
+    assert str(tmp_path / "custom-workspace") in output
+
+
+def test_build_llm_client_uses_anthropic_only_for_anthropic_provider():
+    anthropic = cli._build_llm_client(
+        AgentConfig(
+            provider="anthropic",
+            base_url="https://api.anthropic.com/v1",
+            model="claude-sonnet",
+            api_key="key",
+        )
+    )
+    openai_compatible = cli._build_llm_client(
+        AgentConfig(provider="openrouter", base_url="https://openrouter.ai/api/v1")
+    )
+
+    assert isinstance(anthropic, AnthropicMessagesClient)
+    assert isinstance(openai_compatible, HttpLLMClient)
 
 
 def test_chat_renders_clarification_as_dialogue(monkeypatch, tmp_path):
@@ -71,7 +115,31 @@ def test_chat_skips_loading_in_non_terminal_capture(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert "agent: completed" in result.stdout
-    assert "loading" not in result.stdout
+    assert "you: agent:" not in result.stdout
+    assert "agent: loading" not in result.stdout
+
+
+def test_chat_slash_exit_ends_session_before_llm(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    fake = _patch_llm(monkeypatch, ['{"action":"finish","summary":"should-not-run"}'])
+
+    result = CliRunner().invoke(app, ["chat"], input="/exit\n")
+
+    assert result.exit_code == 0
+    assert fake.calls == 0
+    assert "should-not-run" not in result.stdout
+
+
+def test_chat_ignores_empty_interactive_input(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_is_interactive_stdin", lambda: True)
+    fake = _patch_llm(monkeypatch, ['{"action":"finish","summary":"completed"}'])
+
+    result = CliRunner().invoke(app, ["chat"], input="\ndo something\nexit\n")
+
+    assert result.exit_code == 0
+    assert fake.calls == 1
+    assert "agent: completed" in result.stdout
 
 
 def test_loading_indicator_clears_before_result_for_terminal(monkeypatch):
@@ -106,6 +174,28 @@ def test_loading_indicator_stops_before_interactive_prompt(monkeypatch):
     assert result == "done"
     output = stream.getvalue()
     assert output.count(f"agent: {cli.LOADING_STYLE_START}loading.{cli.LOADING_STYLE_END}") == 1
+    assert output.endswith("\r\x1b[K")
+
+
+def test_loading_indicator_resumes_after_interactive_prompt(monkeypatch):
+    class PromptingRunner:
+        def run_turn(self, request):
+            answer = cli._ask("어떤 데이터를 정리할까요?")
+            assert answer == "events.csv"
+            return "done"
+
+    stream = StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=stream, force_terminal=True))
+    monkeypatch.setattr(cli, "LOADING_INTERVAL_SEC", 10)
+    monkeypatch.setattr(cli, "_prompt_user", lambda **_kwargs: "events.csv")
+
+    result = cli._run_turn_with_loading(PromptingRunner(), "go")
+
+    assert result == "done"
+    output = stream.getvalue()
+    loading_frame = f"agent: {cli.LOADING_STYLE_START}loading.{cli.LOADING_STYLE_END}"
+    assert output.count(loading_frame) == 2
+    assert "agent: 어떤 데이터를 정리할까요?" in output
     assert output.endswith("\r\x1b[K")
 
 
@@ -151,6 +241,23 @@ def test_chat_exit_during_clarification_ends_session(monkeypatch, tmp_path):
     assert "should-not-run" not in result.stdout
 
 
+def test_chat_slash_exit_during_clarification_ends_session(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    fake = _patch_llm(
+        monkeypatch,
+        [
+            '{"action":"ask_user","question":"어떤 데이터를 어떻게 정리할까요?"}',
+            '{"action":"finish","summary":"should-not-run"}',
+        ],
+    )
+
+    result = CliRunner().invoke(app, ["chat"], input="데이터 정리해줘\n/exit\n")
+
+    assert result.exit_code == 0
+    assert fake.calls == 1
+    assert "should-not-run" not in result.stdout
+
+
 def test_chat_renders_policy_confirmation_as_dialogue(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _patch_llm(
@@ -165,6 +272,7 @@ def test_chat_renders_policy_confirmation_as_dialogue(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert "agent: 파일 쓰기가 필요합니다. 진행할까요? (y/n)" in result.stdout
+    assert "you (n): agent:" not in result.stdout
     assert "agent: 저장했습니다." in result.stdout
 
 

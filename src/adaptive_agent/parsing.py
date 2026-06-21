@@ -10,6 +10,7 @@ from .schemas import AgentAction, parse_agent_action
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _CANONICAL_ACTIONS = {"respond", "ask_user", "call_tool", "create_tool", "update_tool", "finish"}
 _DIRECT_TOOL_ACTIONS = {"readFile", "writeFile", "listFiles", "runPython", "searchDocs", "askUser"}
+_CALL_TOOL_TOP_LEVEL_FIELDS = {"action", "name", "input"}
 _ACTION_CONTRACT = (
     "반드시 action 필드를 포함하세요. 최종 답변은 "
     '{"action":"respond","text":"...","final":true} 또는 '
@@ -101,13 +102,31 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
         input_data = value.get("input", {})
         if not isinstance(input_data, dict):
             input_data = {}
-        question = value.get("message", input_data.get("message", input_data.get("question")))
+        question = value.get(
+            "text",
+            value.get("message", input_data.get("text", input_data.get("message", input_data.get("question")))),
+        )
         if question is not None:
             return {
                 **value,
                 "question": str(question),
                 "choices": value.get("choices", input_data.get("choices")),
             }
+
+    if action == "call_tool":
+        input_data = value.get("input", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        extra_input = {
+            key: item for key, item in value.items() if key not in _CALL_TOOL_TOP_LEVEL_FIELDS
+        }
+        if extra_input:
+            return {**value, "input": {**input_data, **extra_input}}
+
+    if action == "create_tool":
+        spec = _normalize_tool_spec(value.get("spec"))
+        if spec is not None:
+            return {**value, "spec": spec}
 
     if action in _CANONICAL_ACTIONS:
         return value
@@ -123,10 +142,16 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
         }
 
     if action == "callTool":
+        input_data = value.get("input", {})
+        if not isinstance(input_data, dict):
+            input_data = {}
+        extra_input = {
+            key: item for key, item in value.items() if key not in _CALL_TOOL_TOP_LEVEL_FIELDS
+        }
         return {
             "action": "call_tool",
             "name": value.get("name"),
-            "input": value.get("input", {}),
+            "input": {**input_data, **extra_input},
         }
 
     if action == "askUser":
@@ -141,7 +166,10 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
         }
 
     if action == "createTool":
-        return {"action": "create_tool", "spec": value.get("spec", value.get("input"))}
+        return {
+            "action": "create_tool",
+            "spec": _normalize_tool_spec(value.get("spec", value.get("input"))),
+        }
 
     if action == "updateTool":
         input_data = value.get("input", {})
@@ -155,6 +183,30 @@ def _normalize_action_payload(value: dict[str, Any]) -> dict[str, Any]:
         }
 
     return value
+
+
+def _normalize_tool_spec(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    if "inputSchema" in raw:
+        return raw
+    inputs = raw.get("inputs")
+    if isinstance(inputs, list):
+        properties = {
+            str(item): {"type": "string"}
+            for item in inputs
+            if isinstance(item, str) and item.strip()
+        }
+        if properties:
+            return {
+                **raw,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": list(properties),
+                },
+            }
+    return raw
 
 
 @dataclass

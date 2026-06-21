@@ -99,3 +99,37 @@ def test_generated_tool_properties_are_required_when_required_is_omitted():
     assert "source" in (res.error or "")
     assert "output" in (res.error or "")
     assert "inputPath" not in (res.error or "")
+
+
+def test_call_validates_property_types_before_handler():
+    called = False
+
+    def handler(inp):
+        nonlocal called
+        called = True
+        return ToolResult(ok=True, output="should not run")
+
+    reg = ToolRegistry()
+    reg.register(
+        Tool(
+            name="document-repository",
+            description="Stores documents",
+            origin="generated",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["name", "content"],
+            },
+            handler=handler,
+        )
+    )
+
+    res = reg.call("document-repository", {"name": "monsters.json", "content": None})
+
+    assert not res.ok
+    assert called is False
+    assert "content" in (res.error or "")
+    assert "string" in (res.error or "")
